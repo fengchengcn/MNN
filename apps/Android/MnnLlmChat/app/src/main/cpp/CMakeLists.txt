@@ -61,6 +61,21 @@ set(LIB_PATH "${MNN_INSTALL_ROOT}/lib")
 add_library(MNN SHARED IMPORTED)
 set_target_properties(MNN PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libMNN.so")
 
+add_library(MNN_CL SHARED IMPORTED)
+set_target_properties(MNN_CL PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libMNN_CL.so")
+
+add_library(MNN_LLM SHARED IMPORTED)
+set_target_properties(MNN_LLM PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libllm.so")
+
+add_library(MNN_Diffusion SHARED IMPORTED)
+set_target_properties(MNN_Diffusion PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libdiffusion.so")
+
+add_library(MNN_Express SHARED IMPORTED)
+set_target_properties(MNN_Express PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libMNN_Express.so")
+
+add_library(MNN_Audio SHARED IMPORTED)
+set_target_properties(MNN_Audio PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libMNNAudio.so")
+
 #add_library(llm SHARED IMPORTED)
 #set_target_properties(llm PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libllm.so")
 #
@@ -86,11 +101,16 @@ set_target_properties(MNN PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libMNN.so")
 # can link libraries from various origins, such as libraries defined in this
 # build script, prebuilt third-party libraries, or Android system libraries.
 target_link_libraries(${CMAKE_PROJECT_NAME}
-        # List libraries link to the target library
         android
         log
         MNN
-        # MediaCodec libraries for hardware video decoding
+        MNN_CL
+        MNN_LLM
+        MNN_Diffusion  # 加上这个，Diffusion::load() 报错就会消失
+        MNN_Express
+        MNN_Audio
         mediandk
+        atomic
+        m
 
         )
