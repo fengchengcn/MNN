@@ -388,3 +388,15 @@ apps/Android/.qoder/settings.json
 apps/Android/MnnLlmChatOld
 
 transformers/llm/export/tmp/
+
+# mnn_tts Android 模块的 NDK 构建产物
+apps/frameworks/mnn_tts/android/.cxx/
+apps/frameworks/mnn_tts/android/build/
+apps/frameworks/mnn_tts/android/.externalNativeBuild/
+apps/frameworks/mnn_tts/android/.gradle/
+
+# 所有 Android/NDK 子工程的常见构建目录
+apps/**/build/
+apps/**/.cxx/
+apps/**/.externalNativeBuild/
+apps/**/.gradle/
