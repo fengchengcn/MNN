@@ -18,8 +18,8 @@ dependencyResolutionManagement {
 rootProject.name = "MnnMultiModalAudioDemo"
 include ':app'
 
-// Reuse frameworks from the MNN project
+// Corrected framework paths
 include ':mnn_tts'
-project(':mnn_tts').projectDir = new File('../../../frameworks/mnn_tts/android')
+project(':mnn_tts').projectDir = new File('../../frameworks/mnn_tts/android')
 include ':model_downloader'
-project(':model_downloader').projectDir = new File('../../../frameworks/model_downloader/android')
+project(':model_downloader').projectDir = new File('../../frameworks/model_downloader/android')
