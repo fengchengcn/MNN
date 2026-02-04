@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project("mnn_multimodal_audio")
+project("multimodal_audio_jni")
 
 add_library(${CMAKE_PROJECT_NAME} SHARED
         multimodal_audio_jni.cpp

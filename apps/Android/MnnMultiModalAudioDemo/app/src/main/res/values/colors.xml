@@ -8,4 +8,13 @@
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
     <color name="ic_launcher_background">#FFFFFF</color>
+    
+    <!-- Chat UI Colors -->
+    <color name="chat_bubble_user">#007AFF</color>
+    <color name="chat_bubble_ai">#F2F2F7</color>
+    <color name="chat_text_user">#FFFFFF</color>
+    <color name="chat_text_ai">#000000</color>
+    <color name="input_background">#F2F2F7</color>
+    <color name="divider">#E0E0E0</color>
+    <color name="mic_active">#FF3B30</color>
 </resources>
