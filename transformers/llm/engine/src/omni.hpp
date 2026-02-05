@@ -111,6 +111,7 @@ public:
     virtual void response(const std::vector<int>& input_ids, std::ostream* os = &std::cout, const char* end_with = nullptr, int max_new_tokens = -1) override;
     virtual void setWavformCallback(std::function<bool(const float*, size_t, bool)> callback) override;
     virtual void generateWavform() override;
+    void cancel();
     // some models preprocess function
     std::vector<int> visionProcess(VARP image);
     std::vector<int> defaultVisionProcess(VARP image);

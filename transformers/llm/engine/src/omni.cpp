@@ -14,6 +14,14 @@
 #include <random>
 #include <MNN/AutoTime.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
+#ifdef __ANDROID__
+#include <android/log.h>
+#define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, "MNN_Omni", __VA_ARGS__)
+#define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, "MNN_Omni", __VA_ARGS__)
+#else
+#define ALOGI(...) MNN_PRINT(__VA_ARGS__)
+#define ALOGE(...) MNN_PRINT(__VA_ARGS__)
+#endif
 #include "omni.hpp"
 #include "kvmeta.hpp"
 #include "llmconfig.hpp"
@@ -137,6 +145,12 @@ bool Omni::load() {
         }
     }
     return true;
+}
+
+void Omni::cancel() {
+    if (mContext) {
+        mContext->status = LlmStatus::USER_CANCEL;
+    }
 }
 
 #ifdef LLM_SUPPORT_VISION
@@ -668,10 +682,12 @@ std::vector<int> Omni::audioProcess(const std::string& file) {
     auto load_res        = MNN::AUDIO::load(file, sample_rate);
     VARP waveform        = load_res.first;
     if (waveform == nullptr) {
-        MNN_PRINT("Omni Can't open audio: %s\n", file.c_str());
+        ALOGE("Omni ERROR: Can't open audio file: %s. Possibly invalid path or corrupted WAV.\n", file.c_str());
         return std::vector<int>(0);
     }
-    mContext->audio_input_s += (float)(waveform->getInfo()->size) / sample_rate;
+    int wave_size = waveform->getInfo()->size;
+    ALOGI("Omni INFO: Audio loaded: %s, size: %d samples, duration: %.2f s\n", file.c_str(), wave_size, (float)wave_size / sample_rate);
+    mContext->audio_input_s += (float)wave_size / sample_rate;
     return audioProcess(waveform);
 #else
     return std::vector<int>(0);
@@ -681,9 +697,22 @@ std::vector<int> Omni::audioProcess(const std::string& file) {
 std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
 #ifdef LLM_SUPPORT_AUDIO
     if (waveform == nullptr) {
-        MNN_PRINT("Omni Can't process audio: waveform is null\n");
+        ALOGE("Omni Can't process audio: waveform is null\n");
         return std::vector<int>(0);
     }
+
+    // Diagnostic: Check waveform amplitude to see if it's silent
+    const float* wave_data = waveform->readMap<float>();
+    int wave_len = waveform->getInfo()->size;
+    float max_val = -1e10, min_val = 1e10, abs_avg = 0;
+    for (int i=0; i<wave_len; ++i) {
+        float v = wave_data[i];
+        if (v > max_val) max_val = v;
+        if (v < min_val) min_val = v;
+        abs_avg += std::abs(v);
+    }
+    abs_avg /= wave_len;
+    ALOGI("Omni Waveform Stats: samples=%d, min=%.4f, max=%.4f, avg_abs=%.4f", wave_len, min_val, max_val, abs_avg);
 
     Timer _t;
     auto input_features  = MNN::AUDIO::whisper_fbank(waveform);
@@ -727,6 +756,7 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
     mContext->audio_us = _t.durationInUs();
     mAudioEmbeddings.push_back(audio_embedding);
     int embed_len = audio_embedding->getInfo()->dim[0];
+    ALOGI("Omni INFO: Audio processing complete. Embedding length: %d\n", embed_len);
     addPositionIds(embed_len);
     std::vector<int> audio_ids(embed_len, mAudioPad);
     return audio_ids;
