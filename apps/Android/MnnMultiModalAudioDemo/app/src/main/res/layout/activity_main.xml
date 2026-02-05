@@ -20,6 +20,20 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
 
+    <!-- Clear Chat Button -->
+    <ImageView
+        android:id="@+id/btn_clear"
+        android:layout_width="40dp"
+        android:layout_height="40dp"
+        android:layout_marginTop="16dp"
+        android:layout_marginEnd="16dp"
+        android:background="@drawable/bg_input_field"
+        android:padding="8dp"
+        android:src="@android:drawable/ic_menu_delete"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        app:tint="@color/black" />
+
     <!-- Image Preview Card (Floating above input) -->
     <androidx.cardview.widget.CardView
         android:id="@+id/preview_card"
@@ -65,13 +79,23 @@
         app:layout_constraintBottom_toBottomOf="parent">
 
         <ImageView
+            android:id="@+id/btn_toggle_voice"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:padding="8dp"
+            android:src="@drawable/ic_mic"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent" />
+
+        <ImageView
             android:id="@+id/btn_add_image"
             android:layout_width="40dp"
             android:layout_height="40dp"
             android:padding="8dp"
             android:src="@drawable/ic_add_image"
             app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintStart_toEndOf="@id/btn_toggle_voice"
             app:layout_constraintTop_toTopOf="parent" />
 
         <EditText
@@ -85,38 +109,75 @@
             android:maxLines="4"
             android:paddingHorizontal="16dp"
             android:paddingVertical="8dp"
-            android:textSize="16sp"
+            android:textSize="14sp"
             app:layout_constraintBottom_toBottomOf="parent"
-            app:layout_constraintEnd_toStartOf="@id/btn_record_or_send"
+            app:layout_constraintEnd_toStartOf="@id/btn_send"
+            app:layout_constraintStart_toEndOf="@id/btn_add_image"
+            app:layout_constraintTop_toTopOf="parent" />
+
+        <TextView
+            android:id="@+id/btn_hold_to_talk"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_marginHorizontal="8dp"
+            android:background="@drawable/bg_voice_button"
+            android:gravity="center"
+            android:text="Hold to Talk"
+            android:textColor="@color/black"
+            android:textSize="14sp"
+            android:visibility="gone"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toEndOf="@id/btn_add_image"
             app:layout_constraintTop_toTopOf="parent" />
 
         <ImageView
-            android:id="@+id/btn_record_or_send"
+            android:id="@+id/btn_send"
             android:layout_width="40dp"
             android:layout_height="40dp"
             android:padding="8dp"
-            android:src="@drawable/ic_mic"
+            android:src="@drawable/ic_send"
+            android:visibility="gone"
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintTop_toTopOf="parent" />
 
     </androidx.constraintlayout.widget.ConstraintLayout>
-    
+
     <!-- Recording Indicator Overlay -->
-    <TextView
+    <LinearLayout
         android:id="@+id/recording_indicator"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="Recording..."
-        android:textSize="24sp"
-        android:textColor="@color/white"
-        android:background="#99000000"
+        android:background="#BB000000"
         android:padding="32dp"
+        android:orientation="vertical"
+        android:gravity="center"
         android:visibility="gone"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"/>
+        app:layout_constraintEnd_toEndOf="parent">
+        
+        <com.alibaba.mnnllm.multimodal.audio.WaveformView
+            android:id="@+id/waveform_view"
+            android:layout_width="200dp"
+            android:layout_height="64dp"
+            android:layout_marginBottom="16dp" />
+
+        <ImageView
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:src="@drawable/ic_mic"
+            app:tint="@color/white" />
+            
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Recording..."
+            android:textSize="18sp"
+            android:textColor="@color/white" />
+    </LinearLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>

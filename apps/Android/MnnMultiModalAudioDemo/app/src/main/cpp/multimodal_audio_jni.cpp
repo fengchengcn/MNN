@@ -6,7 +6,11 @@
 #include <mutex>
 #include <sstream>
 #include <functional>
-#include "llm/llm.hpp"
+#include <dirent.h>
+#include <sys/types.h>
+#include <llm/llm.hpp>
+#include "omni.hpp"
+#include "llmconfig.hpp"
 
 #define TAG "MnnMultiModalAudio_JNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -39,7 +43,7 @@ private:
 };
 
 // Global model pointer with thread safety
-static std::unique_ptr<MNN::Transformer::Llm> g_llm;
+static std::shared_ptr<MNN::Transformer::Llm> g_llm;
 static std::mutex g_mutex;
 
 static JavaVM* g_jvm = nullptr;
@@ -75,7 +79,6 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     return JNI_VERSION_1_6;
 }
 
-#include <dirent.h>
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_alibaba_mnnllm_multimodal_audio_MainActivity_nativeInit(
@@ -104,14 +107,48 @@ Java_com_alibaba_mnnllm_multimodal_audio_MainActivity_nativeInit(
         LOGE("nativeInit: Could not open directory %s", modelDirStr.c_str());
     }
     
+
+    std::string configPath = modelDirStr;
+    if (modelDirStr.back() != '/') {
+        configPath += "/";
+    }
+    
+    // Attempt to find specific config file to ensure LlmConfig loads it correctly
+    // Priority: llm_config.json > config.json > directory
+    std::string llmConfigPath = configPath + "llm_config.json";
+    std::string finalConfigArg = modelDirStr;
+
+    // Simple file existence check using FILE* as dirent approach is already doing listing
+    FILE* fp = fopen(llmConfigPath.c_str(), "r");
+    if (fp) {
+        fclose(fp);
+        finalConfigArg = llmConfigPath;
+        LOGI("nativeInit: Found llm_config.json, using specific config path: %s", finalConfigArg.c_str());
+    } else {
+        std::string wrapperConfigPath = configPath + "config.json";
+        fp = fopen(wrapperConfigPath.c_str(), "r");
+        if (fp) {
+            fclose(fp);
+            finalConfigArg = wrapperConfigPath;
+             LOGI("nativeInit: Found config.json, using specific config path: %s", finalConfigArg.c_str());
+        } else {
+             LOGI("nativeInit: No specific config file found, using directory path: %s", finalConfigArg.c_str());
+        }
+    }
+    
     try {
-        g_llm.reset(MNN::Transformer::Llm::createLLM(modelDirStr.c_str()));
+        // FORCE Creation of Omni instance using manually loaded config
+        // This ensures valid Audio support regardless of precompiled libllm.so settings
+        std::shared_ptr<MNN::Transformer::LlmConfig> config(new MNN::Transformer::LlmConfig(finalConfigArg));
+        g_llm.reset(new MNN::Transformer::Omni(config));
+
         if (!g_llm) {
-            LOGE("nativeInit: Failed to create LLM instance (createLLM returned null)");
+            LOGE("nativeInit: Failed to create Omni instance (new Omni returned null)");
             return JNI_FALSE;
         }
         
         LOGI("nativeInit: Calling g_llm->load()...");
+        
         bool load_res = g_llm->load();
         LOGI("nativeInit: g_llm->load() result: %d", load_res);
         
@@ -125,6 +162,13 @@ Java_com_alibaba_mnnllm_multimodal_audio_MainActivity_nativeInit(
     }
     
     LOGI("nativeInit: Omni Model loaded successfully");
+    
+    // Fix for repetition loop: Apply robust sampling parameters
+    // penalty (presence penalty), n_gram & ngram_factor (penalize repeating sequences)
+    const char* sampler_config = "{\"sampler_type\": \"mixed\", \"temperature\": 0.9, \"topK\": 40, \"topP\": 0.8, \"penalty\": 1.15, \"n_gram\": 3, \"ngram_factor\": 1.2}";
+    g_llm->set_config(sampler_config);
+    LOGI("nativeInit: Applied sampler config: %s", sampler_config);
+
     return JNI_TRUE;
 }
 
@@ -132,105 +176,125 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_alibaba_mnnllm_multimodal_audio_MainActivity_nativeChat(
         JNIEnv* env,
         jobject thiz,
-        jstring prompt) {
+        jobjectArray history) {
     
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_llm) {
+    std::shared_ptr<MNN::Transformer::Llm> llm;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        llm = g_llm;
+    }
+    
+    if (!llm) {
         LOGE("nativeChat: LLM model not initialized or creation failed");
         return;
     }
-    
-    const char* c_prompt = env->GetStringUTFChars(prompt, nullptr);
-    std::string promptStr(c_prompt);
-    env->ReleaseStringUTFChars(prompt, c_prompt);
-    
-    LOGI("nativeChat: Start generation. Prompt length: %zu. Prompt: %s", promptStr.size(), promptStr.c_str());
-    
-    // Cache callback object
-    if (g_callback_obj == nullptr) {
-        g_callback_obj = env->NewGlobalRef(thiz);
-        jclass clazz = env->GetObjectClass(thiz);
-        g_callback_method = env->GetMethodID(clazz, "onChatStreamUpdate", "(Ljava/lang/String;)V");
-        LOGI("nativeChat: Registered Java callback");
+
+    // Convert Java Array to ChatMessages
+    MNN::Transformer::ChatMessages chat_messages;
+    jsize len = env->GetArrayLength(history);
+    for (jsize i = 0; i < len; i += 2) {
+        jstring jRole = (jstring)env->GetObjectArrayElement(history, i);
+        jstring jContent = (jstring)env->GetObjectArrayElement(history, i + 1);
+        
+        const char* cRole = env->GetStringUTFChars(jRole, nullptr);
+        const char* cContent = env->GetStringUTFChars(jContent, nullptr);
+        
+        chat_messages.push_back({std::string(cRole), std::string(cContent)});
+        
+        env->ReleaseStringUTFChars(jRole, cRole);
+        env->ReleaseStringUTFChars(jContent, cContent);
+        env->DeleteLocalRef(jRole);
+        env->DeleteLocalRef(jContent);
+    }
+
+    // Inject System Prompt if not present
+    bool has_system = false;
+    if (!chat_messages.empty() && chat_messages[0].first == "system") {
+        has_system = true;
     }
     
-    // Create custom stream buffer to capture output
-    LlmStreamBuffer stream_buffer([](const char* str, size_t len) {
+    if (!has_system) {
+        std::string system_prompt = "You are Qwen2.5-Omni, a helpful assistant. You can directly understand audio and image inputs provided by the user. Do NOT refuse to process audio or images.";
+        chat_messages.insert(chat_messages.begin(), {"system", system_prompt});
+    }
+    
+    LOGI("nativeChat: Start multi-turn generation. History size: %zu", chat_messages.size());
+    
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_callback_obj == nullptr) {
+            g_callback_obj = env->NewGlobalRef(thiz);
+            jclass clazz = env->GetObjectClass(thiz);
+            g_callback_method = env->GetMethodID(clazz, "onChatStreamUpdate", "(Ljava/lang/String;)V");
+        }
+    }
+    
+    std::string cumulative_response;
+    LlmStreamBuffer stream_buffer([&cumulative_response](const char* str, size_t len) {
         std::string chunk(str, len);
-        LOGI("nativeChat: Received chunk: %s", chunk.c_str());
+        cumulative_response += chunk;
         notifyJava(chunk);
     });
     std::ostream output_stream(&stream_buffer);
     
-    // Build MultimodalPrompt if we have <img> or <audio> tags
-    MNN::Transformer::MultimodalPrompt multimodal_prompt;
-    bool has_multimodal = false;
-    std::string processed_prompt = promptStr;
-    
-    // Simple <img> parser (for demo purpose)
-    size_t img_start = processed_prompt.find("<img>");
-    while (img_start != std::string::npos) {
-        size_t img_end = processed_prompt.find("</img>", img_start);
-        if (img_end != std::string::npos) {
-            size_t path_start = img_start + 5;
-            std::string img_path = processed_prompt.substr(path_start, img_end - path_start);
-            std::string placeholder = "<image_" + std::to_string(multimodal_prompt.images.size()) + ">";
-            
-            MNN::Transformer::PromptImagePart image_part;
-            image_part.width = 0;
-            image_part.height = 0;
-            multimodal_prompt.images[placeholder] = image_part;
-            
-            processed_prompt.replace(img_start, img_end - img_start + 6, placeholder);
-            has_multimodal = true;
-            LOGI("nativeChat: Found image: %s -> %s", img_path.c_str(), placeholder.c_str());
-        }
-        img_start = processed_prompt.find("<img>", img_start + 1);
-    }
-    
-    // Simple <audio> parser
-    size_t audio_start = processed_prompt.find("<audio>");
-    while (audio_start != std::string::npos) {
-        size_t audio_end = processed_prompt.find("</audio>", audio_start);
-        if (audio_end != std::string::npos) {
-            size_t path_start = audio_start + 7;
-            std::string audio_path = processed_prompt.substr(path_start, audio_end - path_start);
-            std::string placeholder = "<audio_" + std::to_string(multimodal_prompt.audios.size()) + ">";
-            
-            MNN::Transformer::PromptAudioPart audio_part;
-            audio_part.file_path = audio_path;
-            multimodal_prompt.audios[placeholder] = audio_part;
-            
-            processed_prompt.replace(audio_start, audio_end - audio_start + 8, placeholder);
-            has_multimodal = true;
-            LOGI("nativeChat: Found audio: %s -> %s", audio_path.c_str(), placeholder.c_str());
-        }
-        audio_start = processed_prompt.find("<audio>", audio_start + 1);
-    }
-    
     try {
-        if (has_multimodal) {
-            multimodal_prompt.prompt_template = processed_prompt;
-            LOGI("nativeChat: Using multimodal API with template: %s", processed_prompt.c_str());
-            g_llm->response(multimodal_prompt, &output_stream, nullptr, -1);
-        } else {
-            LOGI("nativeChat: Using text API");
-            g_llm->response(promptStr, &output_stream, nullptr, -1);
-        }
+        std::string full_prompt = llm->apply_chat_template(chat_messages);
+        LOGI("nativeChat: Full prompt (first 500 chars): %.500s", full_prompt.c_str());
+
+        std::vector<int> input_ids = llm->tokenizer_encode(full_prompt);
+        LOGI("nativeChat: Tokenized %zu tokens from prompt", input_ids.size());
+        
+        llm->response(input_ids, &output_stream, nullptr, 512);
     } catch (const std::exception& e) {
-        LOGE("nativeChat: Exception during response generation: %s", e.what());
+        LOGE("nativeChat: Exception: %s", e.what());
+    }
+
+    // Notify finished
+    jclass clazz = env->GetObjectClass(thiz);
+    jmethodID finish_method = env->GetMethodID(clazz, "onChatFinished", "(Ljava/lang/String;)V");
+    if (finish_method) {
+        jstring jFullResponse = env->NewStringUTF(cumulative_response.c_str());
+        env->CallVoidMethod(thiz, finish_method, jFullResponse);
+        env->DeleteLocalRef(jFullResponse);
     }
     
     LOGI("nativeChat: Generation finished.");
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_alibaba_mnnllm_multimodal_audio_MainActivity_nativeReset(JNIEnv *env, jobject thiz) {
+    LOGI("nativeReset called");
+    std::shared_ptr<MNN::Transformer::Llm> llm;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        llm = g_llm;
+    }
+    
+    if (llm) {
+        // Cancel first to interrupt any ongoing generation in other threads
+        static_cast<MNN::Transformer::Omni*>(llm.get())->cancel();
+        
+        // Then reset history
+        std::lock_guard<std::mutex> lock(g_mutex);
+        llm->reset();
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_alibaba_mnnllm_multimodal_audio_MainActivity_nativeRelease(JNIEnv *env, jobject thiz) {
-    std::lock_guard<std::mutex> lock(g_mutex);
     LOGI("nativeRelease called");
-    if (g_llm) {
+    std::shared_ptr<MNN::Transformer::Llm> llm;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        llm = g_llm;
         g_llm.reset();
     }
+    
+    if (llm) {
+        static_cast<MNN::Transformer::Omni*>(llm.get())->cancel();
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
     if (g_callback_obj) {
         env->DeleteGlobalRef(g_callback_obj);
         g_callback_obj = nullptr;

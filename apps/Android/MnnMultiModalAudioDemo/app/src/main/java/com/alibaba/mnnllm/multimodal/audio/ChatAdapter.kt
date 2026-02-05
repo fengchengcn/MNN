@@ -1,10 +1,12 @@
 package com.alibaba.mnnllm.multimodal.audio
 
 import android.graphics.BitmapFactory
+import android.media.MediaPlayer
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 
@@ -12,7 +14,8 @@ data class ChatMessage(
         val text: String,
         val isUser: Boolean,
         val imagePath: String? = null,
-        val isAudio: Boolean = false
+        val isAudio: Boolean = false,
+        val audioPath: String? = null
 )
 
 class ChatAdapter(private val messages: MutableList<ChatMessage> = mutableListOf()) :
@@ -54,6 +57,12 @@ class ChatAdapter(private val messages: MutableList<ChatMessage> = mutableListOf
         notifyItemInserted(messages.size - 1)
     }
 
+    fun clear() {
+        val size = messages.size
+        messages.clear()
+        notifyItemRangeRemoved(0, size)
+    }
+
     fun updateLastAiMessage(newText: String) {
         if (messages.isNotEmpty()) {
             val lastIndex = messages.size - 1
@@ -62,9 +71,18 @@ class ChatAdapter(private val messages: MutableList<ChatMessage> = mutableListOf
                 messages[lastIndex] = lastMsg.copy(text = lastMsg.text + newText)
                 notifyItemChanged(lastIndex)
             } else {
-                // Should not happen if logic is correct, but safe fallback
                 addMessage(ChatMessage(newText, false))
             }
+        }
+    }
+
+    fun replaceLastMessage(newText: String, isUser: Boolean) {
+        if (messages.isNotEmpty()) {
+            val lastIndex = messages.size - 1
+            messages[lastIndex] = ChatMessage(newText, isUser)
+            notifyItemChanged(lastIndex)
+        } else {
+            addMessage(ChatMessage(newText, isUser))
         }
     }
 
@@ -76,9 +94,20 @@ class ChatAdapter(private val messages: MutableList<ChatMessage> = mutableListOf
     class UserViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
         private val chatText: TextView = itemView.findViewById(R.id.chat_text)
         private val chatImage: ImageView = itemView.findViewById(R.id.chat_image)
+        private val audioLayout: LinearLayout = itemView.findViewById(R.id.audio_layout)
+        private val btnPlayAudio: ImageView = itemView.findViewById(R.id.btn_play_audio)
+
+        companion object {
+            private var currentMediaPlayer: MediaPlayer? = null
+            private var currentPlayingButton: ImageView? = null
+            private var currentPlayingPath: String? = null
+        }
 
         fun bind(message: ChatMessage) {
-            chatText.text = message.text
+            chatText.text = if (message.isAudio) "" else message.text
+            chatText.visibility =
+                    if (message.isAudio && message.text == "[Audio Message]") View.GONE
+                    else View.VISIBLE
 
             if (message.imagePath != null) {
                 chatImage.visibility = View.VISIBLE
@@ -90,6 +119,56 @@ class ChatAdapter(private val messages: MutableList<ChatMessage> = mutableListOf
                 }
             } else {
                 chatImage.visibility = View.GONE
+            }
+
+            if (message.isAudio && message.audioPath != null) {
+                audioLayout.visibility = View.VISIBLE
+                btnPlayAudio.setOnClickListener { playAudio(message.audioPath) }
+
+                if (currentPlayingPath == message.audioPath && currentMediaPlayer?.isPlaying == true
+                ) {
+                    btnPlayAudio.setImageResource(android.R.drawable.ic_media_pause)
+                    currentPlayingButton = btnPlayAudio
+                } else {
+                    btnPlayAudio.setImageResource(android.R.drawable.ic_media_play)
+                }
+            } else {
+                audioLayout.visibility = View.GONE
+            }
+        }
+
+        private fun playAudio(path: String) {
+            try {
+                if (currentPlayingPath == path && currentMediaPlayer?.isPlaying == true) {
+                    currentMediaPlayer?.stop()
+                    btnPlayAudio.setImageResource(android.R.drawable.ic_media_play)
+                    currentPlayingPath = null
+                    currentPlayingButton = null
+                    return
+                }
+
+                currentMediaPlayer?.release()
+                currentPlayingButton?.setImageResource(android.R.drawable.ic_media_play)
+
+                currentMediaPlayer =
+                        MediaPlayer().apply {
+                            setDataSource(path)
+                            prepare()
+                            start()
+                        }
+                currentPlayingPath = path
+                currentPlayingButton = btnPlayAudio
+                btnPlayAudio.setImageResource(android.R.drawable.ic_media_pause)
+
+                currentMediaPlayer?.setOnCompletionListener {
+                    btnPlayAudio.setImageResource(android.R.drawable.ic_media_play)
+                    if (currentPlayingPath == path) {
+                        currentPlayingPath = null
+                        currentPlayingButton = null
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
         }
     }

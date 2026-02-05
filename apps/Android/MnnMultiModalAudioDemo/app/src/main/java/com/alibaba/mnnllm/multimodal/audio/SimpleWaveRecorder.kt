@@ -5,17 +5,17 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Log
+import java.io.File
+import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
-import java.io.File
-import java.io.FileOutputStream
-import java.io.RandomAccessFile
 
 class SimpleWaveRecorder {
     private val TAG = "SimpleWaveRecorder"
-    
+
     // Audio configuration for Whisper/ASR: 16kHz, Mono, 16bit
     private val sampleRate = 16000
     private val channelConfig = AudioFormat.CHANNEL_IN_MONO
@@ -27,18 +27,21 @@ class SimpleWaveRecorder {
     private var recordingJob: Job? = null
     private val coroutineScope = CoroutineScope(Dispatchers.IO)
 
+    var onAmplitudeUpdate: ((Int) -> Unit)? = null
+
     @SuppressLint("MissingPermission")
     fun startRecording(outputFilePath: String) {
         if (isRecording) return
 
         val file = File(outputFilePath)
-        audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            sampleRate,
-            channelConfig,
-            audioFormat,
-            bufferSize
-        )
+        audioRecord =
+                AudioRecord(
+                        MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                        sampleRate,
+                        channelConfig,
+                        audioFormat,
+                        bufferSize
+                )
 
         if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
             Log.e(TAG, "AudioRecord initialization failed")
@@ -48,16 +51,14 @@ class SimpleWaveRecorder {
         isRecording = true
         audioRecord?.startRecording()
 
-        recordingJob = coroutineScope.launch {
-            writeAudioDataToFile(file)
-        }
+        recordingJob = coroutineScope.launch { writeAudioDataToFile(file) }
     }
 
     fun stopRecording() {
         isRecording = false
         recordingJob?.cancel()
         recordingJob = null
-        
+
         try {
             audioRecord?.stop()
             audioRecord?.release()
@@ -68,15 +69,37 @@ class SimpleWaveRecorder {
     }
 
     private fun writeAudioDataToFile(file: File) {
-        val data = ByteArray(bufferSize)
+        val shortBuffer = ShortArray(bufferSize / 2)
         FileOutputStream(file).use { out ->
             // Write placeholder for WAV header (44 bytes)
             out.write(ByteArray(44))
-            
+
             while (isRecording) {
-                val read = audioRecord?.read(data, 0, bufferSize) ?: 0
+                val read = audioRecord?.read(shortBuffer, 0, shortBuffer.size) ?: 0
                 if (read > 0) {
-                    out.write(data, 0, read)
+                    var maxAmplitude = 0
+                    val byteBuffer =
+                            java.nio.ByteBuffer.allocate(read * 2)
+                                    .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    for (i in 0 until read) {
+                        val s = shortBuffer[i]
+                        // Apply software gain (e.g. 5x) to boost generic low volume
+                        val amplified =
+                                (s * 1.2f)
+                                        .coerceIn(
+                                                Short.MIN_VALUE.toFloat(),
+                                                Short.MAX_VALUE.toFloat()
+                                        )
+                                        .toInt()
+                                        .toShort()
+
+                        val finalShort = amplified
+                        val abs = Math.abs(finalShort.toInt())
+                        if (abs > maxAmplitude) maxAmplitude = abs
+                        byteBuffer.putShort(finalShort)
+                    }
+                    onAmplitudeUpdate?.invoke(maxAmplitude)
+                    out.write(byteBuffer.array(), 0, read * 2)
                 }
             }
         }
@@ -91,7 +114,7 @@ class SimpleWaveRecorder {
         val byteRate = 16 * sampleRate * channels / 8
 
         val header = ByteArray(44)
-        header[0] = 'R'.toByte() 
+        header[0] = 'R'.toByte()
         header[1] = 'I'.toByte()
         header[2] = 'F'.toByte()
         header[3] = 'F'.toByte()
