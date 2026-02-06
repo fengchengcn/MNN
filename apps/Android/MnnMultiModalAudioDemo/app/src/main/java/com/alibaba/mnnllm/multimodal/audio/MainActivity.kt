@@ -53,7 +53,7 @@ class MainActivity : AppCompatActivity(), DownloadListener {
     private var isFirstChunk = true
 
     // Model ID for download manager
-    private val omniModelId = "ModelScope/MNN/Qwen2.5-Omni-3B-MNN"
+    private val omniModelId = "ModelScope/MNN/Qwen2.5-Omni-7B-MNN"
 
     // Persistent storage path
     private val PERSISTENT_CACHE_DIR =
@@ -256,9 +256,11 @@ class MainActivity : AppCompatActivity(), DownloadListener {
 
     private fun stopLevelRecording() {
         showRecordingIndicator(false)
-        val wavPath = audioHandler.stopRecording()
-        if (wavPath != null) {
-            processAudio(wavPath)
+        lifecycleScope.launch(Dispatchers.IO) {
+            val wavPath = audioHandler.stopRecording()
+            if (wavPath != null) {
+                withContext(Dispatchers.Main) { processAudio(wavPath) }
+            }
         }
     }
 
@@ -356,7 +358,7 @@ class MainActivity : AppCompatActivity(), DownloadListener {
                 prompt.append("<img>$imagePathToSend</img>")
             }
             prompt.append("<audio>$wavPath</audio>")
-            prompt.append("请把这段录音转写成文字。")
+            prompt.append("请帮我听一下这段录音，并把内容转写成文字。")
 
             val finalPrompt = prompt.toString()
             Timber.i("Processing Audio Prompt: $finalPrompt")
@@ -484,7 +486,7 @@ class MainActivity : AppCompatActivity(), DownloadListener {
             return false
         }
 
-        // Essential files check for Qwen2.5-Omni-3B-MNN
+        // Essential files check for Qwen2.5-Omni-7B-MNN
         val essentialFiles =
                 arrayOf(
                         "config.json",
@@ -555,6 +557,7 @@ class MainActivity : AppCompatActivity(), DownloadListener {
         Timber.d("Download finished at: $path")
         actualModelPath = path
         runOnUiThread {
+            loadingModel = false
             binding.inputMessage.hint = "Loading model..."
             initModel()
         }
@@ -562,7 +565,10 @@ class MainActivity : AppCompatActivity(), DownloadListener {
 
     override fun onDownloadFailed(modelId: String, e: Exception) {
         Timber.e(e, "Download failed")
-        runOnUiThread { Toast.makeText(this, "Model download failed", Toast.LENGTH_SHORT).show() }
+        runOnUiThread {
+            loadingModel = false
+            Toast.makeText(this, "Model download failed", Toast.LENGTH_SHORT).show()
+        }
     }
 
     override fun onDownloadPaused(modelId: String) {}

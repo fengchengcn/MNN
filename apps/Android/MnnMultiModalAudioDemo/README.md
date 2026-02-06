@@ -1,6 +1,6 @@
 # MNN MultiModal Audio Demo (MNN 多模态语音交互 Demo)
 
-这是一个基于 MNN 框架开发的 Android 应用程序，演示了如何在端侧设备上运行 Qwen2.5-Omni 多模态大模型。该应用支持语音输入（录音）和图像输入，并能通过语音（TTS）和文本实时反馈 AI 的回答。
+这是一个基于 MNN Framework 开发的 Android 应用程序，演示了如何在端侧设备上运行 Qwen2.5-Omni-7B 多模态大模型。该应用支持语音输入（录音）和图像输入，并能通过语音（TTS）和文本实时反馈 AI 的回答。
 
 对于前端开发者来说，你可以将这个项目理解为一个移动端的全栈应用：
 - **UI 层 (Kotlin/XML)**：类似于前端的 React/Vue 组件与 HTML/CSS。
@@ -95,8 +95,8 @@ MnnMultiModalAudioDemo/
 1.  **App 启动**: `MainActivity` `onCreate` 执行。
 2.  **组件准备**: 初始化 `AudioHandler` (录音机) 和 `TtsManager` (朗读机)。
 3.  **模型检查**:
-    *   检查本地目录 `.mnnmodels/MNN/Qwen2.5-Omni-3B-MNN` 是否存在且完整。
-    *   **不存在**: 显示下载进度，调用 `ModelDownloadManager` 下载模型 (约 4GB)。
+    *   检查本地目录 `.mnnmodels/MNN/Qwen2.5-Omni-7B-MNN` 是否存在且完整。
+    *   **不存在**: 显示下载进度，调用 `ModelDownloadManager` 下载模型 (约 8GB-10GB)。
     *   **存在**: 调用 Native 方法 `loadModel()` 加载模型进入内存。
 
 ### 阶段二：用户交互 (Input)

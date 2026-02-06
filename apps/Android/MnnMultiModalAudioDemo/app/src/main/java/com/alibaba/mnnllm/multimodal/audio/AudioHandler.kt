@@ -21,12 +21,12 @@ class AudioHandler(private val context: Context) {
         Log.d("AudioHandler", "Started recording to $currentRecordingPath")
     }
 
-    fun stopRecording(): String? {
-        simpleWaveRecorder?.stopRecording()
+    suspend fun stopRecording(): String? {
+        val file = simpleWaveRecorder?.stopRecording()
         val path = currentRecordingPath
         if (path != null) {
-            val file = File(path)
-            Log.d("AudioHandler", "Stopped recording, path: $path, size: ${file.length()} bytes")
+            val size = file?.length() ?: File(path).length()
+            Log.d("AudioHandler", "Stopped recording, path: $path, size: $size bytes")
         }
         simpleWaveRecorder = null
         currentRecordingPath = null

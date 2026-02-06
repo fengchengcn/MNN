@@ -165,7 +165,13 @@ Java_com_alibaba_mnnllm_multimodal_audio_MainActivity_nativeInit(
     
     // Fix for repetition loop: Apply robust sampling parameters
     // penalty (presence penalty), n_gram & ngram_factor (penalize repeating sequences)
-    const char* sampler_config = "{\"sampler_type\": \"mixed\", \"temperature\": 0.9, \"topK\": 40, \"topP\": 0.8, \"penalty\": 1.15, \"n_gram\": 3, \"ngram_factor\": 1.2}";
+    const char* sampler_config = "{\"sampler_type\": \"mixed\", "
+                                 "\"temperature\": 0.8, "
+                                 "\"topK\": 40, "
+                                 "\"topP\": 0.8, "
+                                 "\"penalty\": 1.2, "
+                                 "\"n_gram\": 3, "
+                                 "\"ngram_factor\": 1.5}";
     g_llm->set_config(sampler_config);
     LOGI("nativeInit: Applied sampler config: %s", sampler_config);
 
@@ -214,7 +220,10 @@ Java_com_alibaba_mnnllm_multimodal_audio_MainActivity_nativeChat(
     }
     
     if (!has_system) {
-        std::string system_prompt = "You are Qwen2.5-Omni, a helpful assistant. You can directly understand audio and image inputs provided by the user. Do NOT refuse to process audio or images.";
+        std::string system_prompt = "You are a helpful assistant. Please provide concise and direct answers. "
+                                    "Avoid repeating the same sentences or phrases in your response. "
+                                    "If you have finished your thought, stop immediately without circular talk.";
+
         chat_messages.insert(chat_messages.begin(), {"system", system_prompt});
     }
     

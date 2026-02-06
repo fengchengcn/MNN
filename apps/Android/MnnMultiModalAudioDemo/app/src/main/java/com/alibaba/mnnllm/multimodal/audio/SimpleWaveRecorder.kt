@@ -4,10 +4,13 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Build
 import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
+import kotlin.math.abs
+import kotlin.math.min
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,6 +29,7 @@ class SimpleWaveRecorder {
     private var isRecording = false
     private var recordingJob: Job? = null
     private val coroutineScope = CoroutineScope(Dispatchers.IO)
+    private var outputFile: File? = null
 
     var onAmplitudeUpdate: ((Int) -> Unit)? = null
 
@@ -34,9 +38,16 @@ class SimpleWaveRecorder {
         if (isRecording) return
 
         val file = File(outputFilePath)
+        outputFile = file
+        val audioSource =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    MediaRecorder.AudioSource.UNPROCESSED
+                } else {
+                    MediaRecorder.AudioSource.MIC
+                }
         audioRecord =
                 AudioRecord(
-                        MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                        audioSource,
                         sampleRate,
                         channelConfig,
                         audioFormat,
@@ -54,10 +65,8 @@ class SimpleWaveRecorder {
         recordingJob = coroutineScope.launch { writeAudioDataToFile(file) }
     }
 
-    fun stopRecording() {
+    suspend fun stopRecording(): File? {
         isRecording = false
-        recordingJob?.cancel()
-        recordingJob = null
 
         try {
             audioRecord?.stop()
@@ -66,6 +75,12 @@ class SimpleWaveRecorder {
             Log.e(TAG, "Error stopping recorder: ${e.message}")
         }
         audioRecord = null
+        val job = recordingJob
+        recordingJob = null
+        job?.join()
+        val file = outputFile
+        outputFile = null
+        return file
     }
 
     private fun writeAudioDataToFile(file: File) {
@@ -82,18 +97,7 @@ class SimpleWaveRecorder {
                             java.nio.ByteBuffer.allocate(read * 2)
                                     .order(java.nio.ByteOrder.LITTLE_ENDIAN)
                     for (i in 0 until read) {
-                        val s = shortBuffer[i]
-                        // Apply software gain (e.g. 5x) to boost generic low volume
-                        val amplified =
-                                (s * 1.2f)
-                                        .coerceIn(
-                                                Short.MIN_VALUE.toFloat(),
-                                                Short.MAX_VALUE.toFloat()
-                                        )
-                                        .toInt()
-                                        .toShort()
-
-                        val finalShort = amplified
+                        val finalShort = shortBuffer[i]
                         val abs = Math.abs(finalShort.toInt())
                         if (abs > maxAmplitude) maxAmplitude = abs
                         byteBuffer.putShort(finalShort)
@@ -103,8 +107,8 @@ class SimpleWaveRecorder {
                 }
             }
         }
-        // After recording, update the WAV header with actual data size
         updateWavHeader(file)
+        normalizeWavPcm(file)
     }
 
     private fun updateWavHeader(file: File) {
@@ -162,6 +166,48 @@ class SimpleWaveRecorder {
         RandomAccessFile(file, "rw").use { raf ->
             raf.seek(0)
             raf.write(header)
+        }
+    }
+
+    private fun normalizeWavPcm(file: File) {
+        if (file.length() <= 44) return
+        RandomAccessFile(file, "rw").use { raf ->
+            val dataSize = (raf.length() - 44).toInt()
+            if (dataSize <= 0) return
+            val bytes = ByteArray(dataSize)
+            raf.seek(44)
+            raf.readFully(bytes)
+            var peak = 1
+            var i = 0
+            while (i < bytes.size - 1) {
+                val sample =
+                        (bytes[i].toInt() and 0xff) or
+                                (bytes[i + 1].toInt() shl 8)
+                val s = sample.toShort().toInt()
+                val a = abs(s)
+                if (a > peak) peak = a
+                i += 2
+            }
+            val target = (0.8f * 32767f).toInt()
+            val gain = target.toFloat() / peak.toFloat()
+            val applyGain = min(gain, 2.5f)
+            if (applyGain <= 1.05f) return
+            i = 0
+            while (i < bytes.size - 1) {
+                val sample =
+                        (bytes[i].toInt() and 0xff) or
+                                (bytes[i + 1].toInt() shl 8)
+                val s = sample.toShort().toInt()
+                val scaled =
+                        (s.toFloat() * applyGain)
+                                .coerceIn(Short.MIN_VALUE.toFloat(), Short.MAX_VALUE.toFloat())
+                                .toInt()
+                bytes[i] = (scaled and 0xff).toByte()
+                bytes[i + 1] = (scaled shr 8 and 0xff).toByte()
+                i += 2
+            }
+            raf.seek(44)
+            raf.write(bytes)
         }
     }
 }
