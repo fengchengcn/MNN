@@ -92,40 +92,17 @@ bool Omni::load() {
     if (!res) {
         return false;
     }
-    ScheduleConfig config;
-    if (mConfig->mllm_config_.empty()) {
-        mProcessorRuntimeManager = mRuntimeManager;
-    } else {
-        BackendConfig cpuBackendConfig;
-        config.type      = backend_type_convert(mConfig->backend_type(true));
-        config.numThread = mConfig->thread_num(true);
-        if(config.type == 3){
-            config.numThread |= 64;
-        }
-        if (mConfig->power(true) == "high") {
-            cpuBackendConfig.power = BackendConfig::Power_High;
-        } else if (mConfig->power(true) == "low") {
-            cpuBackendConfig.power = BackendConfig::Power_Low;
-        }
-        if (mConfig->memory(true) == "high") {
-            cpuBackendConfig.memory = BackendConfig::Memory_High;
-        } else if (mConfig->memory(true) == "low") {
-            cpuBackendConfig.memory = BackendConfig::Memory_Low;
-        }
-        if (mConfig->precision(true) == "high") {
-            cpuBackendConfig.precision = BackendConfig::Precision_High;
-        } else if (mConfig->precision(true) == "low") {
-            cpuBackendConfig.precision = BackendConfig::Precision_Low;
-        }
-        config.backendConfig = &cpuBackendConfig;
-        mProcessorRuntimeManager.reset(Executor::RuntimeManager::createRuntimeManager(config));
-        setRuntimeHint(mProcessorRuntimeManager);
-    }
+    
+    // Always reuse mRuntimeManager for multimodal processors to ensure tensor compatibility
+    mProcessorRuntimeManager = mRuntimeManager;
+    
     if (mConfig->has_deepstack()) {
         mExtraArgs.emplace_back(Express::_Fill(_var<int>({3, 1, 1}, {3}), _Scalar<float>(0.0)));
     }
     Module::Config module_config;
-    if(config.type == MNN_FORWARD_NN) {
+    // Follow the main LLM backend type for module config
+    MNNForwardType main_type = backend_type_convert(mConfig->backend_type());
+    if(main_type == MNN_FORWARD_NN) {
         module_config.shapeMutable = false;
         module_config.rearrange    = false;
     } else {
