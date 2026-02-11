@@ -147,3 +147,60 @@ MnnMultiModalAudioDemo/
 2.  **Sync Gradle**: 在 Android Studio 中点击右上角的 "Sync Project with Gradle Files" 图标，确保所有依赖下载完成。
 3.  **Run**: 点击绿色的三角形 "Run" 按钮。
 4.  **Logcat**: 在底部的 Logcat 面板中，你可以输入 `MnnMultiModalAudio_JNI` 来查看 C++ 层的日志，或者 `AudioHandler` 查看 Java 层的日志。
+
+
+
+## 6. 问题记录
+最初的问题是解决 Android 应用加载 libsherpa-mnn-jni.so 时因为找不到 MNN 符号而导致的闪退（UnsatisfiedLinkError）。
+1. 最初要解决的问题
+•
+现象：应用启动或调用 ASR（语音识别）功能时直接崩溃。
+•
+报错：java.lang.UnsatisfiedLinkError: dlopen failed: cannot locate symbol "...MNN::Express::Module::load..."。
+•
+原因：你项目中使用的 libsherpa-mnn-jni.so 是预编译的（可能是从 CDN 下载的），而它链接的 MNN 函数签名与你本地项目中实际运行的 libMNN.so 不匹配（版本、NDK 版本或编译配置不一致）。
+2. 解决方案总结
+为了彻底解决“版本不匹配”的问题，我们的核心思路是：用你本地正在使用的 MNN 库，重新手动编译一遍 sherpa-mnn。
+方案 A：手动编译 sherpa-mnn（目前正在进行的步骤）
+这是最可靠的方案，确保所有的 .so 文件“同根同源”。
+1.
+环境配置：
+◦
+使用 Android SDK 自带的 CMake 3.22.1 和 Ninja，避免系统全局 CMake 4.2 的兼容性问题。
+◦
+指定本地 MNN 库的路径（-DMNN_LIB_DIR）。
+2.
+执行编译命令（在 sherpa-mnn/build-android-arm64-v8a 目录下）：
+gitbash 中执行：
+```bash
+/d/AndroidSdk/cmake/3.22.1/bin/cmake.exe -G "Ninja" \
+  -DCMAKE_MAKE_PROGRAM="/d/AndroidSdk/cmake/3.22.1/bin/ninja.exe" \
+  -DCMAKE_TOOLCHAIN_FILE="/d/AndroidSdk/ndk/25.2.9519653/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI="arm64-v8a" \
+  -DANDROID_PLATFORM="android-21" \
+  -DSHERPA_MNN_ENABLE_JNI="ON" \
+  -DSHERPA_MNN_ENABLE_TTS="ON" \
+  -DSHERPA_MNN_ENABLE_SPEAKER_DIARIZATION="ON" \
+  -DSHERPA_MNN_ENABLE_BINARY="OFF" \
+  -DSHERPA_MNN_ENABLE_C_API="OFF" \
+  -DBUILD_SHARED_LIBS="ON" \
+  -DMNN_LIB_DIR="/d/mojing/MNN/project/android/build_64" \
+  -DCMAKE_INSTALL_PREFIX="./install" \
+  -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES="ON" \
+  ..
+```
+
+之后再执行：
+```bash
+/d/AndroidSdk/cmake/3.22.1/bin/ninja.exe
+/d/AndroidSdk/cmake/3.22.1/bin/ninja.exe install
+```
+
+4.
+替换库文件（最关键的一步）： 编译完成后，不能只替换一个文件，必须将以下 3 个文件同时拷贝 到 Android 项目的 app/src/main/jniLibs/arm64-v8a/ 目录：
+◦
+libsherpa-mnn-jni.so（新编出来的）
+◦
+libMNN.so（本地 build_64 目录下的）
+◦
+libMNN_Express.so（本地 build_64 目录下的）

@@ -27,10 +27,13 @@ import com.alibaba.mls.api.download.DownloadInfo
 import com.alibaba.mls.api.download.DownloadListener
 import com.alibaba.mls.api.download.ModelDownloadManager
 import com.alibaba.mnnllm.multimodal.audio.databinding.ActivityMainBinding
+import com.alibaba.mnnllm.multimodal.audio.asr.RecognizeService
+import com.google.android.material.floatingactionbutton.FloatingActionButton
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -54,17 +57,33 @@ class MainActivity : AppCompatActivity(), DownloadListener {
 
     // Model ID for download manager
     private val omniModelId = "ModelScope/MNN/Qwen2.5-Omni-7B-MNN"
+    private val asrModelIdZhEn = "ModelScope/MNN/sherpa-mnn-streaming-zipformer-bilingual-zh-en-2023-02-20"
+    private val asrModelIdEn = "ModelScope/MNN/sherpa-mnn-streaming-zipformer-en-2023-02-21"
+    private val asrModelId: String
+        get() = if (isChineseLocale()) asrModelIdZhEn else asrModelIdEn
 
     // Persistent storage path
     private val PERSISTENT_CACHE_DIR =
             Environment.getExternalStorageDirectory().absolutePath + "/MnnModels"
 
+    private var asrService: RecognizeService? = null
+    private var isAsrReady = false
+    private var isAsrInitializing = false
+    private var isAsrDownloading = false
+    private var asrFloatingButton: FloatingActionButton? = null
+
     private val requestPermissionLauncher =
             registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
                     permissions ->
                 val recordGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
-                if (permissions.containsKey(Manifest.permission.RECORD_AUDIO) && !recordGranted) {
-                    Toast.makeText(this, "Need Audio Permission", Toast.LENGTH_SHORT).show()
+                if (permissions.containsKey(Manifest.permission.RECORD_AUDIO)) {
+                    if (!recordGranted) {
+                        Toast.makeText(this, "Need Audio Permission", Toast.LENGTH_SHORT).show()
+                    } else {
+                        // Permission granted, user can now start recording
+                        // ASR model should be ready or downloading already
+                        Toast.makeText(this, "Permission granted, click again to record", Toast.LENGTH_SHORT).show()
+                    }
                 }
 
                 val imagePermission =
@@ -109,6 +128,7 @@ class MainActivity : AppCompatActivity(), DownloadListener {
         downloadManager = ModelDownloadManager.getInstance(this)
         downloadManager.addListener(this)
         checkAndInitModel()
+        ensureAsrModelAndInit()
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -142,6 +162,9 @@ class MainActivity : AppCompatActivity(), DownloadListener {
         }
 
         setupInputListeners()
+
+        setupAsrFloatingButton()
+
     }
 
     private fun checkAllFilesAccess(): Boolean {
@@ -230,6 +253,113 @@ class MainActivity : AppCompatActivity(), DownloadListener {
                 else -> false
             }
         }
+    }
+
+    private fun setupAsrFloatingButton() {
+        val btn: FloatingActionButton = findViewById(R.id.btn_asr_floating)
+        asrFloatingButton = btn
+        updateAsrButtonState()
+        btn.setOnClickListener {
+            if (!isPermissionGranted(Manifest.permission.RECORD_AUDIO)) {
+                requestPermissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                return@setOnClickListener
+            }
+            if (!isAsrReady) {
+                ensureAsrModelAndInit()
+                return@setOnClickListener
+            }
+            ttsManager.stop()
+            val service = asrService ?: return@setOnClickListener
+            if (service.isRecording()) {
+                service.stopRecord()
+                showRecordingIndicator(false)
+            } else {
+                showRecordingIndicator(true)
+                service.startRecord()
+            }
+        }
+    }
+
+    private fun updateAsrButtonState() {
+        val btn = asrFloatingButton ?: return
+        val enabled = isAsrReady || (!isAsrInitializing && !isAsrDownloading)
+        btn.isEnabled = enabled
+        btn.alpha = if (enabled) 1.0f else 0.5f
+    }
+
+    private fun ensureAsrModelAndInit() {
+        if (isAsrReady || isAsrInitializing || isAsrDownloading) return
+        if (!::downloadManager.isInitialized) return
+        val dir = downloadManager.getDownloadedFile(asrModelId)
+        if (dir != null && isValidAsrDir(dir)) {
+            initAsr(dir.absolutePath)
+            return
+        }
+        isAsrDownloading = true
+        updateAsrButtonState()
+        downloadManager.startDownload(asrModelId)
+    }
+
+    private fun isValidAsrDir(dir: File): Boolean {
+        if (!dir.exists() || !dir.isDirectory) return false
+        val files = arrayOf(
+            "encoder-epoch-99-avg-1.int8.mnn",
+            "decoder-epoch-99-avg-1.int8.mnn",
+            "joiner-epoch-99-avg-1.int8.mnn",
+            "tokens.txt",
+            "with-state-epoch-99-avg-1.int8.onnx"
+        )
+        return files.all {
+            val file = File(dir, it)
+            file.exists() && file.length() > 0
+        }
+    }
+
+    private fun initAsr(path: String) {
+        if (isAsrReady || isAsrInitializing) return
+        isAsrInitializing = true
+        updateAsrButtonState()
+        val service = RecognizeService(this)
+        asrService = service
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                service.initRecognizer(if (path.endsWith("/")) path else "$path/")
+                service.onRecognizeText = { text ->
+                    runOnUiThread {
+                        asrService?.stopRecord()
+                        showRecordingIndicator(false)
+                        handleAsrText(text)
+                    }
+                }
+                withContext(Dispatchers.Main) {
+                    isAsrReady = true
+                    isAsrInitializing = false
+                    updateAsrButtonState()
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "ASR init failed")
+                withContext(Dispatchers.Main) {
+                    isAsrReady = false
+                    isAsrInitializing = false
+                    updateAsrButtonState()
+                    Toast.makeText(this@MainActivity, "ASR init failed", Toast.LENGTH_SHORT)
+                        .show()
+                }
+            }
+        }
+    }
+
+    private fun handleAsrText(text: String) {
+        if (!isModelLoaded) {
+            Toast.makeText(this, "Model is loading...", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val imagePathToSend = currentImagePath
+        chatAdapter.addMessage(ChatMessage(text, true, imagePathToSend))
+        scrollToBottom()
+        clearImagePreview()
+        isFirstChunk = true
+        processText(text, imagePathToSend)
     }
 
     private fun updateUIForMode() {
@@ -540,6 +670,7 @@ class MainActivity : AppCompatActivity(), DownloadListener {
         if (::downloadManager.isInitialized) {
             downloadManager.removeListener(this)
         }
+        asrService?.stopRecord()
         nativeRelease()
     }
 
@@ -550,16 +681,26 @@ class MainActivity : AppCompatActivity(), DownloadListener {
     override fun onDownloadProgress(modelId: String, downloadInfo: DownloadInfo) {
         val progress = (downloadInfo.progress * 100).toInt()
         Timber.d("onDownloadProgress: $modelId, progress: $progress%")
-        runOnUiThread { binding.inputMessage.hint = "Downloading: $progress%" }
+        if (modelId == omniModelId) {
+            runOnUiThread { binding.inputMessage.hint = "Downloading: $progress%" }
+        }
     }
 
     override fun onDownloadFinished(modelId: String, path: String) {
         Timber.d("Download finished at: $path")
-        actualModelPath = path
-        runOnUiThread {
-            loadingModel = false
-            binding.inputMessage.hint = "Loading model..."
-            initModel()
+        if (modelId == omniModelId) {
+            actualModelPath = path
+            runOnUiThread {
+                loadingModel = false
+                binding.inputMessage.hint = "Loading model..."
+                initModel()
+            }
+        } else if (modelId == asrModelId) {
+            runOnUiThread {
+                isAsrDownloading = false
+                updateAsrButtonState()
+                initAsr(path)
+            }
         }
     }
 
@@ -567,7 +708,13 @@ class MainActivity : AppCompatActivity(), DownloadListener {
         Timber.e(e, "Download failed")
         runOnUiThread {
             loadingModel = false
-            Toast.makeText(this, "Model download failed", Toast.LENGTH_SHORT).show()
+            if (modelId == omniModelId) {
+                Toast.makeText(this, "Model download failed", Toast.LENGTH_SHORT).show()
+            } else if (modelId == asrModelId) {
+                isAsrDownloading = false
+                updateAsrButtonState()
+                Toast.makeText(this, "ASR model download failed", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
@@ -600,5 +747,10 @@ class MainActivity : AppCompatActivity(), DownloadListener {
         init {
             System.loadLibrary("multimodal_audio_jni")
         }
+    }
+
+    private fun isChineseLocale(): Boolean {
+        val language = Locale.getDefault().language
+        return language.startsWith("zh")
     }
 }
