@@ -9,6 +9,10 @@
 [![MNN Chat App](https://img.shields.io/badge/Apps-MNN_Chat-blue)](./apps/Android/MnnLlmChat/README.md)
 [![TaoAvatar](https://img.shields.io/badge/Apps-MNN_TaoAvatar-blue)](./apps/Android/Mnn3dAvatar/README.md)
 
+## 自定义多模态demo 
+项目路径：apps\Android\MnnMultiModalAudioDemo
+功能：集成多模态模型 Qwen2.5-Omni-7B， 支持图片+文字输入推理；存在的问题：按官方说明直接给多模态模型输入audio标签（wav音频文件），语音识别效果很差，原因未知。故又引入单独的ASR模型，用于语音识别，效果很好。
+详见项目内README文件:apps\Android\MnnMultiModalAudioDemo\README.md
 
 ## News 🔥
 - [2025/10/16] Support Qwen3-VL Series.

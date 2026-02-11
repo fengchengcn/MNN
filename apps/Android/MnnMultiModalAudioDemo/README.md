@@ -26,13 +26,21 @@ MnnMultiModalAudioDemo/
 │   │       │       ├── SimpleWaveRecorder.kt  # 具体的录音实现 (PCM转WAV)
 │   │       │       └── TtsManager.kt          # 文字转语音 (TTS) 管理
 │   │       │
+│   │       │       ├── asr/
+│   │       │       │   └── RecognizeService.kt    # 流式语音识别 (ASR, sherpa-mnn)
+│   │       │
+│   │       │   └── com/k2fsa/sherpa/mnn/          # sherpa-mnn 的 Kotlin 封装 (JNI 交互)
+│   │       │       ├── OnlineRecognizer.kt
+│   │       │       ├── FeatureConfig.kt
+│   │       │       └── OnlineStream.kt
+│   │       │
 │   │       ├── cpp/              # C++ 源代码 (核心推理引擎)
 │   │       │   ├── CMakeLists.txt             # C++ 构建脚本 (定义编译规则)
 │   │       │   └── multimodal_audio_jni.cpp   # JNI 接口实现 (Java与MNN的桥梁)
 │   │       │
 │   │       ├── res/              # 资源文件 (布局、图片、字符串等)
 │   │       │   ├── layout/
-│   │       │   │   └── activity_main.xml      # 主界面布局文件 (类似于 HTML)
+│   │       │   │   └── activity_main.xml      # 主界面布局文件 (新增 ASR 悬浮按钮与录音指示层)
 │   │       │   └── values/                    # 常量定义 (颜色、字符串)
 │   │       │
 │   │       └── AndroidManifest.xml # 应用清单文件 (声明权限、Activity、应用元数据)
@@ -68,6 +76,28 @@ MnnMultiModalAudioDemo/
 *   **`TtsManager.kt`**:
     *   简单的 `TextToSpeech` 封装，用于将 AI 生成的文本转换为语音播放。
 
+### 2.3 语音识别（ASR）
+
+*   **`RecognizeService.kt`**（流式 ASR 服务）：
+    *   负责从麦克风读取 16kHz 单声道 PCM 数据，按 100ms chunk 送入在线识别器。
+    *   基于 sherpa-mnn 的在线 Zipformer Transducer 模型进行解码，内部自动进行端点检测（Endpointing）。
+    *   端点触发时（一句话结束），通过回调 `onRecognizeText(text)` 返回识别文本，主界面随后将该文本发送给大模型进行问答。
+    *   关键方法与流程：
+        *   初始化识别器：`initRecognizer(asrModelDir, int8 = true)`，加载 encoder/decoder/joiner 三个 `.mnn` 文件与 `tokens.txt`，并加载 `with-state-epoch-99-avg-1.int8.onnx` 语言模型。
+        *   采集与解码：`startRecord()` 启动录音线程，循环 `acceptWaveform()` 并在 `isReady()` 时调用 `decode()`；端点判定后获取 `getResult(stream).text`。
+        *   停止：`stopRecord()` 停止录音并释放资源。
+    *   代码参考：
+        *   [RecognizeService.kt](file:///d:/mojing/MNN/apps/Android/MnnMultiModalAudioDemo/app/src/main/java/com/alibaba/mnnllm/multimodal/audio/asr/RecognizeService.kt)
+*   **MainActivity 集成**：
+    *   下载与准备 ASR 模型：根据系统语言自动选择中英双语或英文模型并下载缓存，完成后调用 `initAsr(path)`。
+    *   悬浮按钮控制：点击右下角的麦克风悬浮按钮可开始/停止 ASR 录音，识别完成后会自动停止并将文本发到对话流。
+    *   识别结果处理：`handleAsrText(text)` 将识别文本作为用户消息加入聊天，并与当前选中图片一起发送给 LLM。
+    *   代码参考：
+        *   [setupAsrFloatingButton](file:///d:/mojing/MNN/apps/Android/MnnMultiModalAudioDemo/app/src/main/java/com/alibaba/mnnllm/multimodal/audio/MainActivity.kt#L257-L280)
+        *   [ensureAsrModelAndInit](file:///d:/mojing/MNN/apps/Android/MnnMultiModalAudioDemo/app/src/main/java/com/alibaba/mnnllm/multimodal/audio/MainActivity.kt#L290-L301)
+        *   [initAsr](file:///d:/mojing/MNN/apps/Android/MnnMultiModalAudioDemo/app/src/main/java/com/alibaba/mnnllm/multimodal/audio/MainActivity.kt#L307-L350)
+        *   [handleAsrText](file:///d:/mojing/MNN/apps/Android/MnnMultiModalAudioDemo/app/src/main/java/com/alibaba/mnnllm/multimodal/audio/MainActivity.kt#L352-L363)
+
 ### 2.2 Native C++ 层 (模型推理)
 
 *   **`multimodal_audio_jni.cpp`**: 核心逻辑所在。
@@ -98,6 +128,12 @@ MnnMultiModalAudioDemo/
     *   检查本地目录 `.mnnmodels/MNN/Qwen2.5-Omni-7B-MNN` 是否存在且完整。
     *   **不存在**: 显示下载进度，调用 `ModelDownloadManager` 下载模型 (约 8GB-10GB)。
     *   **存在**: 调用 Native 方法 `loadModel()` 加载模型进入内存。
+4.  **ASR 模型检查与初始化**：
+    *   根据系统语言自动选择：
+        *   中文环境：`ModelScope/MNN/sherpa-mnn-streaming-zipformer-bilingual-zh-en-2023-02-20`
+        *   英文环境：`ModelScope/MNN/sherpa-mnn-streaming-zipformer-en-2023-02-21`
+    *   检查是否已下载并完整（必须包含 `encoder-epoch-99-avg-1.int8.mnn`, `decoder-epoch-99-avg-1.int8.mnn`, `joiner-epoch-99-avg-1.int8.mnn`, `tokens.txt`, `with-state-epoch-99-avg-1.int8.onnx`）。
+    *   完成后调用 `initAsr(path)` 初始化识别服务。
 
 ### 阶段二：用户交互 (Input)
 1.  **图片输入 (可选)**:
@@ -110,6 +146,9 @@ MnnMultiModalAudioDemo/
     *   用户 **松开** 按钮。
     *   录音停止，保存为 `.wav` 文件 (例如 `/data/user/0/.../cache/record_12345.wav`)。
     *   记录音频路径 `wavPath`。
+3.  **ASR 输入（实时语音转文本）**:
+    *   点击右下角的 **麦克风悬浮按钮**（`btn_asr_floating`）开始录音，界面显示 **录音指示层**（`recording_indicator`）与 **波形视图**（`WaveformView`）。
+    *   端点检测触发后自动停止录音，识别文本通过回调传回主界面并作为用户消息发送。
 
 ### 阶段三：推理与反馈 (Inference & Output)
 1.  **构建 Prompt**:
@@ -147,6 +186,7 @@ MnnMultiModalAudioDemo/
 2.  **Sync Gradle**: 在 Android Studio 中点击右上角的 "Sync Project with Gradle Files" 图标，确保所有依赖下载完成。
 3.  **Run**: 点击绿色的三角形 "Run" 按钮。
 4.  **Logcat**: 在底部的 Logcat 面板中，你可以输入 `MnnMultiModalAudio_JNI` 来查看 C++ 层的日志，或者 `AudioHandler` 查看 Java 层的日志。
+5.  **ASR 日志**: 过滤 `ASR_RecognizeService` 查看 ASR 录音与解码流程日志；查看 `MainActivity` 中与 ASR 相关的状态日志（下载、初始化、按钮状态）。
 
 
 
@@ -204,3 +244,12 @@ libsherpa-mnn-jni.so（新编出来的）
 libMNN.so（本地 build_64 目录下的）
 ◦
 libMNN_Express.so（本地 build_64 目录下的）
+
+---
+
+## 7. ASR 使用与集成要点
+*   **模型下载与缓存路径**：应用会优先请求外部存储的“所有文件访问”权限以将模型持久化到 `/MnnModels`，否则退回到应用私有缓存目录（`.mnnmodels`）。见 [setupDownloaderAndStart](file:///d:/mojing/MNN/apps/Android/MnnMultiModalAudioDemo/app/src/main/java/com/alibaba/mnnllm/multimodal/audio/MainActivity.kt#L124-L132)。
+*   **语言自适应**：根据系统语言自动选择中英双语/英文 ASR 模型，见 [asrModelId](file:///d:/mojing/MNN/apps/Android/MnnMultiModalAudioDemo/app/src/main/java/com/alibaba/mnnllm/multimodal/audio/MainActivity.kt#L28-L36)。
+*   **权限**：首次点击 ASR 按钮会申请录音权限；权限允许后再次点击即可开始录音。
+*   **UI 元素**：`activity_main.xml` 新增 `btn_asr_floating` 悬浮按钮与 `recording_indicator` 录音指示层、`waveform_view` 波形控件，便于录音状态可视化。
+*   **数据流转**：ASR 识别完成后将文本加入聊天并作为 Prompt 发送至 LLM，形成“语音 → 文本 → LLM”的闭环。
