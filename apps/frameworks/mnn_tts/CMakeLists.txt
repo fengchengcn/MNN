@@ -18,6 +18,7 @@ endif()
 set(MNN_SOURCE_ROOT ${CMAKE_CURRENT_LIST_DIR}/../../../)
 set(MNN_INSTALL_ROOT "${MNN_SOURCE_ROOT}/project/android/build_64")
 set(LIB_PATH "${MNN_INSTALL_ROOT}/lib")
+set(MNN_EXPRESS_PATH "${LIB_PATH}/libMNN_Express.so")
 message(STATUS "MNN_SOURCE_ROOT: ${MNN_SOURCE_ROOT}")
 message(STATUS "LIB_PATH: ${LIB_PATH}")
 
@@ -31,6 +32,12 @@ set_target_properties(MNN PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libMNN.so")
 # 2. 声明 MNN_Express 库 (解决 getGlobalExecutor 报错的关键)
 add_library(MNN_Express SHARED IMPORTED)
 set_target_properties(MNN_Express PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libMNN_Express.so")
+
+if(EXISTS "${MNN_EXPRESS_PATH}")
+  add_library(MNNExpress SHARED IMPORTED)
+  set_target_properties(MNNExpress PROPERTIES IMPORTED_LOCATION "${MNN_EXPRESS_PATH}")
+  message(STATUS "Linking legacy split runtime: ${MNN_EXPRESS_PATH}")
+endif()
 
 include_directories(
         ${CMAKE_CURRENT_LIST_DIR}/include

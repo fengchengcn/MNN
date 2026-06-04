@@ -28,25 +28,36 @@ class MNNConverter:
         self.tie_embeddings_info = None
 
     def convert(self, convert_args):
-        sfd = os.dup(1)
+        import contextlib
         log_fp = open(EXPORT_LOG, "a")
-        log_fd = log_fp.fileno()
-        # mnnconvert ... > .export.log
-        os.dup2(log_fd, 1)
+        sfd = None
         try:
-            sys.argv = convert_args
-            sys.argc = len(convert_args)
-            if self.mnnconvert is None:
-                from MNN.tools import mnnconvert
-                mnnconvert.main()
-            else:
-                convert_args[0] = self.mnnconvert
-                cmd = ' '.join(convert_args)
-                message = os.popen(cmd).read()
-                print(message)
-            sys.argv = []
+            sfd = os.dup(1)
+            log_fd = log_fp.fileno()
+            # mnnconvert ... > .export.log
+            os.dup2(log_fd, 1)
+        except Exception:
+            if sfd is not None:
+                os.close(sfd)
+                sfd = None
+
+        try:
+            with contextlib.redirect_stdout(log_fp):
+                sys.argv = convert_args
+                sys.argc = len(convert_args)
+                if self.mnnconvert is None:
+                    from MNN.tools import mnnconvert
+                    mnnconvert.main()
+                else:
+                    convert_args[0] = self.mnnconvert
+                    cmd = ' '.join(convert_args)
+                    message = os.popen(cmd).read()
+                    print(message)
+                sys.argv = []
         finally:
-            os.dup2(sfd, 1)
+            if sfd is not None:
+                os.dup2(sfd, 1)
+                os.close(sfd)
             log_fp.close()
 
     @spinner_run(f'convert onnx model to ')
@@ -183,8 +194,11 @@ class MNNConverter:
                 inputs.append(node['outputIndexes'][0])
         for output_name in expert_graph['outputName']:
             outputs.append(tensors.index(output_name))
+        # Use actual layer indices (for models where not all layers have MoE)
+        expert_layer_ids = getattr(self.exporter, 'expert_layer_ids', list(range(layers_num)))
         subgraphs = []
         for i in range(layers_num):
+            layer_idx = expert_layer_ids[i]
             for j in range(expert_num):
                 ijnodes = copy.deepcopy(nodes)
                 for op in ijnodes:
@@ -192,10 +206,10 @@ class MNNConverter:
                         for attr in op['main']['attr']:
                             if attr['key'] == 'name':
                                 names = attr['s'].split('/')
-                                names[2] = f'{i}_{j}'
+                                names[2] = f'{layer_idx}_{j}'
                                 attr['s'] = '/'.join(names)
                 subgraph = {
-                    'name': f'/expert/{i}_{j}',
+                    'name': f'/expert/{layer_idx}_{j}',
                     'inputs': inputs,
                     'outputs': outputs,
                     'tensors': copy.deepcopy(tensors),
@@ -249,6 +263,11 @@ class MNNConverter:
                     op['main']['gamma'] = np.frombuffer(f.read(external[1]), np.float32).tolist()
                     op['main']['beta'] = np.frombuffer(f.read(external[2]), np.float32).tolist()
                     del op['main']['external']
+                if op['type'] == 'Const' and 'external' in op['main']:
+                    external = op['main']['external']
+                    f.seek(external[0])
+                    op['main']['float32s'] = np.frombuffer(f.read(external[1]), np.float32).tolist()
+                    del op['main']['external']
         # Rebuild ops
         with open(self.mnn_weight_path, 'wb') as self.mnn_weight:
             for op in tqdm(mnn_graph['oplists'], 'Quant weights'):
@@ -288,7 +307,7 @@ class MNNConverter:
             q_weight = torch.zeros(q_weight_num, dtype=torch.uint8)
             return q_weight, alpha
 
-        q_weight, alpha = torch_quant(weight, quant_bit, quant_block, symmetric, self.args.awq, self.args.hqq)
+        q_weight, alpha = torch_quant(weight.cpu(), quant_bit, quant_block, symmetric, self.args.awq, self.args.hqq)
         return q_weight, alpha
 
     def write_weight(self, data):
@@ -327,18 +346,24 @@ class MNNConverter:
             alpha_len, q_min, shape_int32, header_len = 0, 0, False, 0
         else:
             q_min = 1
-            assert(quant_bit in (1, 2, 4, 8))
+            assert(quant_bit in (1, 2, 3, 4, 8))
             q_weight, alpha = self.quant(linear.weight.data, quant_bit, quant_block, symmetric)
             header_len, shape_int32 = self.write_header(ic, oc, quant_bit)
-
+            scale_fp16 = (self.args.scale_bit == 16)
+            alpha_dtype_size = 2 if scale_fp16 else 4
             if self.exporter.args.skip_weight:
                 weight_len = len(q_weight) + header_len
                 self.mnn_weight.seek(len(q_weight), 1)
-                alpha_len = len(alpha) * 4
+                alpha_len = len(alpha) * alpha_dtype_size
                 self.mnn_weight.seek(alpha_len, 1)
             else:
                 weight_len = self.write_weight(q_weight) + header_len
-                alpha_len = self.write_weight(alpha)
+                if scale_fp16:
+                    alpha_np = alpha.numpy() if hasattr(alpha, 'numpy') else np.asarray(alpha)
+                    alpha_fp16 = alpha_np.astype(np.float16)
+                    alpha_len = self.write_weight(alpha_fp16)
+                else:
+                    alpha_len = self.write_weight(alpha)
 
         if linear.bias is not None:
             bias_length = (oc * 4)
@@ -371,6 +396,8 @@ class MNNConverter:
             return self.rebuild_linear(op, graph)
         if op_type == 'FusedAttention':
             return self.rebuild_attnention(op, graph)
+        if op_type == 'FusedLinearAttention':
+            return self.rebuild_linear_attnention(op, graph)
         if op_type == "LayerNorm":
             return self.rebuild_layernorm(op, graph)
         if op_type == 'MoE':
@@ -409,21 +436,84 @@ class MNNConverter:
 
     def rebuild_attnention(self, op, graph):
         attrs = op['main']['attr']
+        layer_index = -1
+        kv_shared_layer_index = -1
         for attr in attrs:
             if attr['key'] == 'name':
                 name = attr['s']
+            elif attr['key'] == 'kv_cache':
+                kv_cache = attr['i']
+            elif attr['key'] == 'layer_index':
+                layer_index = attr.get('i', -1)
+            elif attr['key'] == 'kv_shared_layer_index':
+                kv_shared_layer_index = attr.get('i', -1)
         origin_input = op['inputIndexes']
         origin_output = op['outputIndexes']
+        main_dict = {
+            "kv_cache": bool(kv_cache),
+            "layer_index": layer_index,
+            "kv_shared_layer_index": kv_shared_layer_index,
+        }
         fused_attention = {
             "inputIndexes": origin_input,
             "main_type": "AttentionParam",
-            "main": { "kv_cache": True },
+            "main": main_dict,
             "name": name,
             "outputIndexes": origin_output,
             "type": "Attention",
             "defaultDimentionFormat": "NHWC"
         }
         return [fused_attention]
+
+    def rebuild_linear_attnention(self, op, graph):
+        attrs = op['main']['attr']
+        num_k_heads = 0
+        num_v_heads = 0
+        head_k_dim = 0
+        head_v_dim = 0
+        attn_type = "gated_delta_rule"
+        use_qk_l2norm = False
+        name = ""
+
+        # Parse attributes from Custom Op
+        for attr in attrs:
+            if attr['key'] == 'name':
+                name = attr['s']
+            elif attr['key'] == 'num_k_heads':
+                num_k_heads = attr['i']
+            elif attr['key'] == 'num_v_heads':
+                num_v_heads = attr['i']
+            elif attr['key'] == 'head_k_dim':
+                head_k_dim = attr['i']
+            elif attr['key'] == 'head_v_dim':
+                head_v_dim = attr['i']
+            elif attr['key'] == 'attn_type':
+                attn_type = attr['s']
+            elif attr['key'] == 'use_qk_l2norm':
+                use_qk_l2norm = bool(attr['i'])
+
+        input_indexes = op['inputIndexes']
+        output_indexes = op['outputIndexes']
+
+        linear_attention_param = {
+            "attn_type": attn_type,
+            "num_k_heads": num_k_heads,
+            "num_v_heads": num_v_heads,
+            "head_k_dim": head_k_dim,
+            "head_v_dim": head_v_dim,
+            "use_qk_l2norm": use_qk_l2norm
+        }
+
+        fused_linear_attention = {
+            "inputIndexes": input_indexes,
+            "main_type": "LinearAttentionParam",
+            "main": linear_attention_param,
+            "name": name,
+            "outputIndexes": output_indexes,
+            "type": "LinearAttention",
+            "defaultDimentionFormat": "NHWC"
+        }
+        return [fused_linear_attention]
 
     def rebuild_linear(self, op, graph):
         attrs = op['main']['attr']
@@ -466,7 +556,14 @@ class MNNConverter:
             weight_offset = external[0] + header_len
             alpha_offset = external[0] + external[1]
             alpha_size = external[2]
-            self.tie_embeddings_info = [weight_offset, alpha_offset, alpha_size, quant_bit, quant_block]
+            self.tie_embeddings_info = {
+                "weight_offset": weight_offset,
+                "alpha_offset": alpha_offset,
+                "alpha_size": alpha_size,
+                "quant_bit": quant_bit,
+                "quant_block": quant_block,
+                "alpha_dtype": "fp16" if self.args.scale_bit == 16 else "fp32",
+            }
 
         origin_input = op['inputIndexes']
         origin_output = op['outputIndexes']
@@ -521,7 +618,8 @@ class MNNConverter:
             quanParameter = {
                 "quantScale": 1.0, "scaleIn": 0.0, "scaleOut": 0.0,
                 "useInt32": False, "has_scaleInt": False, "shapeInt32": shape_int32,
-                "type": 1, "aMaxOrBits": quant_bit, "aMin": aMin, "readType": readType, "weightSize": 0
+                "type": 1, "aMaxOrBits": quant_bit, "aMin": aMin, "readType": readType, "weightSize": 0,
+                "scaleStorage": "FP16" if self.args.scale_bit == 16 else "FP32",
             }
         conv_op = {
             "name": conv_name,

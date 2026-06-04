@@ -19,6 +19,7 @@ int main(int argc, const char* argv[]) {
     std::string config_path = argv[1];
     std::cout << "config path is " << config_path << std::endl;
     std::unique_ptr<Qwen3Reranker> reranker(new Qwen3Reranker(config_path));
+    reranker->load();
     reranker->setInstruct("Given a web search query, retrieve relevant passages that answer the query");
     std::string query = "What is the capital of China?";
     std::vector<std::string> documents = {
@@ -34,6 +35,10 @@ int main(int argc, const char* argv[]) {
         auto t1 = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         std::cout << "Reranker compute time: " << duration << " ms" << std::endl;
+        if(scores.empty()) {
+            std::cerr << "Error: Reranker compute_scores failed (returned empty)" << std::endl;
+            return -1;
+        }
     }
     #endif
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -41,6 +46,12 @@ int main(int argc, const char* argv[]) {
     auto t1 = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
     std::cout << "Reranker compute time: " << duration << " ms" << std::endl;
+    
+    // Check for errors
+    if(scores.empty()) {
+        std::cerr << "Error: Reranker compute_scores failed (returned empty)" << std::endl;
+        return -1;
+    }
     // sorted_documents by scores
     std::vector<int> documents_index(documents.size());
     for (int i = 0; i < documents.size(); i++) {

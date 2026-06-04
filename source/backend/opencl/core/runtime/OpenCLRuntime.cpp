@@ -79,8 +79,11 @@ OpenCLRuntime::OpenCLRuntime(int platformSize, int platformId, int deviceId, voi
                 return;
             }
             const std::string deviceName    = mFirstGPUDevicePtr->getInfo<CL_DEVICE_NAME>();
+            const std::string driverVersion = mFirstGPUDevicePtr->getInfo<CL_DRIVER_VERSION>();
             mDeviceName = deviceName;
             const std::string deviceVersion = mFirstGPUDevicePtr->getInfo<CL_DEVICE_VERSION>();
+            
+            mDriverInfo = deviceName + " " + deviceVersion + " " + driverVersion;
             std::map<std::string, std::pair<MNN::MaliAr, MNN::GpuLevel>> maliArMap {
                 {"Mali-T860", {MIDGARD, LOW}},
                 {"Mali-T880", {MIDGARD, LOW}},
@@ -395,6 +398,14 @@ std::vector<size_t> OpenCLRuntime::getMaxImage2DSize() {
 
 bool OpenCLRuntime::isSupportedFP16() const {
     return mIsSupportedFP16;
+}
+
+bool OpenCLRuntime::isClCreateImageAvailable() const {
+#ifdef MNN_USE_LIB_WRAPPER
+    return OpenCLSymbolsOperator::getOpenclSymbolsPtr()->clCreateImage != nullptr;
+#else
+    return true; // clCreateImage is available when statically linked with OpenCL 1.2+
+#endif
 }
 
 bool OpenCLRuntime::isDeviceSupportedLowPower() const {
@@ -762,6 +773,7 @@ std::pair<const void*, size_t> OpenCLRuntime::makeCache(void* tuneInfo) {
     
     std::unique_ptr<BackendInfoT> backend(new BackendInfoT);
     backend->deviceName = mDeviceInfo;
+    backend->driverVersion = mDriverInfo;
     
     // Get All program's binary
     for (auto& iter : mBuildProgramMap) {
@@ -935,6 +947,10 @@ bool OpenCLRuntime::setCache(std::pair<const void*, size_t> cache) {
             
             // Load Program
             if (nullptr != backendinfo->programs()) {
+                if(backendinfo->driverVersion() == nullptr || backendinfo->driverVersion()->str() != mDriverInfo){
+                    res = false;
+                    continue;
+                }
                 auto programs = backendinfo->programs();
                 for (int i=0; i<programs->size(); ++i) {
                     auto shaderInfo = programs->GetAs<Shader>(i);

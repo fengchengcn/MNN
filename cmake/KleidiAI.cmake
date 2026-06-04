@@ -22,9 +22,9 @@ function (download_kleidiai_and_collect_sources)
     # Disable the KleidiAI tests
     set(KLEIDIAI_BUILD_TESTS OFF)
 
-    set(KLEIDIAI_COMMIT_SHA "1.14.0")
+    set(KLEIDIAI_COMMIT_SHA "1.16.0")
     set(KLEIDIAI_DOWNLOAD_URL "https://github.com/ARM-software/kleidiai/archive/refs/tags/v${KLEIDIAI_COMMIT_SHA}.tar.gz")
-    set(KLEIDIAI_ARCHIVE_MD5 "45e110675d93f99f82c23a1afcca76bc")
+    set(KLEIDIAI_ARCHIVE_MD5 "0a9e9008adb6031f9e8cf70dff4a3321")
 
     set(_kleidiai_src_dir "")
     if(DEFINED KLEIDIAI_SRC_DIR AND EXISTS "${KLEIDIAI_SRC_DIR}")
@@ -73,8 +73,15 @@ function (download_kleidiai_and_collect_sources)
             CACHE PATH "Path to KleidiAI source (downloaded or provided)" FORCE)
     endif()
 
-    list(APPEND MNN_SOURCES_KLEIDIAI ${CMAKE_CURRENT_LIST_DIR}/mnn_kleidiai.cpp)
-    list(APPEND MNN_SOURCES_KLEIDIAI ${CMAKE_CURRENT_LIST_DIR}/mnn_kleidiai_util.cpp)
+    set(MNN_KLEIDIAI_DIR "${CMAKE_SOURCE_DIR}/source/backend/cpu/kleidiai")
+    list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_DIR}/mnn_kleidiai.cpp)
+    list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_DIR}/mnn_kleidiai_util.cpp)
+    list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_DIR}/KleidiAIConvolution.cpp)
+    list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_DIR}/KleidiAIConvolutionDepthwise.cpp)
+    list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_DIR}/KleidiAIConvInt8.cpp)
+    list(APPEND MNN_SOURCES_KLEIDIAI ${MNN_KLEIDIAI_DIR}/KleidiAIDenseConvolution.cpp)
+
+    include_directories(${MNN_KLEIDIAI_DIR})
 
     include_directories(
         ${KLEIDIAI_SRC_DIR}/

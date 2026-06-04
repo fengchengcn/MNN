@@ -150,10 +150,6 @@ void MNNPackForMatMul_B(float* dest, const float* source, size_t h, size_t kerne
 void MNNPackedMatMul(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
 void MNNFunctionInit();
 void MNNPackedMatMulRemain(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
-void MNNPackedMatMul_int4(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
-void MNNPackedMatMulRemain_int4(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
-void MNNPackedMatMul_int8(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
-void MNNPackedMatMulRemain_int8(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
 
 void MNNPackForSparseMatMul_B(float* dest, unsigned int* NNZMap, int* dataOffsetMap, int sparseBlockOC, const float* source, size_t h, size_t l, const int eP, bool transpose);
 struct SparseMatMulParas
@@ -243,11 +239,23 @@ struct MatmulRelatedFunctions {
     void(*MNNPackC4Int8ForMatMul_A)(int8_t* destOrigin, int8_t const** sourceGroup, const int32_t* info, const int32_t* el) = nullptr;
     void(*MNNGemmInt8AddBiasScale_Unit_FP16)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad, const QuanPostTreatParameters* post, size_t realDstCount) = nullptr;
     void(*MNNGemmInt8AddBiasScale_w4_Unit_FP16)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad, const QuanPostTreatParameters* post, size_t realDstCount) = nullptr;
+    void (*MNNGemmInt8AddBiasScale_w2_Unit_FP16)(int8_t* dst, const int8_t* src, const int8_t* weight,
+                                                 size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad,
+                                                 const QuanPostTreatParameters* post, size_t realDstCount) = nullptr;
+    void (*MNNGemmInt8AddBiasScale_w3_Unit_FP16)(int8_t* dst, const int8_t* src, const int8_t* weight,
+                                                 size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad,
+                                                 const QuanPostTreatParameters* post, size_t realDstCount) = nullptr;
     void(*MNNGemmInt8AddBiasScale_Unit_FP16_DecodeMax)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad, const QuanPostTreatParameters* post, size_t realDstCount) = nullptr;
     void(*MNNGemmInt8AddBiasScale_Unit_FP32_DecodeMax)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad, const QuanPostTreatParameters* post, size_t realDstCount) = nullptr;
     void(*MNNGemmInt8AddBiasScale_w4_Unit_FP16_DecodeMax)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad, const QuanPostTreatParameters* post, size_t realDstCount) = nullptr;
     void(*MNNGemmInt8AddBiasScale_w4_Unit_FP32_DecodeMax)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad, const QuanPostTreatParameters* post, size_t realDstCount) = nullptr;
     void(*Int8GemmKernel_W4)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad, size_t dst_step, size_t dst_depth_quad, const QuanPostTreatParameters* post, size_t realDstCount) = nullptr;
+    void (*Int8GemmKernel_W2)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad,
+                              size_t dst_step, size_t dst_depth_quad, const QuanPostTreatParameters* post,
+                              size_t realDstCount) = nullptr;
+    void (*Int8GemmKernel_W3)(int8_t* dst, const int8_t* src, const int8_t* weight, size_t src_depth_quad,
+                              size_t dst_step, size_t dst_depth_quad, const QuanPostTreatParameters* post,
+                              size_t realDstCount) = nullptr;
     void(*MNNSumByAxisLForMatmul_A)(float* dest, int8_t* source, const float* dequantScale, ssize_t realDstCount, SumByAxisParams sumParams) = nullptr;
 
     int eP;
@@ -259,6 +267,7 @@ struct CoreFunctions {
     bool supportSDot = false;
     bool supportI8mm = false;
     bool supportSME2 = false;
+    bool supportRVV  = false;
     int  smeCoreNumber = 0;
     /**MatMul Pack and Functions*/
     void(*MNNGetMatMulPackMode)(int* eP, int *lP, int* hP);
@@ -279,10 +288,25 @@ struct CoreFunctions {
     void(*MNNAbsMax)(const float* source, float* absmax, size_t src_depth_quad, size_t realSize, int pack) = nullptr;
     void(*MNNQuantScale)(float* absmax, float* quant_scale, float* dequant_scale, size_t thread, size_t batch) = nullptr;
     void(*MNNDynamicQuant)(const float* src, int8_t* dst, const float* scale, size_t src_depth_quad, size_t realSize, int pack, const float* bias) = nullptr;
-    void(*MNNPackedMatMul_int8)(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b) = nullptr;
-    void(*MNNPackedMatMulRemain_int8)(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b) = nullptr;
     void(*MNNComputeMatMulForH_1)(const float* A, const float* B, float* C, const float* biasPtr, const MatMulParam* param, size_t tId);
     void(*MNNComputeMatMulForE_1)(const float* A, const float* B, float* C, const float* biasPtr, const MatMulParam* param, size_t tId);
+    // Rank-1 update: S[dk, dv] += k[dk] * delta[dv] (outer product add)
+    void(*MNNRankOneUpdate)(float* S, const float* k, const float* delta, size_t dk, size_t dv);
+    // Read-only dual MatVec: out_k = S^T @ k, out_q = S^T @ q (does NOT modify S)
+    void(*MNNDualMatVec)(const float* S, const float* k, const float* q, float* out_k, float* out_q, size_t dk, size_t dv);
+    // Fused decay + rank-1 update: S[i,j] = decay * S[i,j] + k[i] * delta[j]
+    void(*MNNDecayRankOneUpdate)(float* S, const float* k, const float* delta, float decay, size_t dk, size_t dv);
+    // Fused gated-delta-rule kernel. Computes (all in the backend's native
+    // precision — fp32 in default backend, fp16 in arm82; pointer type is
+    // float* by convention):
+    //     out_k = S^T @ k                                       [d_v]
+    //     out_q = S^T @ q                                       [d_v]
+    //     delta = beta * (v - decay * out_k)                    [d_v]
+    //     out   = decay * out_q + kq * delta                    [d_v] (written)
+    //     S     = decay * S + k ⊗ delta                         [d_k, d_v] (in-place)
+    // 'kq' must be precomputed as dot(k,q) by the caller.
+    void (*MNNFusedGatedDelta)(float* S, const float* k, const float* q, const float* v, float* out, float decay,
+                               float beta, float kq, size_t dk, size_t dv);
     void(*MNNCountMaxMinValue)(const float* source, float* minVal, float* maxVal, size_t size);
     void(*MNNDynamicUpdateConvBiasScale)(float* newbias, float* oldbias, float* weightKernelSum, float* inputZero, size_t ocQuad);
     void(*MNNAsyQuantInfo)(float* scale, float* bias, float* qscale, float* qbias, float* dstMin, float* dstMax, const float* src, const size_t* info);

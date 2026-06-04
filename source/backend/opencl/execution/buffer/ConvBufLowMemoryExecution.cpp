@@ -15,6 +15,14 @@ namespace OpenCL {
 // set mDequantScale mDequantOffset mNumQuantBit mFilterDataPtr from mConv2dParams
 void ConvBufLowMemoryExecution::getInfoFromOpLowMemory(void *weight_ptr) {
     auto quanCommon = ConvolutionCommon::load(mOp, this->backend(), false, true, weight_ptr);
+    if(quanCommon == nullptr){
+        mValid = false;
+        auto staticMapAlloc = mOpenCLBackend->getStaticAllocatorMMap();
+        if(mOpenCLBackend->getRuntime()->hint().useCachedMmap && staticMapAlloc != nullptr){
+            staticMapAlloc->setRemove(true);
+        }
+        return;
+    }
     // set mResource->mNumQuantBit
     if(quanCommon->canUseInt4){
         mResource->mNumQuantBit = 4;
@@ -96,6 +104,10 @@ void ConvBufLowMemoryExecution::getInfoFromOpLowMemory(void *weight_ptr) {
                         for(int j = 0; j < mResource->mBlockSize; ++j){
                             float o = srcZ[2*j+0];
                             float s = srcZ[2*j+1];
+                            // For int4, absorb -8 bias into offset: offset_new = offset - 8 * scale
+                            if (mResource->mNumQuantBit == 4) {
+                                o = o - 8.0f * s;
+                            }
                             ((half_float::half*)dequantScaleOffsetBufferMap)[(j * numAlphaPack + i) * 2] = (half_float::half)(s * coef);
                             ((half_float::half*)dequantScaleOffsetBufferMap)[(j * numAlphaPack + i) * 2 + 1] = (half_float::half)(o * coef);
                         }
@@ -122,6 +134,10 @@ void ConvBufLowMemoryExecution::getInfoFromOpLowMemory(void *weight_ptr) {
                         for(int j = 0; j < mResource->mBlockSize; ++j){
                             float o = srcZ[2*j+0];
                             float s = srcZ[2*j+1];
+                            // For int4, absorb -8 bias into offset: offset_new = offset - 8 * scale
+                            if (mResource->mNumQuantBit == 4) {
+                                o = o - 8.0f * s;
+                            }
                             ((float *)dequantScaleOffsetBufferMap)[(j * numAlphaPack + i) * 2] = s * coef;
                             ((float *)dequantScaleOffsetBufferMap)[(j * numAlphaPack + i) * 2 + 1] = o * coef;
                         }
@@ -165,6 +181,9 @@ bool ConvBufLowMemoryExecution::convertToQuantWeight1x1Buffer(cl::Buffer input) 
     } else {/* More types to be supported. */}
 
     mBufferToConv1x1Kernel = runtime->buildKernelWithCache("buffer_convert_quant", kernelName, buildOptions, mOpenCLBackend->getPrecision());
+    if (mBufferToConv1x1Kernel == nullptr) {
+        return false;
+    }
     auto kernel = mBufferToConv1x1Kernel->get();
     uint32_t gws[2] = {static_cast<uint32_t>(UP_DIV(mResource->mInputChannel, PACK_CIN)), static_cast<uint32_t>(UP_DIV(mResource->mOutputChannel, PACK_COUT))};
 
@@ -217,6 +236,9 @@ void ConvBufLowMemoryExecution::set1x1WeightLowMemory() {
         }
     } else{
         getInfoFromOpLowMemory(nullptr);
+        if(mValid == false){
+            return;
+        }
     }
     cl_int res = CL_SUCCESS;
     std::shared_ptr<Tensor> filterBuffer(Tensor::createDevice<float>({ROUND_UP(mResource->mOutputChannel, PACK_COUT), ROUND_UP(mResource->mInputChannel, PACK_CIN), 1, 1}));
@@ -237,6 +259,9 @@ void ConvBufLowMemoryExecution::set1x1WeightLowMemory() {
         if(mapPtr != nullptr && res == CL_SUCCESS){
             if(preAllocGpuMem){
                 getInfoFromOpLowMemory(mapPtr);
+                if(mValid == false){
+                    return;
+                }
             } else{
                 ::memcpy(mapPtr, mFilterDataPtr, cpy_size);
             }
@@ -272,6 +297,9 @@ void ConvBufLowMemoryExecution::set1x1WeightLowMemory() {
     }else {
         if(preAllocGpuMem){
             getInfoFromOpLowMemory(nullptr);
+            if(mValid == false){
+                return;
+            }
         }
         // Use Image load weights
         if(UP_DIV(mResource->mInputChannel, actual_packCin) <= 16384 && ROUND_UP(mResource->mOutputChannel, PACK_COUT) <= 16384){
@@ -309,6 +337,9 @@ void ConvBufLowMemoryExecution::setGeneralWeightLowMemory() {
         }
     } else{
         getInfoFromOpLowMemory(nullptr);
+        if(mValid == false){
+            return;
+        }
     }
     
     if(mOpenCLBackend->getRuntime()->hint().useCachedMmap <= 1){
@@ -327,6 +358,9 @@ void ConvBufLowMemoryExecution::setGeneralWeightLowMemory() {
         if(ptrCL != nullptr && res == CL_SUCCESS) {
             if(preAllocGpuMem){
                 getInfoFromOpLowMemory(ptrCL);
+                if(mValid == false){
+                    return;
+                }
             } else{
                 ::memcpy(ptrCL, mFilterDataPtr, cpy_size);
             }
@@ -337,14 +371,20 @@ void ConvBufLowMemoryExecution::setGeneralWeightLowMemory() {
         if (mResource->mNumQuantBit == 8) {
             // ROUND_UP(IC, 4), UP_DIV(OC, 4) * mKernelWidth * mKernelHeight
             mResource->mFilter.reset(Tensor::createDevice<int8_t>({1, UP_DIV(mResource->mOutputChannel, 4) * mResource->mKernelWidth * mResource->mKernelHeight, 1, 4 * ROUND_UP(mResource->mInputChannel, 4)}));
-            mOpenCLBackend->onAcquireBuffer(mResource->mFilter.get(), Backend::STATIC);
+            if (!(mOpenCLBackend->onAcquireBuffer(mResource->mFilter.get(), Backend::STATIC))) {
+                mValid = false;
+                return;
+            }
         } else if (mResource->mNumQuantBit == 4){
             // ROUND_UP(IC, 4), UP_DIV(OC, 4) * mKernelWidth * mKernelHeight
             // For int4 case, data stored in mFilter should be uint8_t,
             // while "Tensor::createDevice<uint8_t>" occupies more memory than "Tensor::createDevice<int8_t>".
             // Therefore, we use "Tensor::createDevice<int8_t>" currently, leaving "Tensor::createDevice<uint8_t>" to be supported.
             mResource->mFilter.reset(Tensor::createDevice<int8_t>({1, UP_DIV(mResource->mOutputChannel, 4) * mResource->mKernelWidth * mResource->mKernelHeight, 1, 2 * ROUND_UP(mResource->mInputChannel, 4)}));
-            mOpenCLBackend->onAcquireBuffer(mResource->mFilter.get(), Backend::STATIC);
+            if (!(mOpenCLBackend->onAcquireBuffer(mResource->mFilter.get(), Backend::STATIC))) {
+                mValid = false;
+                return;
+            }
         }
         // convert to NC4HW4
         MNN::OpenCL::BufferConvertor bufferConvertor{mOpenCLBackend->getOpenCLRuntime()};
@@ -352,18 +392,27 @@ void ConvBufLowMemoryExecution::setGeneralWeightLowMemory() {
     }else{
         if(preAllocGpuMem){
             getInfoFromOpLowMemory(nullptr);
+            if(mValid == false){
+                return;
+            }
         }
         if (mResource->mNumQuantBit == 8) {
             // ROUND_UP(IC, 4), UP_DIV(OC, 4) * mKernelWidth * mKernelHeight
             mResource->mFilter.reset(Tensor::createDevice<int8_t>({1, UP_DIV(mResource->mOutputChannel, 4) * mResource->mKernelWidth * mResource->mKernelHeight, 1, 4 * ROUND_UP(mResource->mInputChannel, 4)}));
-            mOpenCLBackend->onAcquireBuffer(mResource->mFilter.get(), Backend::STATIC);
+            if (!(mOpenCLBackend->onAcquireBuffer(mResource->mFilter.get(), Backend::STATIC))) {
+                mValid = false;
+                return;
+            }
         } else if (mResource->mNumQuantBit == 4){
             // ROUND_UP(IC, 4), UP_DIV(OC, 4) * mKernelWidth * mKernelHeight
             // For int4 case, data stored in mFilter should be uint8_t,
             // while "Tensor::createDevice<uint8_t>" occupies more memory than "Tensor::createDevice<int8_t>".
             // Therefore, we use "Tensor::createDevice<int8_t>" currently, leaving "Tensor::createDevice<uint8_t>" to be supported.
             mResource->mFilter.reset(Tensor::createDevice<int8_t>({1, UP_DIV(mResource->mOutputChannel, 4) * mResource->mKernelWidth * mResource->mKernelHeight, 1, 2 * ROUND_UP(mResource->mInputChannel, 4)}));
-            mOpenCLBackend->onAcquireBuffer(mResource->mFilter.get(), Backend::STATIC);
+            if (!(mOpenCLBackend->onAcquireBuffer(mResource->mFilter.get(), Backend::STATIC))) {
+                mValid = false;
+                return;
+            }
         }
     }
 
@@ -696,7 +745,38 @@ void ConvBufLowMemoryExecution::tuneGemvLowMemory(Tensor * input, Tensor * outpu
     if(mResource->mUseImage){
         buildOption.emplace("-DUSE_IMAGE");
     }
-    
+
+    // Create image1d_buffer_t for input to leverage texture cache (int4 only)
+    if (mResource->mNumQuantBit == 4) {
+        auto runtime = mOpenCLBackend->getOpenCLRuntime();
+        if (runtime->isClCreateImageAvailable()) {
+            cl_int err = CL_SUCCESS;
+            cl_image_format format;
+            format.image_channel_order = CL_RGBA;
+            format.image_channel_data_type = (mOpenCLBackend->fpBytes() == 2) ? CL_HALF_FLOAT : CL_FLOAT;
+
+            cl_image_desc desc;
+            memset(&desc, 0, sizeof(desc));
+            desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+            desc.image_width = input->elementSize() / 4;
+            desc.buffer = openCLBuffer(input)();
+
+            if (mInputImage1d != nullptr) {
+                clReleaseMemObject(mInputImage1d);
+                mInputImage1d = nullptr;
+            }
+            mInputImage1d = clCreateImage(runtime->context()(), CL_MEM_READ_ONLY, &format, &desc, nullptr, &err);
+            if (err == CL_SUCCESS && mInputImage1d != nullptr) {
+                buildOption.emplace("-DUSE_IMAGE1D_INPUT");
+            } else {
+                if (mInputImage1d != nullptr) {
+                    clReleaseMemObject(mInputImage1d);
+                }
+                mInputImage1d = nullptr;
+            }
+        }
+    }
+
     int local_size = useLocalMem ? 128 : 1;
     if(useLocalMem && mOpenCLBackend->getCLTuneLevel() != None && mOpenCLBackend->getCLTuneLevel() != Fast){
         int min_time = INT_MAX;
@@ -712,7 +792,11 @@ void ConvBufLowMemoryExecution::tuneGemvLowMemory(Tensor * input, Tensor * outpu
             ret |= kernel->get().setArg(idx++, static_cast<int>(gws[0]));
             ret |= kernel->get().setArg(idx++, static_cast<int>(gws[1]));
             ret |= kernel->get().setArg(idx++, static_cast<int>(gws[1]));
-            ret |= kernel->get().setArg(idx++, openCLBuffer(input));
+            if (mInputImage1d != nullptr) {
+                ret |= kernel->get().setArg(idx++, sizeof(cl_mem), &mInputImage1d);
+            } else {
+                ret |= kernel->get().setArg(idx++, openCLBuffer(input));
+            }
             if(mResource->mUseImage){
                 ret |= kernel->get().setArg(idx++, *mResource->mKernelImage.get());
             }else{
@@ -748,7 +832,11 @@ void ConvBufLowMemoryExecution::tuneGemvLowMemory(Tensor * input, Tensor * outpu
     ret |= unit.kernel->get().setArg(idx++, static_cast<int>(mGlobalWorkSize[0]));
     ret |= unit.kernel->get().setArg(idx++, static_cast<int>(mGlobalWorkSize[1]));
     ret |= unit.kernel->get().setArg(idx++, static_cast<int>(mGlobalWorkSize[1]));
-    ret |= unit.kernel->get().setArg(idx++, openCLBuffer(input));
+    if (mInputImage1d != nullptr) {
+        ret |= unit.kernel->get().setArg(idx++, sizeof(cl_mem), &mInputImage1d);
+    } else {
+        ret |= unit.kernel->get().setArg(idx++, openCLBuffer(input));
+    }
     if(mResource->mUseImage){
         ret |= unit.kernel->get().setArg(idx++, *mResource->mKernelImage.get());
     }else{
@@ -954,6 +1042,36 @@ void ConvBufLowMemoryExecution::tuneGemmLowMemory(Tensor * input, Tensor * outpu
         }
         return;
     }
+    // Create image1d_buffer_t for input (global_y > 16 path)
+    {
+        auto runtime = mOpenCLBackend->getOpenCLRuntime();
+        if (runtime->isClCreateImageAvailable()) {
+            cl_int err = CL_SUCCESS;
+            cl_image_format format;
+            format.image_channel_order = CL_RGBA;
+            format.image_channel_data_type = (mOpenCLBackend->fpBytes() == 2) ? CL_HALF_FLOAT : CL_FLOAT;
+
+            cl_image_desc desc;
+            memset(&desc, 0, sizeof(desc));
+            desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
+            desc.image_width = input->elementSize() / 4;
+            desc.buffer = openCLBuffer(input)();
+
+            if (mGemmInputImage1d != nullptr) {
+                clReleaseMemObject(mGemmInputImage1d);
+                mGemmInputImage1d = nullptr;
+            }
+            mGemmInputImage1d = clCreateImage(runtime->context()(), CL_MEM_READ_ONLY, &format, &desc, nullptr, &err);
+            if (err == CL_SUCCESS && mGemmInputImage1d != nullptr) {
+                buildOption.emplace("-DUSE_IMAGE1D_INPUT");
+            } else {
+                if (mGemmInputImage1d != nullptr) {
+                    clReleaseMemObject(mGemmInputImage1d);
+                }
+                mGemmInputImage1d = nullptr;
+            }
+        }
+    }
     unit.kernel = mOpenCLBackend->getOpenCLRuntime()->buildKernel("gemm_conv1x1_buf", kernelName, buildOption, mOpenCLBackend->getPrecision());
     uint32_t maxWorkGroupSize = static_cast<uint32_t>(mOpenCLBackend->getOpenCLRuntime()->getMaxWorkGroupSize(unit.kernel));
     
@@ -962,7 +1080,11 @@ void ConvBufLowMemoryExecution::tuneGemmLowMemory(Tensor * input, Tensor * outpu
     cl_int ret = CL_SUCCESS;
     ret |= unit.kernel->get().setArg(idx++, mGlobalWorkSize[0]);
     ret |= unit.kernel->get().setArg(idx++, mGlobalWorkSize[1]);
-    ret |= unit.kernel->get().setArg(idx++, openCLBuffer(input));
+    if (mGemmInputImage1d != nullptr) {
+        ret |= unit.kernel->get().setArg(idx++, sizeof(cl_mem), &mGemmInputImage1d);
+    } else {
+        ret |= unit.kernel->get().setArg(idx++, openCLBuffer(input));
+    }
     if(mResource->mUseImage){
         ret |= unit.kernel->get().setArg(idx++, *mResource->mKernelImage.get());
     }else{
@@ -986,6 +1108,10 @@ void ConvBufLowMemoryExecution::tuneGemmLowMemory(Tensor * input, Tensor * outpu
 }
 ConvBufLowMemoryExecution::ConvBufLowMemoryExecution(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, const MNN::Op *op, Backend *backend)
     : ConvBufCommonExecution(op->main_as_Convolution2D(), backend), CommonExecution(backend, op) {
+    if (!mConvComValid) {
+        mValid = false;
+        return;
+    }
 #ifdef LOG_VERBOSE
     MNN_PRINT("Start ConvBufLowMemoryExecution init !\n");
 #endif
@@ -1035,7 +1161,14 @@ ConvBufLowMemoryExecution::ConvBufLowMemoryExecution(std::shared_ptr<ConvBufReso
 }
 
 ConvBufLowMemoryExecution::~ConvBufLowMemoryExecution() {
-    // Do nothing
+    if (mInputImage1d != nullptr) {
+        clReleaseMemObject(mInputImage1d);
+        mInputImage1d = nullptr;
+    }
+    if (mGemmInputImage1d != nullptr) {
+        clReleaseMemObject(mGemmInputImage1d);
+        mGemmInputImage1d = nullptr;
+    }
 }
 
 bool ConvBufLowMemoryExecution::onClone(Backend* bn, const Op* op, Execution** dst) {

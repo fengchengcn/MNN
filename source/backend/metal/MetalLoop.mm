@@ -32,105 +32,138 @@ struct constBuffer
     int4 iter;
 };
 
-struct s3
-{
-    T data[1];
-};
-
-struct s4
-{
-    T data[1];
-};
-
-struct s5
-{
-    T data[1];
-};
-
-struct s6
-{
-    T data[1];
-};
-
-struct s0
-{
-    T data[1];
-};
-
-struct s1
-{
-    T data[1];
-};
-
-struct s2
-{
-    T data[1];
-};
-
-struct d0
-{
-    T data[1];
-};
-
-kernel void loop_matmul(device d0& uOutput [[buffer(0)]], const device s0& uInputA [[buffer(1)]], const device s1& uInputB [[buffer(2)]],
+kernel void loop_matmul(device T* uOutput [[buffer(0)]], const device T* uInputA [[buffer(1)]], const device T* uInputB [[buffer(2)]],
 #ifdef HAS_BIAS
-    const device s2& uInputC [[buffer(3)]],
-    const device s3& uOOffset [[buffer(4)]],
-    const device s4& uAOffset [[buffer(5)]],
-    const device s5& uBOffset [[buffer(6)]],
-    const device s6& uCOffset [[buffer(7)]],
+    const device T* uInputC [[buffer(3)]],
+    const device int* uOOffset [[buffer(4)]],
+    const device int* uAOffset [[buffer(5)]],
+    const device int* uBOffset [[buffer(6)]],
+    const device int* uCOffset [[buffer(7)]],
     constant constBuffer& uConstant [[buffer(8)]],
 #else
-    const device s3& uOOffset [[buffer(3)]],
-    const device s4& uAOffset [[buffer(4)]],
-    const device s5& uBOffset [[buffer(5)]],
+    const device int* uOOffset [[buffer(3)]],
+    const device int* uAOffset [[buffer(4)]],
+    const device int* uBOffset [[buffer(5)]],
     constant constBuffer& uConstant [[buffer(6)]],
 #endif
     uint3 gl_GlobalInvocationID [[thread_position_in_grid]])
 {
-    int3 posTmp = int3(gl_GlobalInvocationID);
     int e = uConstant.size.x;
     int l = uConstant.size.y;
     int h = uConstant.size.z;
     int n = uConstant.size.w;
-    int eh = e * h;
-    if (posTmp.x < (eh * n))
-    {
-        int regionInsideIndex = posTmp.x % eh;
-        int regionOutsideIndex = posTmp.x / eh;
-        int X = regionInsideIndex % e;
-        int Y = regionInsideIndex / e;
-        int4 index = int4(regionOutsideIndex, regionOutsideIndex, regionOutsideIndex, regionOutsideIndex);
-        if (uConstant.iter.x >= 0)
-        {
-            index.x = int(uOOffset.data[regionOutsideIndex]);
-        }
-        if (uConstant.iter.y >= 0)
-        {
-            index.y = int(uAOffset.data[regionOutsideIndex]);
-        }
-        if (uConstant.iter.z >= 0)
-        {
-            index.z = int(uBOffset.data[regionOutsideIndex]);
-        }
+
+    int X0 = gl_GlobalInvocationID.x * 4;
+    int Y0 = gl_GlobalInvocationID.y * 4;
+    int regionOutsideIndex = gl_GlobalInvocationID.z;
+
+    if (X0 >= e || Y0 >= h || regionOutsideIndex >= n) {
+        return;
+    }
+
+    int4 index = int4(regionOutsideIndex, regionOutsideIndex, regionOutsideIndex, regionOutsideIndex);
+    if (uConstant.iter.x >= 0) {
+        index.x = uOOffset[regionOutsideIndex];
+    }
+    if (uConstant.iter.y >= 0) {
+        index.y = uAOffset[regionOutsideIndex];
+    }
+    if (uConstant.iter.z >= 0) {
+        index.z = uBOffset[regionOutsideIndex];
+    }
 #ifdef HAS_BIAS
-        if (uConstant.iter.w >= 0)
-        {
-            index.w = int(uCOffset.data[regionOutsideIndex]);
-        }
+    if (uConstant.iter.w >= 0) {
+        index.w = uCOffset[regionOutsideIndex];
+    }
 #endif
-        int4 offset = index * uConstant._step;
-        T value = 0.0;
-        int aOffset = (offset.y + uConstant.stride_a.w) + (X * uConstant.stride_a.x);
-        int bOffset = (offset.z + uConstant.stride_b.w) + (Y * uConstant.stride_b.z);
-        for (int i = 0; i < l; i++)
-        {
-            value += (uInputA.data[aOffset + (i * uConstant.stride_a.y)] * uInputB.data[bOffset + (i * uConstant.stride_b.y)]);
+
+    int4 offset = index * uConstant._step;
+
+    T value[4][4];
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x) {
+            value[x][y] = T(0.0);
         }
+    }
+
+    int aOffset0 = offset.y + uConstant.stride_a.w;
+    int bOffset0 = offset.z + uConstant.stride_b.w;
+
+    int a_idx[4];
+    int b_idx[4];
+    for (int x = 0; x < 4; ++x) {
+        a_idx[x] = min(X0 + x, e - 1) * uConstant.stride_a.x;
+    }
+    for (int y = 0; y < 4; ++y) {
+        b_idx[y] = min(Y0 + y, h - 1) * uConstant.stride_b.z;
+    }
+
+    bool safe = (X0 + 3 < e) && (Y0 + 3 < h);
+
+    if (safe) {
+        for (int i = 0; i < l; i++) {
+            T a[4];
+            T b[4];
+            int a_base = aOffset0 + i * uConstant.stride_a.y;
+            int b_base = bOffset0 + i * uConstant.stride_b.y;
+
+            for(int x = 0; x < 4; ++x) {
+                a[x] = uInputA[a_base + a_idx[x]];
+            }
+
+            for(int y = 0; y < 4; ++y) {
+                b[y] = uInputB[b_base + b_idx[y]];
+            }
+
+            for(int y = 0; y < 4; ++y) {
+                for(int x = 0; x < 4; ++x) {
+                    value[x][y] += a[x] * b[y];
+                }
+            }
+        }
+    } else {
+        for (int i = 0; i < l; i++) {
+            T a[4];
+            T b[4];
+            int a_base = aOffset0 + i * uConstant.stride_a.y;
+            int b_base = bOffset0 + i * uConstant.stride_b.y;
+
+            // Load A with boundary check
+            for(int x = 0; x < 4; ++x) {
+                if (X0 + x < e) {
+                    a[x] = uInputA[a_base + a_idx[x]];
+                } else {
+                    a[x] = T(0.0);
+                }
+            }
+
+            // Load B with boundary check
+            for(int y = 0; y < 4; ++y) {
+                if (Y0 + y < h) {
+                    b[y] = uInputB[b_base + b_idx[y]];
+                } else {
+                    b[y] = T(0.0);
+                }
+            }
+
+            for(int y = 0; y < 4; ++y) {
+                for(int x = 0; x < 4; ++x) {
+                    value[x][y] += a[x] * b[y];
+                }
+            }
+        }
+    }
+
+    for (int y = 0; y < 4; ++y) {
+        if (Y0 + y >= h) continue;
+        for (int x = 0; x < 4; ++x) {
+            if (X0 + x >= e) continue;
+            T outVal = value[x][y];
 #ifdef HAS_BIAS
-        value += uInputC.data[(offset.w + (Y * uConstant.stride_c.z)) + (X * uConstant.stride_c.x)];
+            outVal += uInputC[offset.w + (Y0 + y) * uConstant.stride_c.z + (X0 + x) * uConstant.stride_c.x];
 #endif
-        uOutput.data[((offset.x + uConstant.stride_o.w) + (X * uConstant.stride_o.x)) + (Y * uConstant.stride_o.z)] = value;
+            uOutput[offset.x + uConstant.stride_o.w + (X0 + x) * uConstant.stride_o.x + (Y0 + y) * uConstant.stride_o.z] = outVal;
+        }
     }
 }
 )metal";
@@ -162,9 +195,10 @@ private:
     id<MTLComputePipelineState> mPipeline;
     std::vector<Tensor*> mTensors;
     bool mHasBias = false;
+    int mCmdIndex = 0;
 
 public:
-    MetalBatchMatMul(const LoopParam* loop, Backend *bn) : MetalExecution(bn) {
+    MetalBatchMatMul(const LoopParam* loop, Backend *bn, int index = 0) : MetalExecution(bn) {
         mLoop = loop;
         auto mtbn = static_cast<MetalBackend *>(bn);
         auto context = (__bridge MNNMetalContext *)mtbn->context();
@@ -180,7 +214,7 @@ public:
             std::string([T UTF8String]),
             "matmulunit"
         };
-        auto cmd = loop->commands()->GetAs<RegionCommand>(0);
+        auto cmd = loop->commands()->GetAs<RegionCommand>(index);
         mHasBias = cmd->indexes()->size() > 3;
         if (mHasBias) {
             keys.emplace_back("BIAS");
@@ -200,17 +234,19 @@ public:
             }
             pipeline = mtbn->makeComputePipelineWithSourceOption(gMatMulUnitTemplate, "loop_matmul", compileOptions);
             mtbn->runtime()->insertPipeline(keys, pipeline);
+
         }
         if (nil == pipeline) {
             MNN_ERROR("Create batch matmul pipeline error\n");
         }
         mPipeline = pipeline;
         mTensors.resize(mLoop->tensorNumber());
+        mCmdIndex = index;
     }
     virtual ~MetalBatchMatMul() = default;
     virtual ErrorCode onResize(const std::vector<Tensor *>& inputs, const std::vector<Tensor *>& outputs) override {
         _setTensorStack(mTensors, inputs, outputs, mLoop);
-        auto cmd = mLoop->commands()->GetAs<RegionCommand>(0);
+        auto cmd = mLoop->commands()->GetAs<RegionCommand>(mCmdIndex);
         auto size = cmd->size()->data();
         auto AStride = cmd->view()->GetAs<View>(1)->stride()->data();
         auto BStride = cmd->view()->GetAs<View>(2)->stride()->data();
@@ -234,12 +270,11 @@ public:
         return NO_ERROR;
     }
     virtual void onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) override {
-        auto cmd = mLoop->commands()->GetAs<RegionCommand>(0);
+        auto cmd = mLoop->commands()->GetAs<RegionCommand>(mCmdIndex);
         auto size = cmd->size()->data();
         auto AStride = cmd->view()->GetAs<View>(1)->stride()->data();
         auto BStride = cmd->view()->GetAs<View>(2)->stride()->data();
         auto OStride = cmd->view()->GetAs<View>(0)->stride()->data();
-        size_t totalSize = mLoop->loopNumber() * size[0] * size[2];
         [encoder setComputePipelineState:mPipeline];
         for (int i=0; i<cmd->indexes()->size(); ++i) {
             MetalBackend::setTensor(mTensors[cmd->indexes()->data()[i]], encoder, i);
@@ -252,8 +287,16 @@ public:
                 MetalBackend::setTensor(inputs[0], encoder, cmd->indexes()->size() + i);
             }
         }
+//        printf("loop_matmul out dequant BMNK: %d %d %d %d\n", mLoop->loopNumber(), size[0], size[2], size[1]);
+
         [encoder setBuffer:mParam offset:0 atIndex:cmd->indexes()->size() * 2];
-        [encoder dispatchThreadgroups:MTLSizeMake(UP_DIV(totalSize, 256), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+        int e = size[0];
+        int h = size[2];
+        int n = mLoop->loopNumber();
+        int threadsX = UP_DIV(e, 4);
+        int threadsY = UP_DIV(h, 4);
+        [encoder dispatchThreadgroups:MTLSizeMake(UP_DIV(threadsX, 8), UP_DIV(threadsY, 8), n) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
     }
 };
 
@@ -394,15 +437,12 @@ kernel void set_copy(device T *out   [[buffer(0)]],
 class MetalGather : public MetalExecution {
 private:
     const LoopParam* mLoop;
-    bool mNeedInit = false;
-    std::pair<MTLSize, MTLSize> mInitThreads;
+    int mCmdIndex = 0;
     id<MTLBuffer> mParam;
     id<MTLComputePipelineState> mPipeline;
-    id<MTLComputePipelineState> mInitPipeline;
-    id<MTLBuffer> mInitParam;
     std::vector<Tensor*> mTensors;
 public:
-    MetalGather(const LoopParam* loop, Backend *bn, const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) : MetalExecution(bn) {
+    MetalGather(const LoopParam* loop, Backend *bn, const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs, int index = 0) : MetalExecution(bn) {
         mLoop = loop;
         auto mtbn = static_cast<MetalBackend *>(bn);
         auto context = (__bridge MNNMetalContext *)mtbn->context();
@@ -410,7 +450,8 @@ public:
         mParam = [context newDeviceBuffer:sizeof(GatherInfo) access:CPUWriteOnly];
         bool useFp16 = mtbn->useFp16InsteadFp32();
         mTensors.resize(mLoop->tensorNumber());
-        auto cmd = mLoop->commands()->GetAs<RegionCommand>(0);
+        mCmdIndex = index;
+        auto cmd = mLoop->commands()->GetAs<RegionCommand>(mCmdIndex);
         _setTensorStack(mTensors, inputs, outputs, mLoop);
         auto dstTensor = mTensors[cmd->indexes()->data()[0]];
         
@@ -435,40 +476,10 @@ public:
             }
             mPipeline = pipeline;
         }
-        
-        // scatter need init command pipeline
-        if(mLoop->initCommand() != nullptr){
-            mNeedInit = true;
-            std::string shader = "set_copy";
-            auto cmd = mLoop->initCommand()->GetAs<RegionCommand>(0);
-            if (cmd->op() == nullptr){
-                shader = "set_zero";
-            } else {
-                mInitParam = [context newDeviceBuffer:sizeof(InitInfo) access:CPUWriteOnly];
-            }
-            std::vector<std::string> keys = {
-                std::string([T UTF8String]),
-                "init_region",
-                shader
-            };
-            auto pipeline = mtbn->runtime()->findPipeline(keys);
-            if (nil == pipeline) {
-                MTLCompileOptions *compileOptions = [[MTLCompileOptions alloc] init];
-                compileOptions.preprocessorMacros = @{
-                    @"T" : T,
-                };
-                pipeline = mtbn->makeComputePipelineWithSourceOption(gInitRegion, shader.c_str(), compileOptions);
-                mtbn->runtime()->insertPipeline(keys, pipeline);
-            }
-            if (nil == pipeline) {
-                MNN_ERROR("Create gather init pipeline error\n");
-            }
-            mInitPipeline = pipeline;
-        }
     }
     virtual ~MetalGather() = default;
     virtual ErrorCode onResize(const std::vector<Tensor *>& inputs, const std::vector<Tensor *>& outputs) override {
-        auto cmd = mLoop->commands()->GetAs<RegionCommand>(0);
+        auto cmd = mLoop->commands()->GetAs<RegionCommand>(mCmdIndex);
         _setTensorStack(mTensors, inputs, outputs, mLoop);
         
         auto srcStride = cmd->view()->GetAs<View>(1)->stride()->data();
@@ -504,51 +515,11 @@ public:
         param->totalSize[0] = inputSize;
         param->totalSize[1] = outputSize;
         
-        if(mNeedInit) {
-            auto initCmd = mLoop->initCommand()->GetAs<RegionCommand>(0);
-            auto data = reinterpret_cast<InitInfo*>([mInitParam contents]);
-
-            auto srcStride = initCmd->view()->GetAs<View>(1)->stride()->data();
-            auto dstStride = initCmd->view()->GetAs<View>(0)->stride()->data();
-            auto dataSize = initCmd->size()->data();
-            for (int i = 0; i < 3; ++i) {
-                data->srcStride[i] = srcStride[i];
-                data->dstStride[i] = dstStride[i];
-                data->size[i] = dataSize[i];
-            }
-            
-            auto initDstTensor = mTensors[initCmd->indexes()->data()[0]];
-            auto initSrcTensor = mTensors[initCmd->indexes()->data()[1]];
-            auto initInputSize = initSrcTensor->usize() / initSrcTensor->buffer().type.bytes();
-            auto initOutputSize = initDstTensor->usize() / initDstTensor->buffer().type.bytes();
-            data->totalSize[0] = initInputSize;
-            data->totalSize[1] = initOutputSize;
-            
-            auto backend = static_cast<MetalBackend *>(this->backend());
-            auto context = (__bridge MNNMetalContext *)backend->context();
-            mInitThreads = [context computeBestGroupAndLocal:mInitPipeline threads:MTLSizeMake(data->size[0], data->size[1], data->size[2])];
-        }
         return NO_ERROR;
     }
     virtual void onEncode(const std::vector<Tensor *>& inputs, const std::vector<Tensor *>& outputs,
                           id<MTLComputeCommandEncoder> encoder) override {
-        if(mNeedInit) {
-            auto initCmd = mLoop->initCommand()->GetAs<RegionCommand>(0);
-            int x = initCmd->size()->data()[0];
-            int y = initCmd->size()->data()[1];
-            int z = initCmd->size()->data()[2];
-            
-            [encoder setComputePipelineState:mInitPipeline];
-            auto dstTensor = mTensors[initCmd->indexes()->data()[0]];
-            auto srcTensor = mTensors[initCmd->indexes()->data()[1]];
-            MetalBackend::setTensor(dstTensor, encoder, 0);
-            MetalBackend::setTensor(srcTensor, encoder, 1);
-            [encoder setBuffer:mInitParam offset:0 atIndex:2];
-            
-            [encoder dispatchThreadgroups:mInitThreads.first threadsPerThreadgroup:mInitThreads.second];
-        }
-        
-        auto cmd = mLoop->commands()->GetAs<RegionCommand>(0);
+        auto cmd = mLoop->commands()->GetAs<RegionCommand>(mCmdIndex);
         auto size = cmd->size()->data();
         auto srcStride = cmd->view()->GetAs<View>(1)->stride()->data();
         auto dstStride = cmd->view()->GetAs<View>(0)->stride()->data();
@@ -631,13 +602,14 @@ struct BinaryBroadCastInfo {
 
 class MetalBinaryBroadCast : public MetalExecution {
 public:
-    MetalBinaryBroadCast(const LoopParam* loop, Backend *bn, std::vector<Tensor*>&& tensors, NSString* CUSTOM) : MetalExecution(bn) {
+    MetalBinaryBroadCast(const LoopParam* loop, Backend *bn, const std::vector<Tensor*>& tensors, NSString* CUSTOM, int index = 0) : MetalExecution(bn) {
         mLoop = loop;
         auto mtbn = static_cast<MetalBackend *>(bn);
         auto context = (__bridge MNNMetalContext *)mtbn->context();
         mParam = mtbn->getConstBuffer(sizeof(BinaryBroadCastInfo));
-        mTensors = std::move(tensors);
-        auto cmd = mLoop->commands()->GetAs<RegionCommand>(0);
+        mTensors = tensors;
+        mCmdIndex = index;
+        auto cmd = mLoop->commands()->GetAs<RegionCommand>(mCmdIndex);
         auto dstTensor = mTensors[cmd->indexes()->data()[0]];
         auto srcTensor = mTensors[cmd->indexes()->data()[1]];
         auto srcTensor1 = mTensors[cmd->indexes()->data()[2]];
@@ -672,7 +644,7 @@ public:
     }
     virtual ErrorCode onResize(const std::vector<Tensor *>& inputs, const std::vector<Tensor *>& outputs) override {
         _setTensorStack(mTensors, inputs, outputs, mLoop);
-        auto cmd = mLoop->commands()->GetAs<RegionCommand>(0);
+        auto cmd = mLoop->commands()->GetAs<RegionCommand>(mCmdIndex);
         auto size = cmd->size()->data();
         auto srcStride0 = cmd->view()->GetAs<View>(1)->stride()->data();
         auto srcStride1 = cmd->view()->GetAs<View>(2)->stride()->data();
@@ -694,7 +666,7 @@ public:
     virtual void onEncode(const std::vector<Tensor *>& inputs, const std::vector<Tensor *>& outputs,
                                id<MTLComputeCommandEncoder> encoder) override {
 
-        auto cmd = mLoop->commands()->GetAs<RegionCommand>(0);
+        auto cmd = mLoop->commands()->GetAs<RegionCommand>(mCmdIndex);
         auto dstTensor = mTensors[cmd->indexes()->data()[0]];
         auto srcTensor = mTensors[cmd->indexes()->data()[1]];
         auto srcTensor1 = mTensors[cmd->indexes()->data()[2]];
@@ -711,6 +683,139 @@ private:
     id<MTLBuffer> mParam;
     std::vector<Tensor*> mTensors;
     int mTotalSize;
+    int mCmdIndex = 0;
+};
+
+class MetalLoop : public MetalExecution {
+public:
+    MetalLoop(const LoopParam* loop, Backend *bn, const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) : MetalExecution(bn) {
+        mLoop = loop;
+        auto mtbn = static_cast<MetalBackend *>(bn);
+        auto context = (__bridge MNNMetalContext *)mtbn->context();
+        mTensors.resize(mLoop->tensorNumber());
+        _setTensorStack(mTensors, inputs, outputs, mLoop);
+
+        // Init
+        if(mLoop->initCommand() != nullptr) {
+            mNeedInit = true;
+            std::string shader = "set_copy";
+            auto dstTensor = mTensors[mLoop->initCommand()->GetAs<RegionCommand>(0)->indexes()->data()[0]];
+            NSString* T = MetalCast::getScalarType(dstTensor->getType(), mtbn->useFp16InsteadFp32());
+
+            auto cmd = mLoop->initCommand()->GetAs<RegionCommand>(0);
+            if (cmd->op() == nullptr){
+                shader = "set_zero";
+            } else {
+                mInitParam = [context newDeviceBuffer:sizeof(InitInfo) access:CPUWriteOnly];
+            }
+            std::vector<std::string> keys = {
+                std::string([T UTF8String]),
+                "init_region",
+                shader
+            };
+            auto pipeline = mtbn->runtime()->findPipeline(keys);
+            if (nil == pipeline) {
+                MTLCompileOptions *compileOptions = [[MTLCompileOptions alloc] init];
+                compileOptions.preprocessorMacros = @{
+                    @"T" : T,
+                };
+                pipeline = mtbn->makeComputePipelineWithSourceOption(gInitRegion, shader.c_str(), compileOptions);
+                mtbn->runtime()->insertPipeline(keys, pipeline);
+            }
+            if (nil == pipeline) {
+                MNN_ERROR("Create gather init pipeline error\n");
+            }
+            mInitPipeline = pipeline;
+        }
+
+        bool valid = true;
+        for (int i=0; i<loop->commands()->size(); ++i) {
+            auto cmd = loop->commands()->GetAs<RegionCommand>(i);
+            auto subop = cmd->op();
+            if (OpType_UnaryOp == subop->type() && nullptr == subop->main() && cmd->fuse() < 0) {
+                mExecutions.emplace_back(std::make_shared<MetalGather>(loop, bn, inputs, outputs, i));
+            } else if (OpType_MatMul == subop->type() && loop->parallel()) {
+                mExecutions.emplace_back(std::make_shared<MetalBatchMatMul>(loop, bn, i));
+            } else if (OpType_BinaryOp == subop->type() && cmd->fuse() < 0 && 1 == loop->loopNumber()) {
+                mExecutions.emplace_back(std::make_shared<MetalBinaryBroadCast>(loop, bn, mTensors, MetalBinary::convert(cmd->op()->main_as_BinaryOp()->opType(), mTensors[cmd->indexes()->data()[1]]->getType().code == halide_type_float), i));
+            } else {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) {
+            mExecutions.clear();
+        }
+    }
+    virtual ~MetalLoop() = default;
+    
+    virtual ErrorCode onResize(const std::vector<Tensor *>& inputs, const std::vector<Tensor *>& outputs) override {
+        // Init
+        if(mNeedInit) {
+            _setTensorStack(mTensors, inputs, outputs, mLoop);
+            auto initCmd = mLoop->initCommand()->GetAs<RegionCommand>(0);
+            auto data = reinterpret_cast<InitInfo*>([mInitParam contents]);
+
+            auto srcStride = initCmd->view()->GetAs<View>(1)->stride()->data();
+            auto dstStride = initCmd->view()->GetAs<View>(0)->stride()->data();
+            auto dataSize = initCmd->size()->data();
+            for (int i = 0; i < 3; ++i) {
+                data->srcStride[i] = srcStride[i];
+                data->dstStride[i] = dstStride[i];
+                data->size[i] = dataSize[i];
+            }
+            
+            auto initDstTensor = mTensors[initCmd->indexes()->data()[0]];
+            auto initSrcTensor = mTensors[initCmd->indexes()->data()[1]];
+            auto initInputSize = initSrcTensor->usize() / initSrcTensor->buffer().type.bytes();
+            auto initOutputSize = initDstTensor->usize() / initDstTensor->buffer().type.bytes();
+            data->totalSize[0] = initInputSize;
+            data->totalSize[1] = initOutputSize;
+            
+            auto backend = static_cast<MetalBackend *>(this->backend());
+            auto context = (__bridge MNNMetalContext *)backend->context();
+            mInitThreads = [context computeBestGroupAndLocal:mInitPipeline threads:MTLSizeMake(data->size[0], data->size[1], data->size[2])];
+        }
+
+        // Loop commands
+        for (auto& exe : mExecutions) {
+            auto code = exe->onResize(inputs, outputs);
+            if (NO_ERROR != code) {
+                return code;
+            }
+        }
+        return NO_ERROR;
+    }
+    virtual void onEncode(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs, id<MTLComputeCommandEncoder> encoder) override {
+        // Init
+        if(mNeedInit) {
+            auto initCmd = mLoop->initCommand()->GetAs<RegionCommand>(0);
+            [encoder setComputePipelineState:mInitPipeline];
+            auto dstTensor = mTensors[initCmd->indexes()->data()[0]];
+            auto srcTensor = mTensors[initCmd->indexes()->data()[1]];
+            MetalBackend::setTensor(dstTensor, encoder, 0);
+            MetalBackend::setTensor(srcTensor, encoder, 1);
+            [encoder setBuffer:mInitParam offset:0 atIndex:2];
+            [encoder dispatchThreadgroups:mInitThreads.first threadsPerThreadgroup:mInitThreads.second];
+        }
+        // Loop commands
+        for (auto& exe : mExecutions) {
+            exe->onEncode(inputs, outputs, encoder);
+        }
+    }
+    bool isValid() {
+        return !mExecutions.empty();
+    }
+private:
+    const LoopParam* mLoop;
+    std::vector<std::shared_ptr<MetalExecution>> mExecutions;
+    std::vector<Tensor*> mTensors;
+    // For Init
+    bool mNeedInit = false;
+    std::pair<MTLSize, MTLSize> mInitThreads;
+    id<MTLComputePipelineState> mInitPipeline;
+    id<MTLBuffer> mInitParam;
+
 };
 
 class MetalLoopCreator : public MetalBackend::Creator {
@@ -725,7 +830,7 @@ public:
         if (1 == loop->commands()->size()) {
             auto cmd = loop->commands()->GetAs<RegionCommand>(0);
             auto subop = cmd->op();
-            if (OpType_UnaryOp == subop->type() && nullptr == subop->main() && cmd->fuse() < 0) {
+            if (OpType_UnaryOp == subop->type() && nullptr == subop->main() && cmd->fuse() < 0 && nullptr == loop->initCommand()) {
                 return new MetalGather(loop, bn, inputs, outputs);
             }
             if (OpType_MatMul == subop->type() && loop->parallel() && nullptr == loop->initCommand()) {
@@ -741,10 +846,17 @@ public:
                     MNN_ERROR("Metal Don't support binary - %d \n", cmd->op()->main_as_BinaryOp()->opType());
                     return nullptr;
                 }
-                return new MetalBinaryBroadCast(loop, bn, std::move(tensors), CUSTOM);
+                return new MetalBinaryBroadCast(loop, bn, tensors, CUSTOM);
             }
         }
+        // General Case
+        auto exe = new MetalLoop(loop, bn, inputs, outputs);
+        if (exe->isValid()) {
+            return exe;
+        }
+        delete exe;
         return nullptr;
+
     }
 };
 REGISTER_METAL_OP_CREATOR(MetalLoopCreator, OpType_While);

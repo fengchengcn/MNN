@@ -36,12 +36,6 @@ void MNNPackedMatMulFP16(float* C, const float* A, const float* B, const size_t*
 // parameter: [aStride, l, h, cStride, bExtraStride]
 void MNNPackedMatMulRemainFP16(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
 
-#ifdef MNN_CPU_WEIGHT_DEQUANT_GEMM
-void MNNPackedMatMulFP16_int4(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
-void MNNPackedMatMulRemainFP16_int4(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
-void MNNPackedMatMulFP16_int8(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
-void MNNPackedMatMulRemainFP16_int8(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
-#endif
 
 #ifdef __aarch64__
 #ifdef MNN_LOW_MEMORY
@@ -73,8 +67,204 @@ void MNNDepthwiseConvFastKernelFP16(float* dst, const float* src, const float* w
 
 void MNNConvRunForLineDepthwiseFP16(float* dst, const float* src, const float* weight, size_t width, size_t src_w_setup,
                                 size_t fw, size_t fh, size_t dilateX_step, size_t dilateY_step, size_t height, size_t srcHStep, size_t dstHStep);
+
+// LinearAttention fp16 kernels
+void MNNRankOneUpdateFp16(float* S, const float* k, const float* delta, size_t dk, size_t dv);
+void MNNDualMatVecFp16(const float* S, const float* k, const float* q, float* out_k, float* out_q, size_t dk, size_t dv);
+void MNNDecayRankOneUpdateFp16(float* S, const float* k, const float* delta, float decay, size_t dk, size_t dv);
 }
 
+#if defined(__aarch64__) && defined(MNN_USE_NEON)
+// ──────────────────────────────────────────────────────────────────────────
+// MNNFusedGatedDeltaFp16 — FP16 specialization of the fused gated-delta-rule
+// kernel. See documentation in CommonOptFunction.h for the math.
+//
+// Pointers are typed `float*` for ABI uniformity with the FP32 version (the
+// dispatch table holds a single function pointer signature), but the
+// underlying memory is fp16. d_v is processed in chunks of 32 (= 4 v.8h
+// registers per accumulator) to keep all per-chunk state in registers,
+// which matters at d_v=128 where holding both out_k and out_q for the
+// whole row would otherwise exceed the 32 NEON v register budget.
+// ──────────────────────────────────────────────────────────────────────────
+static void MNNFusedGatedDeltaFp16(float* S_, const float* k_, const float* q_, const float* v_, float* out_,
+                                   float decay, float beta, float kq, size_t dk, size_t dv) {
+    auto S = reinterpret_cast<__fp16*>(S_);
+    auto k = reinterpret_cast<const __fp16*>(k_);
+    auto q = reinterpret_cast<const __fp16*>(q_);
+    auto vIn = reinterpret_cast<const __fp16*>(v_);
+    auto out = reinterpret_cast<__fp16*>(out_);
+
+    const __fp16 decayH = static_cast<__fp16>(decay);
+    const __fp16 betaH = static_cast<__fp16>(beta);
+    const __fp16 kqH = static_cast<__fp16>(kq);
+    const float16x8_t vDecay = vdupq_n_f16(decayH);
+    const float16x8_t vBeta = vdupq_n_f16(betaH);
+    const float16x8_t vKq = vdupq_n_f16(kqH);
+
+    const size_t kChunk = 32;
+    size_t j = 0;
+    for (; j + kChunk <= dv; j += kChunk) {
+        // ── Pass 1: out_k = S^T @ k, out_q = S^T @ q for this column chunk ──
+        float16x8_t ok0 = vdupq_n_f16((__fp16)0), ok1 = vdupq_n_f16((__fp16)0), ok2 = vdupq_n_f16((__fp16)0),
+                    ok3 = vdupq_n_f16((__fp16)0);
+        float16x8_t oq0 = vdupq_n_f16((__fp16)0), oq1 = vdupq_n_f16((__fp16)0), oq2 = vdupq_n_f16((__fp16)0),
+                    oq3 = vdupq_n_f16((__fp16)0);
+        size_t i = 0;
+        // Unroll i by 8: load 8 k & q scalars at once, then use fma-by-lane
+        // to amortize the scalar broadcast across 8 row iterations.
+        for (; i + 8 <= dk; i += 8) {
+            float16x8_t kVec = vld1q_f16(k + i);
+            float16x8_t qVec = vld1q_f16(q + i);
+#define LANE_STEP(lane)                                \
+    {                                                  \
+        const __fp16* row = S + (i + (lane)) * dv + j; \
+        float16x8_t s0 = vld1q_f16(row);               \
+        float16x8_t s1 = vld1q_f16(row + 8);           \
+        float16x8_t s2 = vld1q_f16(row + 16);          \
+        float16x8_t s3 = vld1q_f16(row + 24);          \
+        ok0 = vfmaq_laneq_f16(ok0, s0, kVec, (lane));  \
+        ok1 = vfmaq_laneq_f16(ok1, s1, kVec, (lane));  \
+        ok2 = vfmaq_laneq_f16(ok2, s2, kVec, (lane));  \
+        ok3 = vfmaq_laneq_f16(ok3, s3, kVec, (lane));  \
+        oq0 = vfmaq_laneq_f16(oq0, s0, qVec, (lane));  \
+        oq1 = vfmaq_laneq_f16(oq1, s1, qVec, (lane));  \
+        oq2 = vfmaq_laneq_f16(oq2, s2, qVec, (lane));  \
+        oq3 = vfmaq_laneq_f16(oq3, s3, qVec, (lane));  \
+    }
+            LANE_STEP(0);
+            LANE_STEP(1);
+            LANE_STEP(2);
+            LANE_STEP(3);
+            LANE_STEP(4);
+            LANE_STEP(5);
+            LANE_STEP(6);
+            LANE_STEP(7);
+#undef LANE_STEP
+        }
+        // Tail rows (dk % 8) — fall back to the broadcast form.
+        for (; i < dk; ++i) {
+            const __fp16* row = S + i * dv + j;
+            float16x8_t s0 = vld1q_f16(row);
+            float16x8_t s1 = vld1q_f16(row + 8);
+            float16x8_t s2 = vld1q_f16(row + 16);
+            float16x8_t s3 = vld1q_f16(row + 24);
+            __fp16 ki = k[i];
+            __fp16 qi = q[i];
+            ok0 = vfmaq_n_f16(ok0, s0, ki);
+            ok1 = vfmaq_n_f16(ok1, s1, ki);
+            ok2 = vfmaq_n_f16(ok2, s2, ki);
+            ok3 = vfmaq_n_f16(ok3, s3, ki);
+            oq0 = vfmaq_n_f16(oq0, s0, qi);
+            oq1 = vfmaq_n_f16(oq1, s1, qi);
+            oq2 = vfmaq_n_f16(oq2, s2, qi);
+            oq3 = vfmaq_n_f16(oq3, s3, qi);
+        }
+
+        // ── Inline analytic correction (regs only) ──
+        float16x8_t v0 = vld1q_f16(vIn + j);
+        float16x8_t v1 = vld1q_f16(vIn + j + 8);
+        float16x8_t v2 = vld1q_f16(vIn + j + 16);
+        float16x8_t v3 = vld1q_f16(vIn + j + 24);
+        // delta = beta * (v - decay * out_k)
+        float16x8_t d0 = vmulq_f16(vBeta, vsubq_f16(v0, vmulq_f16(vDecay, ok0)));
+        float16x8_t d1 = vmulq_f16(vBeta, vsubq_f16(v1, vmulq_f16(vDecay, ok1)));
+        float16x8_t d2 = vmulq_f16(vBeta, vsubq_f16(v2, vmulq_f16(vDecay, ok2)));
+        float16x8_t d3 = vmulq_f16(vBeta, vsubq_f16(v3, vmulq_f16(vDecay, ok3)));
+        // out = decay * out_q + kq * delta
+        float16x8_t o0 = vfmaq_f16(vmulq_f16(vDecay, oq0), vKq, d0);
+        float16x8_t o1 = vfmaq_f16(vmulq_f16(vDecay, oq1), vKq, d1);
+        float16x8_t o2 = vfmaq_f16(vmulq_f16(vDecay, oq2), vKq, d2);
+        float16x8_t o3 = vfmaq_f16(vmulq_f16(vDecay, oq3), vKq, d3);
+        vst1q_f16(out + j, o0);
+        vst1q_f16(out + j + 8, o1);
+        vst1q_f16(out + j + 16, o2);
+        vst1q_f16(out + j + 24, o3);
+
+        // ── Pass 2: S = decay * S + k ⊗ delta (delta still in regs) ──
+        size_t i2 = 0;
+        for (; i2 + 8 <= dk; i2 += 8) {
+            float16x8_t kVec = vld1q_f16(k + i2);
+#define ROW_UPDATE(lane)                                                           \
+    {                                                                              \
+        __fp16* row = S + (i2 + (lane)) * dv + j;                                  \
+        float16x8_t s0 = vld1q_f16(row);                                           \
+        float16x8_t s1 = vld1q_f16(row + 8);                                       \
+        float16x8_t s2 = vld1q_f16(row + 16);                                      \
+        float16x8_t s3 = vld1q_f16(row + 24);                                      \
+        float16x8_t r0 = vfmaq_laneq_f16(vmulq_f16(vDecay, s0), d0, kVec, (lane)); \
+        float16x8_t r1 = vfmaq_laneq_f16(vmulq_f16(vDecay, s1), d1, kVec, (lane)); \
+        float16x8_t r2 = vfmaq_laneq_f16(vmulq_f16(vDecay, s2), d2, kVec, (lane)); \
+        float16x8_t r3 = vfmaq_laneq_f16(vmulq_f16(vDecay, s3), d3, kVec, (lane)); \
+        vst1q_f16(row, r0);                                                        \
+        vst1q_f16(row + 8, r1);                                                    \
+        vst1q_f16(row + 16, r2);                                                   \
+        vst1q_f16(row + 24, r3);                                                   \
+    }
+            ROW_UPDATE(0);
+            ROW_UPDATE(1);
+            ROW_UPDATE(2);
+            ROW_UPDATE(3);
+            ROW_UPDATE(4);
+            ROW_UPDATE(5);
+            ROW_UPDATE(6);
+            ROW_UPDATE(7);
+#undef ROW_UPDATE
+        }
+        for (; i2 < dk; ++i2) {
+            __fp16* row = S + i2 * dv + j;
+            float16x8_t s0 = vld1q_f16(row);
+            float16x8_t s1 = vld1q_f16(row + 8);
+            float16x8_t s2 = vld1q_f16(row + 16);
+            float16x8_t s3 = vld1q_f16(row + 24);
+            __fp16 ki = k[i2];
+            float16x8_t r0 = vfmaq_n_f16(vmulq_f16(vDecay, s0), d0, ki);
+            float16x8_t r1 = vfmaq_n_f16(vmulq_f16(vDecay, s1), d1, ki);
+            float16x8_t r2 = vfmaq_n_f16(vmulq_f16(vDecay, s2), d2, ki);
+            float16x8_t r3 = vfmaq_n_f16(vmulq_f16(vDecay, s3), d3, ki);
+            vst1q_f16(row, r0);
+            vst1q_f16(row + 8, r1);
+            vst1q_f16(row + 16, r2);
+            vst1q_f16(row + 24, r3);
+        }
+    }
+
+    // ── Tail (chunks of 8) ──
+    for (; j + 8 <= dv; j += 8) {
+        float16x8_t ok = vdupq_n_f16((__fp16)0);
+        float16x8_t oq = vdupq_n_f16((__fp16)0);
+        for (size_t i = 0; i < dk; ++i) {
+            float16x8_t s = vld1q_f16(S + i * dv + j);
+            ok = vfmaq_n_f16(ok, s, k[i]);
+            oq = vfmaq_n_f16(oq, s, q[i]);
+        }
+        float16x8_t vv = vld1q_f16(vIn + j);
+        float16x8_t d = vmulq_f16(vBeta, vsubq_f16(vv, vmulq_f16(vDecay, ok)));
+        float16x8_t o = vfmaq_f16(vmulq_f16(vDecay, oq), vKq, d);
+        vst1q_f16(out + j, o);
+        for (size_t i = 0; i < dk; ++i) {
+            float16x8_t s = vld1q_f16(S + i * dv + j);
+            float16x8_t r = vfmaq_n_f16(vmulq_f16(vDecay, s), d, k[i]);
+            vst1q_f16(S + i * dv + j, r);
+        }
+    }
+
+    // ── Scalar tail (defensive; d_v < multiple of 8 not used in current models) ──
+    for (; j < dv; ++j) {
+        float ok = 0.0f, oq = 0.0f;
+        for (size_t i = 0; i < dk; ++i) {
+            float s = (float)S[i * dv + j];
+            ok += s * (float)k[i];
+            oq += s * (float)q[i];
+        }
+        float delta_j = beta * ((float)vIn[j] - decay * ok);
+        out[j] = (__fp16)(decay * oq + kq * delta_j);
+        for (size_t i = 0; i < dk; ++i) {
+            float s = (float)S[i * dv + j];
+            S[i * dv + j] = (__fp16)(decay * s + (float)k[i] * delta_j);
+        }
+    }
+}
+#endif // __aarch64__ && MNN_USE_NEON
 
 namespace MNN {
 
@@ -2265,171 +2455,358 @@ static inline float32x4_t expApprox(float32x4_t x) {
     int32x4_t k_shifted = vshlq_n_s32(k_int, 23);
     return vreinterpretq_f32_s32(vaddq_s32(vreinterpretq_s32_f32(exp_r), k_shifted));
 }
-static void MNNSoftmaxFp16(float* dest, const float* source, float* runningMax, float* runningSum, float* updateScale, int outside, int reduceSize, int kvSeqOffset, int validOffset, int pack, bool mask) {
-    const int reduceSize_8 = UP_DIV(reduceSize, 8);
+static void MNNSoftmaxFp16_Pack8(float* dest, const float* source, float* runningMax, float* runningSum, float* updateScale, int outside, int reduceSize, int kvSeqOffset, int validOffset, int pack, bool mask) {
     auto softmaxDst = (FLOAT16*)dest;
     auto softmaxSrc = (FLOAT16*)source;
 
-    // source shape: [reduceSizeOuter, outside, reduceSizeInner]
-    // for C4, [up_div(reduceSize,4), outside,4] => reduceSizeOuter=up_div(reduceSize,4), reduceSizeInner=4
-    // for C,  [outside, reduceSize]             => reduceSizeOuter=1, reduceSizeInner=reduceSize
-
-    const int packUnit = 8;
-    int reduceSizeOuter = 1;
-    int reduceSizeInner = reduceSize;
-    int stride0         = packUnit;
-    if (pack > 1) {
-        reduceSizeOuter = UP_DIV(reduceSize, pack);
-        reduceSizeInner = pack;
-        stride0         = outside * reduceSizeInner;
+    if (pack != 8) {
+        MNN_ERROR("MNNSoftmaxFp16_Pack8 only support pack=8\n");
+        return;
     }
 
+    const int packUnit = 8;
+    int reduceSizeOuter = UP_DIV(reduceSize, packUnit);
+    int stride0 = outside * packUnit;
+
+    // Loop Tiling: Unroll K by 16
+    // 16 * 8 * 2 = 256 Bytes
+    for (int k = 0; k < outside; k += 16) {
+        int count = ALIMIN(16, outside - k);
+
+        int validLens[16];
+        bool isRowValid[16];
+
+        for (int i = 0; i < count; ++i) {
+            int currentK = k + i;
+            if (mask && kvSeqOffset > currentK + validOffset) {
+                isRowValid[i] = false;
+                validLens[i] = 0;
+                if (updateScale) updateScale[currentK] = 1.0f;
+            } else {
+                isRowValid[i] = true;
+                validLens[i] = mask ? ALIMIN(reduceSize, currentK + (validOffset + 1) - kvSeqOffset) : reduceSize;
+            }
+        }
+
+        float currentMax[16];
+        for (int i = 0; i < count; ++i) {
+            currentMax[i] = runningMax ? runningMax[k + i] : -65504.0f;
+        }
+
+        for (int j = 0; j < reduceSizeOuter; ++j) {
+            auto blockSrcBase = softmaxSrc + j * stride0 + k * packUnit;
+
+            for (int i = 0; i < count; ++i) {
+                if (!isRowValid[i]) continue;
+
+                int len = validLens[i];
+                int blockStart = j * packUnit;
+                if (blockStart >= len) continue;
+
+                auto srcPtr = blockSrcBase + i * packUnit;
+                int remain = len - blockStart;
+
+                if (remain >= packUnit) {
+                    float16x8_t val = vld1q_f16(srcPtr);
+                    float maxInVec = vmaxvq_f16(val);
+                    currentMax[i] = ALIMAX(currentMax[i], maxInVec);
+                } else {
+                    for (int p = 0; p < remain; ++p) {
+                        currentMax[i] = ALIMAX(currentMax[i], (float)srcPtr[p]);
+                    }
+                }
+            }
+        }
+
+        float currentSum[16] = {0.0f};
+        float32x4_t vecSum0[16]; // Low part accumulator
+        float32x4_t vecSum1[16]; // High part accumulator
+        float32x4_t finalMaxVec[16];
+
+        for (int i = 0; i < count; ++i) {
+            vecSum0[i] = vdupq_n_f32(0.0f);
+            vecSum1[i] = vdupq_n_f32(0.0f);
+            finalMaxVec[i] = vdupq_n_f32(currentMax[i]);
+        }
+
+        for (int j = 0; j < reduceSizeOuter; ++j) {
+            auto blockSrcBase = softmaxSrc + j * stride0 + k * packUnit;
+            auto blockDstBase = softmaxDst + j * stride0 + k * packUnit;
+
+            for (int i = 0; i < count; ++i) {
+                if (!isRowValid[i]) {
+                    memset(blockDstBase + i * packUnit, 0, packUnit * sizeof(__fp16));
+                    continue;
+                }
+
+                int len = validLens[i];
+                int blockStart = j * packUnit;
+                if (blockStart >= len) {
+                    memset(blockDstBase + i * packUnit, 0, packUnit * sizeof(__fp16));
+                    continue;
+                }
+
+                auto srcPtr = blockSrcBase + i * packUnit;
+                auto dstPtr = blockDstBase + i * packUnit;
+                int remain = len - blockStart;
+
+                if (remain >= packUnit) {
+                    float16x8_t srcVal = vld1q_f16(srcPtr);
+
+                    // F16 -> F32 expansion
+                    float32x4_t low = vcvt_f32_f16(vget_low_f16(srcVal));
+                    float32x4_t high = vcvt_f32_f16(vget_high_f16(srcVal));
+
+                    // Subtract Max
+                    low = vsubq_f32(low, finalMaxVec[i]);
+                    high = vsubq_f32(high, finalMaxVec[i]);
+
+                    // Exp
+                    low = expApprox(low);
+                    high = expApprox(high);
+
+                    // Accumulate Sum
+                    vecSum0[i] = vaddq_f32(vecSum0[i], low);
+                    vecSum1[i] = vaddq_f32(vecSum1[i], high);
+
+                    // Store Exp result temporarily
+                    vst1q_f16(dstPtr, vcombine_f16(vcvt_f16_f32(low), vcvt_f16_f32(high)));
+                } else {
+                    // Handle Tail
+                    for (int p = 0; p < remain; ++p) {
+                        float val = expf((float)srcPtr[p] - currentMax[i]);
+                        currentSum[i] += val;
+                        dstPtr[p] = (__fp16)val;
+                    }
+                    memset(dstPtr + remain, 0, (packUnit - remain) * sizeof(__fp16));
+                }
+            }
+        }
+
+        // Horizontal reduction for sums
+        for (int i = 0; i < count; ++i) {
+            currentSum[i] += vaddvq_f32(vecSum0[i]) + vaddvq_f32(vecSum1[i]);
+        }
+
+        for (int i = 0; i < count; ++i) {
+            int currentK = k + i;
+            if (!isRowValid[i]) continue;
+
+            float scale;
+            if (runningMax && runningSum && updateScale) {
+                // Incremental Softmax logic
+                float oldMax = runningMax[currentK];
+                float scaleForSum = expf(oldMax - currentMax[i]);
+                runningSum[currentK] = runningSum[currentK] * scaleForSum + currentSum[i];
+                runningMax[currentK] = currentMax[i];
+                updateScale[currentK] = scaleForSum;
+                continue;
+            } else {
+                // Standard Softmax logic
+                if (runningMax && runningSum) {
+                    currentSum[i] += runningSum[currentK] * expf(runningMax[currentK] - currentMax[i]);
+                }
+                scale = 1.0f / (currentSum[i] + 1e-20f);
+            }
+
+            float16x8_t scaleVec = vdupq_n_f16((__fp16)scale);
+
+            // Normalize Pass
+            for (int j = 0; j < reduceSizeOuter; ++j) {
+                int len = validLens[i];
+                int blockStart = j * packUnit;
+                if (blockStart >= len) break;
+
+                auto dstPtr = softmaxDst + j * stride0 + k * packUnit + i * packUnit;
+
+                if (len - blockStart >= packUnit) {
+                    float16x8_t val = vld1q_f16(dstPtr);
+                    val = vmulq_f16(val, scaleVec);
+                    vst1q_f16(dstPtr, val);
+                } else {
+                    int remain = len - blockStart;
+                    for (int p = 0; p < remain; ++p) {
+                        dstPtr[p] = (__fp16)((float)dstPtr[p] * scale);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void MNNSoftmaxFp16_Pack1(float* dest, const float* source, float* runningMax, float* runningSum, float* updateScale, int outside, int reduceSize, int kvSeqOffset, int validOffset, bool mask) {
+    auto softmaxDst = (FLOAT16*)dest;
+    auto softmaxSrc = (FLOAT16*)source;
 
     for (int k = 0; k < outside; ++k) {
-        if (mask && kvSeqOffset > k + validOffset) {
-            if (updateScale){
-                updateScale[k] = 1;
+        int currentValidSize = reduceSize;
+        bool isRowValid = true;
+
+        if (mask) {
+            if (kvSeqOffset > k + validOffset) {
+                isRowValid = false;
+                currentValidSize = 0;
+                if (updateScale) updateScale[k] = 1.0f;
+            } else {
+                currentValidSize = ALIMIN(reduceSize, k + (validOffset + 1) - kvSeqOffset);
             }
-            for (int j = 0; j < reduceSizeOuter; ++j) {
-                int i = 0;
-                for (; i < reduceSizeInner; i += packUnit) {
-                    auto destPtr = softmaxDst + j * stride0 + k * reduceSizeInner + i;
-                    vst1q_f16(destPtr, vdupq_n_f16(0.0f));
-                }
-                if (i < reduceSizeInner) {
-                    memset(softmaxDst + j * stride0 + k * reduceSizeInner + i, 0, (reduceSizeInner - i) * sizeof(__fp16));
-                }
-            }
+        }
+
+        if (!isRowValid || currentValidSize == 0) {
+            memset(softmaxDst + k * reduceSize, 0, reduceSize * sizeof(__fp16));
             continue;
         }
 
-        const int validReduceSize = mask ? ALIMIN(reduceSize, k + (validOffset + 1) - kvSeqOffset) : reduceSize;
-        const int remain = validReduceSize % packUnit;
-        const int sizeDiv = validReduceSize / packUnit;
+        auto srcRow = softmaxSrc + k * reduceSize;
+        auto dstRow = softmaxDst + k * reduceSize;
 
-        // 1. newMax
-        float oldMax = -65504.0f;
-        if (runningMax) {
-            oldMax = runningMax[k];
+        float oldMax = runningMax ? runningMax[k] : -65504.0f;
+        float16x8_t maxVec = vdupq_n_f16(-65504.0f);
+
+        // Unroll 4 (32 elements per loop)
+        int i = 0;
+        for (; i <= currentValidSize - 32; i += 32) {
+            float16x8_t v0 = vld1q_f16(srcRow + i + 0);
+            float16x8_t v1 = vld1q_f16(srcRow + i + 8);
+            float16x8_t v2 = vld1q_f16(srcRow + i + 16);
+            float16x8_t v3 = vld1q_f16(srcRow + i + 24);
+
+            maxVec = vmaxq_f16(maxVec, v0);
+            maxVec = vmaxq_f16(maxVec, v1);
+            maxVec = vmaxq_f16(maxVec, v2);
+            maxVec = vmaxq_f16(maxVec, v3);
+        }
+        // Handle remaining blocks of 8
+        for (; i <= currentValidSize - 8; i += 8) {
+            maxVec = vmaxq_f16(maxVec, vld1q_f16(srcRow + i));
         }
 
-        auto newMaxVec = vdupq_n_f16(-65504.0f);
+        // Horizontal Max reduction
+        float newMax = vmaxvq_f16(maxVec);
 
-        for (int j = 0; j < sizeDiv; ++j) {
-            auto srcPtr = softmaxSrc + j * stride0 + k * reduceSizeInner;
-            float16x8_t srcVec = vld1q_f16(srcPtr);
-            newMaxVec = vmaxq_f16(newMaxVec, srcVec);
-        }
-        float newMax = vmaxvq_f16(newMaxVec);
-
-        if (remain > 0) {
-            auto srcPtr = softmaxSrc + sizeDiv * stride0  + k * reduceSizeInner;
-            for (int i = 0; i < remain; ++i) {
-                newMax = ALIMAX(newMax, (float)srcPtr[i]);
-            }
+        // Handle remaining scalars (Tail)
+        for (; i < currentValidSize; ++i) {
+            newMax = ALIMAX(newMax, (float)srcRow[i]);
         }
 
-        const float finalMax = ALIMAX(oldMax, newMax);
-        const float32x4_t finalMaxVec = vdupq_n_f32(finalMax);
+        float finalMax = ALIMAX(oldMax, newMax);
+        float32x4_t finalMaxVec = vdupq_n_f32(finalMax);
 
-        // 2. exp(x - finalMax)
         float sum = 0.0f;
-        float32x4_t sumVec0 = vdupq_n_f32(0.0f);
-        float32x4_t sumVec1 = vdupq_n_f32(0.0f);
+        float32x4_t sumVec = vdupq_n_f32(0.0f);
 
-        for (int j = 0; j < sizeDiv; ++j) {
-            auto idx = j * stride0 + k * reduceSizeInner;
-            auto srcPtr = softmaxSrc + idx;
-            auto dstPtr = softmaxDst + idx;
+        i = 0;
+        // Unroll 2 (16 elements). Exp is heavy, unroll 4 might cause register spilling.
+        for (; i <= currentValidSize - 16; i += 16) {
+            float16x8_t v0 = vld1q_f16(srcRow + i);
+            float16x8_t v1 = vld1q_f16(srcRow + i + 8);
 
-            float16x8_t srcVec = vld1q_f16(srcPtr);
+            // Process v0
+            float32x4_t v0_lo = vcvt_f32_f16(vget_low_f16(v0));
+            float32x4_t v0_hi = vcvt_f32_f16(vget_high_f16(v0));
+            v0_lo = expApprox(vsubq_f32(v0_lo, finalMaxVec));
+            v0_hi = expApprox(vsubq_f32(v0_hi, finalMaxVec));
+            sumVec = vaddq_f32(sumVec, v0_lo);
+            sumVec = vaddq_f32(sumVec, v0_hi);
+            vst1q_f16(dstRow + i, vcombine_f16(vcvt_f16_f32(v0_lo), vcvt_f16_f32(v0_hi)));
 
-            // F16 -> F32
-            float32x4_t srcLo = vcvt_f32_f16(vget_low_f16(srcVec));
-            float32x4_t srcHi = vcvt_f32_f16(vget_high_f16(srcVec));
-
-            // sub max
-            srcLo = vsubq_f32(srcLo, finalMaxVec);
-            srcHi = vsubq_f32(srcHi, finalMaxVec);
-
-            // exp
-            srcLo = expApprox(srcLo);
-            srcHi = expApprox(srcHi);
-
-            // sum
-            sumVec0 = vaddq_f32(sumVec0, srcLo);
-            sumVec1 = vaddq_f32(sumVec1, srcHi);
-
-            // F32 -> F16 and store
-            vst1q_f16(dstPtr, vcombine_f16(vcvt_f16_f32(srcLo), vcvt_f16_f32(srcHi)));
+            // Process v1
+            float32x4_t v1_lo = vcvt_f32_f16(vget_low_f16(v1));
+            float32x4_t v1_hi = vcvt_f32_f16(vget_high_f16(v1));
+            v1_lo = expApprox(vsubq_f32(v1_lo, finalMaxVec));
+            v1_hi = expApprox(vsubq_f32(v1_hi, finalMaxVec));
+            sumVec = vaddq_f32(sumVec, v1_lo);
+            sumVec = vaddq_f32(sumVec, v1_hi);
+            vst1q_f16(dstRow + i + 8, vcombine_f16(vcvt_f16_f32(v1_lo), vcvt_f16_f32(v1_hi)));
         }
 
-        if (remain > 0) {
-            auto idx = sizeDiv * stride0  + k * reduceSizeInner;
-            auto srcPtr = softmaxSrc + idx;
-            auto dstPtr = softmaxDst + idx;
+        // Handle remaining blocks of 8
+        for (; i <= currentValidSize - 8; i += 8) {
+            float16x8_t v = vld1q_f16(srcRow + i);
+            float32x4_t v_lo = vcvt_f32_f16(vget_low_f16(v));
+            float32x4_t v_hi = vcvt_f32_f16(vget_high_f16(v));
 
-            __fp16 tempDst[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            v_lo = expApprox(vsubq_f32(v_lo, finalMaxVec));
+            v_hi = expApprox(vsubq_f32(v_hi, finalMaxVec));
 
-            for(int i = 0; i < remain; ++i) {
-                float val = expf((float)srcPtr[i] - finalMax);
+            sumVec = vaddq_f32(sumVec, v_lo);
+            sumVec = vaddq_f32(sumVec, v_hi);
+
+            vst1q_f16(dstRow + i, vcombine_f16(vcvt_f16_f32(v_lo), vcvt_f16_f32(v_hi)));
+        }
+
+        // Handle Tail scalars
+        if (i < currentValidSize) {
+             __fp16 tempDst[8];
+            int remain = currentValidSize - i;
+            auto sPtr = srcRow + i;
+            for (int p = 0; p < remain; ++p) {
+                float val = expf((float)sPtr[p] - finalMax);
                 sum += val;
-                tempDst[i] = (__fp16)val;
+                tempDst[p] = (__fp16)val;
             }
-            if (pack > 1) {
-                memcpy(dstPtr, tempDst, packUnit * sizeof(__fp16));
-            } else {
-                memcpy(dstPtr, tempDst, remain * sizeof(__fp16));
-            }
+            memcpy(dstRow + i, tempDst, remain * sizeof(__fp16));
+            i += remain; // align i to currentValidSize
         }
 
-        sum += vaddvq_f32(sumVec0) + vaddvq_f32(sumVec1);
+        sum += vaddvq_f32(sumVec);
 
-        // 3. update runningMax, runningSum, scale or normalize softmax results
-        if (runningMax != nullptr && runningSum != nullptr && updateScale != nullptr) {
-            // update runningSum, runningMax, scale
+        // Fill remaining invalid part with 0
+        if (currentValidSize < reduceSize) {
+            memset(dstRow + currentValidSize, 0, (reduceSize - currentValidSize) * sizeof(__fp16));
+        }
+
+        if (runningMax && runningSum && updateScale) {
             float scaleForSum = expf(oldMax - finalMax);
             runningSum[k] = runningSum[k] * scaleForSum + sum;
             runningMax[k] = finalMax;
             updateScale[k] = scaleForSum;
         } else {
-            // Normalize softmax results
-            if (runningMax != nullptr && runningSum != nullptr) {
+            if (runningMax && runningSum) {
                 sum += runningSum[k] * expf(oldMax - finalMax);
             }
             float scale = 1.0f / (sum + 1e-20f);
-            float16x8_t scale_vec = vdupq_n_f16((__fp16)scale);
+            float16x8_t scaleVec = vdupq_n_f16((__fp16)scale);
 
-            for (int j = 0; j < sizeDiv; ++j) {
-                auto pDest = softmaxDst + j * stride0 + k * reduceSizeInner;
-                float16x8_t data = vld1q_f16(pDest);
-                data = vmulq_f16(data, scale_vec);
-                vst1q_f16(pDest, data);
-            }
+            // Unroll 4 (32 elements) for throughput
+            i = 0;
+            for (; i <= currentValidSize - 32; i += 32) {
+                float16x8_t v0 = vld1q_f16(dstRow + i);
+                float16x8_t v1 = vld1q_f16(dstRow + i + 8);
+                float16x8_t v2 = vld1q_f16(dstRow + i + 16);
+                float16x8_t v3 = vld1q_f16(dstRow + i + 24);
 
-            if (remain > 0) {
-                auto pDest = softmaxDst + sizeDiv * stride0 + k * reduceSizeInner;
-                for (int i = 0; i < remain; ++i) {
-                    pDest[i] = (__fp16)((float)pDest[i] * scale);
-                }
+                vst1q_f16(dstRow + i, vmulq_f16(v0, scaleVec));
+                vst1q_f16(dstRow + i + 8, vmulq_f16(v1, scaleVec));
+                vst1q_f16(dstRow + i + 16, vmulq_f16(v2, scaleVec));
+                vst1q_f16(dstRow + i + 24, vmulq_f16(v3, scaleVec));
             }
-        }
-
-        // 4. memset invalid positions to zero
-        if (pack > 1) {
-            if (validReduceSize % packUnit > 0) {
-                memset(softmaxDst + sizeDiv * stride0 + k * reduceSizeInner + (validReduceSize % packUnit), 0, (packUnit - (validReduceSize % packUnit)) * sizeof(__fp16));
+            for (; i <= currentValidSize - 8; i += 8) {
+                float16x8_t v = vld1q_f16(dstRow + i);
+                vst1q_f16(dstRow + i, vmulq_f16(v, scaleVec));
             }
-            auto validDiv8 = UP_DIV(validReduceSize, packUnit);
-            auto allDiv8 = UP_DIV(reduceSize, packUnit);
-            for (int j = validDiv8; j < allDiv8; ++j) {
-                auto destPtr = softmaxDst + j * stride0 + k * reduceSizeInner;
-                memset(destPtr, 0, packUnit * sizeof(__fp16));
+            for (; i < currentValidSize; ++i) {
+                dstRow[i] = (__fp16)((float)dstRow[i] * scale);
             }
-        } else {
-            memset(softmaxDst + k * reduceSizeInner + validReduceSize, 0, (reduceSize - validReduceSize) * sizeof(__fp16));
         }
     }
+}
+
+
+static void MNNSoftmaxFp16(float* dest, const float* source, float* runningMax, float* runningSum, float* updateScale, int outside, int reduceSize, int kvSeqOffset, int validOffset, int pack, bool mask) {
+    // source shape: [reduceSizeOuter, outside, reduceSizeInner]
+    // for C4, [up_div(reduceSize,8), outside,8] => reduceSizeOuter=up_div(reduceSize,8), reduceSizeInner=8
+    // for C,  [outside, reduceSize]             => reduceSizeOuter=1, reduceSizeInner=reduceSize
+    if (pack == 8) {
+        MNNSoftmaxFp16_Pack8(dest, source, runningMax, runningSum, updateScale, outside, reduceSize, kvSeqOffset, validOffset, pack, mask);
+        return;
+    }
+    if (pack == 1) {
+        MNNSoftmaxFp16_Pack1(dest, source, runningMax, runningSum, updateScale, outside, reduceSize, kvSeqOffset, validOffset, mask);
+        return;
+    }
+    MNN_ERROR("MNNSoftMaxFp16 not support pack!=8 and pack!=1\n");
+    return;
 }
 
 static CoreFunctions* gInstance = nullptr;
@@ -2500,11 +2877,6 @@ bool Arm82Functions::init() {
     gInstance->supportI8mm = origin->supportI8mm;
     gInstance->supportSME2 = origin->supportSME2;
     gInstance->smeCoreNumber = origin->smeCoreNumber;
-#ifdef MNN_CPU_WEIGHT_DEQUANT_GEMM
-    // Weight Dequant Gemm Kernels
-    FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMul_int8, MNNPackedMatMulFP16_int8);
-    FUNC_PTR_ASSIGN(gInstance->MNNPackedMatMulRemain_int8, MNNPackedMatMulRemainFP16_int8);
-#endif
 #ifdef MNN_LOW_MEMORY
     // Dynamic Qaunt Helper Functions
     FUNC_PTR_ASSIGN(gInstance->MNNAbsMax, MNNAbsMaxFP16);
@@ -2533,6 +2905,16 @@ bool Arm82Functions::init() {
     FUNC_PTR_ASSIGN(gInstance->MNNFlashAttentionUpdateBlockOutput, MNNFlashAttentionUpdateBlockOutput);
     gInstance->MNNQuantAttentionKey = MNNQuantAttentionKeyFP16;
     gInstance->MNNQuantAttentionValue = MNNQuantAttentionValueFP16;
+
+    // LinearAttention fp16 kernels
+    FUNC_PTR_ASSIGN(gInstance->MNNRankOneUpdate, MNNRankOneUpdateFp16);
+    FUNC_PTR_ASSIGN(gInstance->MNNDualMatVec, MNNDualMatVecFp16);
+    FUNC_PTR_ASSIGN(gInstance->MNNDecayRankOneUpdate, MNNDecayRankOneUpdateFp16);
+#if defined(__aarch64__) && defined(MNN_USE_NEON)
+    // Fused kernel uses NEON intrinsics directly (not extern asm), so the
+    // assignment must follow the same guard as the function body above.
+    FUNC_PTR_ASSIGN(gInstance->MNNFusedGatedDelta, MNNFusedGatedDeltaFp16);
+#endif
 #endif // MNN_SUPPORT_TRANSFORMER_FUSE
 
     gInstance->MNNComputeMatMulForH_1 = _MNNComputeMatMulForH_1_FP16;

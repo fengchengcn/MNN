@@ -12,6 +12,7 @@
 #include "core/Backend.hpp"
 #include "core/BufferAllocator.hpp"
 #include "core/TensorUtils.hpp"
+#include <atomic>
 #include "MNN_generated.h"
 #include "MetalDefine.h"
 #include <MNN/ErrorCode.hpp>
@@ -246,29 +247,36 @@ public:
     BackendConfig::MemoryMode getMemoryMode() const {
         return mMemoryMode;
     }
+    bool isSupportTensorApi() const {
+        return mSupportTensorApi;
+    }
 private:
     BackendConfig::MemoryMode mMemoryMode;
+    bool mSupportTensorApi = false;
 private:
     MetalRuntimeAllocator::MetalBufferAlloc mEmptyMem;
     id<MTLCommandBuffer> getCommandBufferForNet() const;
     id<MTLComputeCommandEncoder> encoder_net() const;
     mutable id<MTLCommandBuffer> _commandBuffer = nil;
-    mutable id<MTLCommandBuffer> _commandBuffer_net = nil;
     mutable std::queue<id<MTLBuffer>> mHoldBuffers;
 
     id<MTLCommandQueue> _commandQueue;
 
     const MetalRuntime* mRuntime;
     mutable NSUInteger mEncoderCount = 0;
-    mutable bool mSupportDeferEncode = true;
 
     mutable id<MTLComputeCommandEncoder> mComputeEncoder = nil;
     std::shared_ptr<BufferAllocator> mBufferPool;
     std::shared_ptr<BufferAllocator> mBufferPoolShapeImmutable;
+    std::atomic<bool> mGPUEnabledSwitch;
+    id<NSObject> mForegroundObserver;
+    id<NSObject> mBackgroundObserver;
 
 private:
     void _resetDynamicMemory() const;
     CopyPipeline _makeCopyInfo(const Tensor *src, const Tensor *dst, id<MTLBuffer> shape, int castType) const;
+    void setUpGPUEnabledSwitch();
+    void removeNotificationsObservers();
 
     mutable id<MTLBuffer> mHostBuffer = nullptr;
     // hostmask: 0: no host, 1: src is host, 2: dst is host

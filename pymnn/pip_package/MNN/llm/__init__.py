@@ -2,17 +2,19 @@ import _mnncengine.llm as _F
 from enum import IntEnum
 
 class LlmStatus(IntEnum):
+    NOT_LOADED = -1
     RUNNING = 0
     NORMAL_FINISHED = 1
     MAX_TOKENS_FINISHED = 2
     USER_CANCEL = 3
     INTERNAL_ERROR = 4
+    TIMEOUT = 5
 
     def __str__(self):
-        return f"{self.__class__.__name__}.{self.name}"
+        return "{}.{}".format(self.__class__.__name__, self.name)
 
     def __repr__(self):
-        return f"{self.__class__.__name__}.{self.name}"
+        return "{}.{}".format(self.__class__.__name__, self.name)
 
 class Context:
     def __init__(self, llm_obj):
@@ -151,7 +153,7 @@ class Context:
             self.update(status=int(value))
 
     def __repr__(self):
-        return f"Context({self._data})"
+        return "Context({})".format(self._data)
 
 class Llm:
 

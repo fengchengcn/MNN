@@ -31,10 +31,10 @@ int MNNMetalGetTensorContent(MNNMetalTensorContent* content, void* tensor) {
         return 0;
     }
     auto t = (MNN::Tensor*)tensor;
-    auto des = MNN::TensorUtils::getDescribe(t);
+    auto des = MNN::TensorUtils::getDescribeOrigin(t);
     content->buffer = ((MNN::MetalRuntimeAllocator::MetalBufferAlloc*)t->deviceId())->getBuffer();
     content->texture = nil;
-    content->offset = des->extra.offset;
+    content->offset = des->offset;
     return 0;
 }
 
@@ -43,8 +43,8 @@ namespace MNN {
 static void _MetalApplyTensor(uint8_t* host, size_t offset, Tensor* t) {
     // ptr of MetalBufferAlloc
     t->buffer().device = (uint64_t)host;
-    auto des = TensorUtils::getDescribe(t);
-    des->extra.offset = offset;
+    auto des = TensorUtils::getDescribeOrigin(t);
+    des->offset = offset;
 }
 BufferAllocator* MetalRuntime::createDynamicAllocator(int index, bool secondResize) const {
     if (hint().memoryAllocatorType == Runtime::Allocator_Defer && secondResize) {
@@ -93,17 +93,86 @@ MetalBackend::MetalBackend(const MetalRuntime* runtime, bool usefp16AsFp32, Back
     if (runtime->getCommandQueue() == nil) {
         // one command queue can create only a few command buffer, so let each backend own a command queue
         _commandQueue = [[ctx device] newCommandQueue];
-        mSupportDeferEncode = true;
     } else {
         // otherwise forbid defer encode optimize
         _commandQueue = runtime->getCommandQueue();
-        mSupportDeferEncode = false;
+    }
+    if(((MetalRuntime *)mRuntime)->supportTensorOps()) {
+        mSupportTensorApi = true;
+        const char * src_tensor_f16 = "\n"
+            "#include <metal_stdlib> \n"
+            "#include <metal_tensor> \n"
+            "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h> \n"
+            " \n"
+            "using namespace metal; \n"
+            "using namespace mpp::tensor_ops; \n"
+            " \n"
+            "kernel void dummy_kernel( \n"
+            "    tensor<device  half, dextents<int32_t, 2>> A [[buffer(0)]], \n"
+            "    tensor<device  half, dextents<int32_t, 2>> B [[buffer(1)]], \n"
+            "    device float * C [[buffer(2)]], \n"
+            "    uint2 tgid [[threadgroup_position_in_grid]]) \n"
+            "{ \n"
+            "    auto tA = A.slice(0, (int)tgid.y); \n"
+            "    auto tB = B.slice((int)tgid.x, 0); \n"
+            " \n"
+            "    matmul2d< \n"
+            "        matmul2d_descriptor(8, 8, dynamic_extent), \n"
+            "        execution_simdgroups<4>> mm; \n"
+            " \n"
+            "    auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>(); \n"
+            " \n"
+            "    auto sA = tA.slice(0, 0); \n"
+            "    auto sB = tB.slice(0, 0); \n"
+            "    mm.run(sB, sA, cT); \n"
+            " \n"
+            "    auto tC = tensor<device float, dextents<int32_t, 2>, tensor_inline>(C, dextents<int32_t, 2>(4, 4)); \n"
+            " \n"
+            "    cT.store(tC); \n"
+            "}";
+        
+        auto pipeline = makeComputePipelineWithSourceOption(src_tensor_f16, "dummy_kernel", nullptr);
+        if(pipeline == nullptr) {
+            MNN_PRINT("Metal4 Tensor api compile err, disable tensor api.\n");
+            mSupportTensorApi = false;
+        }
     }
     _commandBuffer = nil;
-    _commandBuffer_net = nil;
+    setUpGPUEnabledSwitch();
 }
 MetalBackend::~MetalBackend() {
     flushEncoder();
+    removeNotificationsObservers();
+}
+
+void MetalBackend::setUpGPUEnabledSwitch() {
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+    __block UIApplicationState state;
+    if ([NSThread isMainThread]) {
+        state = [UIApplication sharedApplication].applicationState;
+    } else {
+        dispatch_semaphore_t latch = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            state = [UIApplication sharedApplication].applicationState;
+            dispatch_semaphore_signal(latch);
+        });
+        dispatch_semaphore_wait(latch, DISPATCH_TIME_FOREVER);
+    }
+    mGPUEnabledSwitch.store(state == UIApplicationStateActive);
+    mForegroundObserver = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:nil usingBlock:^(NSNotification * _Nonnull notification) {
+        mGPUEnabledSwitch.store(true);
+    }];
+    mBackgroundObserver = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:nil usingBlock:^(NSNotification * _Nonnull notification) {
+        mGPUEnabledSwitch.store(false);
+    }];
+#endif
+}
+
+void MetalBackend::removeNotificationsObservers() {
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+    [[NSNotificationCenter defaultCenter] removeObserver:mForegroundObserver];
+    [[NSNotificationCenter defaultCenter] removeObserver:mBackgroundObserver];
+#endif
 }
 
 id<MTLComputeCommandEncoder> MetalBackend::encoder_net() const {
@@ -236,7 +305,6 @@ Execution *MetalBackend::onCreate(const std::vector<Tensor *> &inputs, const std
 
     auto iter = map->find(op->type());
     if (iter == map->end()) {
-        mSupportDeferEncode = false;
         if (nullptr != op->name()) {
             MNN_PRINT("Don't support type [%s], %s\n", EnumNameOpType(op->type()), op->name()->c_str());
         } else {
@@ -248,7 +316,6 @@ Execution *MetalBackend::onCreate(const std::vector<Tensor *> &inputs, const std
 
     auto exe = iter->second->onCreate(inputs, op, this, outputs);
     if (NULL == exe) {
-        mSupportDeferEncode = false;
         MNN_PRINT("The Creator Don't support type [%s], %s\n", MNN::EnumNameOpType(op->type()), op->name() ? op->name()->c_str() : "");
         return NULL;
     }
@@ -536,7 +603,6 @@ kernel void main0(const device IType *in [[buffer(0)]], device OType *out [[buff
 void MetalBackend::onResizeBegin() {    
     // Abort last inference task if needed
     flushEncoder();
-    _commandBuffer_net = nil;
     _commandBuffer = nil;
     wait();
     mCurrentAllocator->reset();
@@ -734,7 +800,7 @@ void MetalBackend::onCopyBuffer(const Tensor *src, const Tensor *dst, id<MTLComp
 
     if (!src->buffer().host && dst->buffer().host) {
         auto device = (id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)src->deviceId())->getBuffer();
-        auto devicePtr = (uint8_t*)device.contents + TensorUtils::getDescribe(src)->extra.offset;
+        auto devicePtr = (uint8_t*)device.contents + TensorUtils::getDescribeOrigin(src)->offset;
         if (needConvert) {
             auto tDst = const_cast<Tensor*>(dst);
             auto tmpBuffer = getHostBuffer(dst->usize());
@@ -772,7 +838,7 @@ void MetalBackend::onCopyBuffer(const Tensor *src, const Tensor *dst, id<MTLComp
             commit();
         } else {
             auto device = (id<MTLBuffer>)((MetalRuntimeAllocator::MetalBufferAlloc *)dst->deviceId())->getBuffer();
-            auto devicePtr = (uint8_t*)device.contents + TensorUtils::getDescribe(dst)->extra.offset;
+            auto devicePtr = (uint8_t*)device.contents + TensorUtils::getDescribeOrigin(dst)->offset;
             ::memcpy(devicePtr, src->host<void>(), srcSize);
         }
         return;
@@ -795,26 +861,15 @@ int MetalBackend::onSync(Tensor::MapType mtype, bool toCpu, const Tensor* dstTen
 id<MTLCommandBuffer> MetalBackend::getCommandBufferForBufferCopy() const {
     if (nil == _commandBuffer) {
         _commandBuffer = [_commandQueue commandBuffer];
-        if (!mSupportDeferEncode) {
-            // In this case _commandBuffer should be the same as _commandBuffer_net
-            _commandBuffer_net = _commandBuffer;
-        }
     }
     return _commandBuffer;
 }
 id<MTLCommandBuffer> MetalBackend::getCommandBufferForNet() const {
-    if (nil == _commandBuffer_net) {
-        _commandBuffer_net = [_commandQueue commandBuffer];
-        if (!mSupportDeferEncode) {
-            // In this case _commandBuffer should be the same as _commandBuffer_net
-            _commandBuffer = _commandBuffer_net;
-        }
-    }
-    return _commandBuffer_net;
+    return getCommandBufferForBufferCopy();
 }
 
 void MetalBackend::setTensor(const MNN::Tensor* tensor, id<MTLComputeCommandEncoder> encoder, int index) {
-    [encoder setBuffer:((MetalRuntimeAllocator::MetalBufferAlloc *)tensor->deviceId())->getBuffer() offset:TensorUtils::getDescribe(tensor)->extra.offset atIndex:index];
+    [encoder setBuffer:((MetalRuntimeAllocator::MetalBufferAlloc *)tensor->deviceId())->getBuffer() offset:TensorUtils::getDescribeOrigin(tensor)->offset atIndex:index];
 }
 void MetalBackend::setMem(const MemChunk& chunk, id<MTLComputeCommandEncoder> encoder, int index) {
     [encoder setBuffer:((MetalRuntimeAllocator::MetalBufferAlloc *)chunk.first)->getBuffer() offset:chunk.second atIndex:index];
@@ -826,19 +881,16 @@ void MetalBackend::setBuffer(id<MTLBuffer> buffer, int offset, id<MTLComputeComm
     [encoder setBuffer:buffer offset:offset atIndex:index];
 }
 std::pair<id<MTLBuffer>, int> MetalBackend::getBuffer(const MNN::Tensor* tensor) {
-    return std::make_pair(((MetalRuntimeAllocator::MetalBufferAlloc *)tensor->deviceId())->getBuffer(), TensorUtils::getDescribe(tensor)->extra.offset);
+    return std::make_pair(((MetalRuntimeAllocator::MetalBufferAlloc *)tensor->deviceId())->getBuffer(), TensorUtils::getDescribeOrigin(tensor)->offset);
 }
 
 
 void MetalBackend::commit() const {
 #ifdef CHECK_IOS_UI_STATUS
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-    if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground || [UIApplication sharedApplication].applicationState == UIApplicationStateInactive) {
+    if (!mGPUEnabledSwitch) {
         mRuntime->pExecutionStatus = NO_EXECUTION;
         _commandBuffer = nil;
-        if (!mSupportDeferEncode) {
-            _commandBuffer_net = nil;
-        }
         return;
     }
 #endif
@@ -848,36 +900,11 @@ void MetalBackend::commit() const {
         [_commandBuffer commit];
         mRuntime->_waiting = _commandBuffer;
         _commandBuffer = nil;
-        if (!mSupportDeferEncode) {
-            // In this case _commandBuffer should be the same as _commandBuffer_net
-            _commandBuffer_net = nil;
-        }
     }
 }
 
 void MetalBackend::commit_net() const {
-#ifdef CHECK_IOS_UI_STATUS
-#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-    if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground || [UIApplication sharedApplication].applicationState == UIApplicationStateInactive) {
-        mRuntime->pExecutionStatus = NO_EXECUTION;
-        _commandBuffer_net = nil;
-        if (!mSupportDeferEncode) {
-            _commandBuffer = nil;
-        }
-        return;
-    }
-#endif
-#endif
-    mRuntime->pExecutionStatus = NO_ERROR;
-    if (nil != _commandBuffer_net && _commandBuffer_net.status < MTLCommandBufferStatusCommitted) {
-        [_commandBuffer_net commit];
-        mRuntime->_waiting = _commandBuffer_net;
-        _commandBuffer_net = nil;
-        if (!mSupportDeferEncode) {
-            // In this case _commandBuffer should be the same as _commandBuffer_net
-            _commandBuffer = nil;
-        }
-    }
+    commit();
 }
 
 void MetalBackend::wait() const {
@@ -1040,11 +1067,22 @@ MetalRuntime::MetalRuntime(void* context) {
     mContext = context;
     auto ctx = (__bridge MNNMetalContext *)mContext;
     std::shared_ptr<EagerBufferAllocator::Allocator> allocator(new MetalRuntimeAllocator([ctx device]));
-    mSimdGroupReduce = [[ctx device] supportsFamily:MTLGPUFamilyApple7];
-    mSimdGroupReduce |= [[ctx device] supportsFamily:(MTLGPUFamily)MTLGPUFamilyMetal3_MNN];
-    mSimdGroupMatrix = [[ctx device] supportsFamily:MTLGPUFamilyApple7];
+    // supportsFamily: is available since iOS 13.0 / macOS 10.15, must check before calling
+    if (@available(iOS 13.0, macOS 10.15, *)) {
+        mSimdGroupReduce = [[ctx device] supportsFamily:MTLGPUFamilyApple7];
+        mSimdGroupReduce |= [[ctx device] supportsFamily:(MTLGPUFamily)MTLGPUFamilyMetal3_MNN];
+        mSimdGroupMatrix = [[ctx device] supportsFamily:MTLGPUFamilyApple7];
+    } else {
+        mSimdGroupReduce = false;
+        mSimdGroupMatrix = false;
+    }
     // Metal4 Support M1/A14 and later chips
-    mTensorOps = [[ctx device] supportsFamily:(MTLGPUFamily)MTLGPUFamilyMetal4_MNN];
+#ifdef MNN_METAL_TENSOR
+    if (@available(iOS 13.0, macOS 10.15, *)) {
+        mTensorOps = [[ctx device] supportsFamily:(MTLGPUFamily)MTLGPUFamilyMetal4_MNN];
+    } else {
+        mTensorOps = false;
+    }
 
     // AI TensorCore device support from M5/A19
     bool noAICoreDevice = [[[ctx device] name] containsString:@"M1"] || \
@@ -1057,6 +1095,9 @@ MetalRuntime::MetalRuntime(void* context) {
                         [[[ctx device] name] containsString:@"A17"] || \
                         [[[ctx device] name] containsString:@"A18"];
     mTensorOps = mTensorOps && !noAICoreDevice;
+#else
+    mTensorOps = false;
+#endif
 //    MNN_PRINT("Metal device name %s, open tensor: %d\n\n", [[[ctx device] name] UTF8String], mTensorOps);
     mStaticAllocator.reset(new EagerBufferAllocator(allocator));
     mDynamic.resize(METAL_SEPERATE_MAX_COUNT);

@@ -27,6 +27,7 @@ MNN使用CMake构建项目，CMake中的宏定义列表如下：
 | NATIVE_LIBRARY_OUTPUT | 如果构建为动态库，则指定动态库的输出路径，默认为`OFF` |
 | NATIVE_INCLUDE_OUTPUT | 如果构建为动态库，则指定动态库的头文件路径，默认为`OFF` |
 | MNN_AAPL_FMWK        | 是否构建`MNN.framework`替代`*.dylib`，默认为`OFF` |
+| MNN_GENERATE_PODSPEC  | 是否构建`MNN.podspec`以支持CocoaPods发布，默认为`OFF` |
 | MNN_WITH_PLUGIN      | 是否支持`Plugin算子`，默认为`OFF` |
 | MNN_SKIPBUILD_GEOMETRY   | 是否跳过MNN的几何计算编译，若是，MNN引擎仅支持在模型转换工具时加上 --saveStaticModel 转换出来的固定输入形状的模型，默认为`OFF` |
 | MNN_BUILD_MINI       | 是否构建MNN的最小化版本，若是，开启 `MNN_SKIPBUILD_GEOMETRY` 和 `MNN_REDUCE_SIZE`，默认为`OFF` |
@@ -39,6 +40,7 @@ MNN使用CMake构建项目，CMake中的宏定义列表如下：
 | MNN_INTERNAL         | 是否构建MNN的一些内部功能，如：日志；默认为`OFF` |
 | MNN_JNI              | 是否构建MNN的JNI支持，默认为`OFF` |
 | MNN_METAL            | 是否构建`Metal`后端，默认为`OFF` |
+| MNN_METAL_TENSOR     | 是否启用`Metal Tensor`接口，该宏仅在`MNN_METAL=ON`时生效，默认为`ON` |
 | MNN_OPENCL           | 是否构建`OpenCL`后端，默认为`OFF` |
 | MNN_OPENGL           | 是否构建`OpenGL`后端，默认为`OFF` |
 | MNN_VULKAN           | 是否构建`Vulkan`后端，默认为`OFF` |
@@ -53,6 +55,7 @@ MNN使用CMake构建项目，CMake中的宏定义列表如下：
 | MNN_CUDA_QUANT       | 是否打开CUDA 量化文件编译，默认为`OFF` |
 | MNN_CUDA_BF16        | 是否打开CUDA Bf16文件编译，默认为`OFF` |
 | MNN_CUDA_TUNE_PARAM  | 是否打开CUDA TUNE相关文件编译，目前仅支持安培及以上架构，默认为`OFF` |
+| MNN_CUDA_NATIVE_ARCH | 是否仅编译本机检测到的CUDA架构(单显卡环境下加快构建)，默认为`OFF` |
 | MNN_TENSORRT         | 是否构建`TensorRT`后端，默认为`OFF` |
 | MNN_COREML           | 是否构建`CoreML`后端，默认为`OFF` |
 | MNN_NNAPI            | 是否构建`NNAPI`后端，默认为`OFF`  |
@@ -94,7 +97,6 @@ MNN使用CMake构建项目，CMake中的宏定义列表如下：
 | MNN_AUDIO_TEST       | 构建MNN的Audio功能是否开启单元测试，默认为`OFF` |
 | MNN_VULKAN_IMAGE     | 构建MNN的Vulkan后端时采用Image内存模式，以便支持FP16和部分移动端上GPU的加速，默认为`ON` |
 | MNN_LOW_MEMORY       | 是否支持低内存模式，支持低内存模式使用权值量化模型并设置`low_memory`则会使用计算时反量化，默认为`OFF` |
-| MNN_CPU_WEIGHT_DEQUANT_GEMM       | 是否编译CPU权重反量化的矩阵乘Kernel， 如果打开该编译宏并且在CPU推理时设置MNN::BackendConfig::MemoryMode=Memory_Normal，就会使用权重反量化算子进行权重量化模型的推理，默认为`OFF` |
 | MNN_SUPPORT_RENDER   | 是否支持图形渲染相关算子实现，默认为 `OFF` |
 | MNN_SUPPORT_TRANSFORMER_FUSE | 是否支持Fuse Transformer相关OP实现，默认为 `OFF` |
 | MNN_BUILD_LLM        | 是否构建基于MNN的llm库和demo，默认为`OFF` ，打开时 MNN_LOW_MEMORY , MNN_SUPPORT_TRANSFORMER_FUSE 对应开启|
@@ -103,3 +105,8 @@ MNN使用CMake构建项目，CMake中的宏定义列表如下：
 | MNN_KLEIDIAI         | 是否集成ARM的klediAI加速库，默认为`ON` |
 | MNN_KLEIDIAI_DEFAULT_ON | 是否默认使用KLEIDIAI的Kernel, 默认为`OFF` |
 | MNN_USE_RVV          | 是否启用RISC-V向量扩展支持，默认为`OFF` |
+| MNN_MUSA_QUANT       | 是否开启 MUSA 量化相关代码编译，默认为`OFF` |
+| MNN_MUSA_BF16        | 是否开启 MUSA BFloat16 代码编译，默认为`OFF` |
+| MNN_MUSA_COMPAT_STUB | MUSA 兼容存根模式，仅编译不依赖真实 GPU，默认为`ON` |
+| MNN_MUSA_COMPAT_CUDA | 将 MUSA API 映射到 CUDA 进行编译测试，默认为`OFF` |
+| MNN_MUSA_NATIVE      | 使用原生 MUSA SDK 编译，默认为`OFF` |
