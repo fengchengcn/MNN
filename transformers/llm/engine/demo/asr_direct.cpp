@@ -75,6 +75,25 @@ static int argmax(const float* logits) {
     return idx;
 }
 
+// Argmax with repetition penalty: penalize already-generated tokens
+static int argmax_penalized(const float* logits, const std::vector<int>& history, float penalty) {
+    if (penalty <= 1.0f || history.empty()) return argmax(logits);
+
+    // Copy logits and apply penalty
+    std::vector<float> penalized(VOCAB);
+    memcpy(penalized.data(), logits, VOCAB * sizeof(float));
+    for (int id : history) {
+        if (id < 0 || id >= VOCAB) continue;
+        if (penalized[id] < 0)
+            penalized[id] *= penalty;
+        else
+            penalized[id] /= penalty;
+    }
+    int idx = 0;
+    for (int i = 1; i < VOCAB; i++) if (penalized[i] > penalized[idx]) idx = i;
+    return idx;
+}
+
 // Create causal mask: [1, 1, S_new, S_total], where S_total = past_len + S_new
 // For prefill (past_len=0): standard causal mask
 // For decode (past_len>0, S_new=1): single query attending to all positions
@@ -99,7 +118,7 @@ static std::vector<VARP> create_empty_cache() {
 }
 
 int main(int argc, char* argv[]) {
-    std::string dir = "/root/projects/mnn-models/Qwen3-ASR-0.6B-MNN";
+    std::string dir = "/root/projects/MNN/mnn-models/Qwen3-ASR-0.6B-MNN";
     std::string wav = "/tmp/test_audio.wav";
     if (argc > 1) dir = argv[1];
     if (argc > 2) wav = argv[2];
@@ -267,6 +286,9 @@ int main(int argc, char* argv[]) {
     std::vector<int> token_ids;
     token_ids.push_back(current_token);
 
+    // Repetition penalty (1.0 = disabled, 1.1-1.2 = typical)
+    const float REP_PENALTY = 1.15f;  // 1.0=off, 1.1-1.2 typical for ASR
+
     while (gen_len < max_new && current_token != EOS_TOKEN && current_token != 151645) {
         auto td0 = NOW();
 
@@ -293,7 +315,7 @@ int main(int argc, char* argv[]) {
         k_cache = out[1];
         v_cache = out[2];
 
-        current_token = argmax(logits->readMap<float>());  // [1, 1, V], only 1 position
+        current_token = argmax_penalized(logits->readMap<float>(), token_ids, REP_PENALTY);
         token_ids.push_back(current_token);
         gen_len++;
         S = cache_len + 1;  // update for next iteration
