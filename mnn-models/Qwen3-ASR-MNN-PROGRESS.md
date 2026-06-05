@@ -314,19 +314,23 @@ Token IDs:
 
 ## 六、后续路线图
 
-### 短期（Android 验证）
+### Android 集成（代码已完成，待编译测试）
 - [x] 诊断 Audio Encoder 性能：根因=单线程 + 首次调用惩罚（从 5s → 0.78s）
-- [ ] 交叉编译 MNN for Android（arm64-v8a），获取真实 ARM 性能数据
-  - 这是目前最关键的一步：x86 数据只能推算，ARM 实测才知真 RTF
-- [ ] Android 模型部署：将 8-bit 模型（~1.5GB）推送到手机测试
-- [ ] 如 ARM 上 RTF 仍 > 0.6，研究 GPU (OpenCL/Vulkan) 卸载 Prefill
+- [x] 添加 repetition penalty（默认 1.15，打破 n-gram 重复循环）
+- [x] C++ ASR 引擎类 (qwen3_asr_engine.h/.cpp)
+- [x] JNI 桥接层 (qwen3_asr_jni.cpp)
+- [x] Kotlin 包装类 (Qwen3AsrEngine.kt)
+- [x] CMakeLists.txt 更新（加入新源文件）
+- [x] Android 集成指南 (QWEN3_ASR_ANDROID_INTEGRATION.md)
+- [ ] **待你在 Windows 上操作：**
+  - 用 Android Studio + NDK 交叉编译 MNN（需加 LLM/AUDIO 编译 flags）
+  - 用 Android Studio 打开 MnnLlmChat 工程编译
+  - 将 8-bit 模型（~1.1GB）推送到手机
+  - 实测 ARM 上的 RTF
+  - 如 RTF > 0.6，考虑 GPU (OpenCL/Vulkan) 卸载 Prefill
 
-### 中期（完善）
-- [ ] 在 asr_direct.cpp 中实现采样解码（top-k/top-p）
-- [ ] 添加 repetition penalty 防止重复
+### 后续优化方向
 - [ ] 支持流式 ASR（音频分块 + encoder 增量推理）
-- [ ] 集成到 MNN LLM Omni 引擎
-
-### 长期（验证）
-- [ ] 待 transformers 官方支持 `qwen3_asr` 后，对比标准 RoPE vs mRoPE 差异
+- [ ] 集成到 MNN LLM Omni 引擎（替换手写 decode 循环）
 - [ ] 研究 AWQ/SmoothQuant 校准量化，尝试恢复 4-bit 精度
+- [ ] 待 transformers 官方支持 `qwen3_asr` 后，对比标准 RoPE vs mRoPE 差异
