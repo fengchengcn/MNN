@@ -307,8 +307,14 @@ bool Llm::load() {
     if (mBaseModule != nullptr) {
         module_config.base = mBaseModule;
     }
-    // load single model
-    std::vector<std::string> inputNames {"input_ids", "attention_mask", "position_ids", "logits_index"};
+    // load single model - support input name override from config (e.g., "inputs_embeds" for Omni)
+    auto config_input_names = mConfig->config_.value("input_names", std::vector<std::string>());
+    std::vector<std::string> inputNames;
+    if (!config_input_names.empty()) {
+        inputNames = config_input_names;
+    } else {
+        inputNames = {"input_ids", "attention_mask", "position_ids", "logits_index"};
+    }
     std::vector<std::string> outputNames {"logits"};
     if (mConfig->has_talker()) {
         outputNames.emplace_back("talker_embeds");

@@ -873,6 +873,9 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
         input_features = MNN::AUDIO::conformer_fbank(waveform);
     } else if (audio_type == "usm") {
         input_features = MNN::AUDIO::usm_fbank(waveform);
+    } else if (audio_type == "qwen3_asr") {
+        // Qwen3-ASR uses standard Whisper-style Mel filterbank
+        input_features = MNN::AUDIO::whisper_fbank(waveform);
     } else {
         input_features = MNN::AUDIO::whisper_fbank(waveform);
     }
