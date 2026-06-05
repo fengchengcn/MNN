@@ -92,6 +92,9 @@ if(MNN_LLM_BUILD_DEMO)
     target_link_libraries(reranker_demo ${LLM_DEPS})
     target_link_libraries(rollback_demo ${LLM_DEPS})
     target_link_libraries(tokenizer_demo ${LLM_DEPS})
+
+    add_executable(asr_demo ${CMAKE_CURRENT_LIST_DIR}/demo/asr_direct.cpp)
+    target_link_libraries(asr_demo ${LLM_DEPS})
 endif()
 
 option(MNN_LLM_BUILD_TEST "Build LLM unit tests" OFF)

@@ -308,10 +308,13 @@ bool Llm::load() {
         module_config.base = mBaseModule;
     }
     // load single model - support input name override from config (e.g., "inputs_embeds" for Omni)
-    auto config_input_names = mConfig->config_.value("input_names", std::vector<std::string>());
+    // load single model - auto-detect inputs for Omni/audio models
     std::vector<std::string> inputNames;
+    auto config_input_names = mConfig->config_.value("input_names", std::vector<std::string>());
     if (!config_input_names.empty()) {
         inputNames = config_input_names;
+    } else if (mConfig->is_audio()) {
+        inputNames = {};  // auto-detect, needed for inputs_embeds (float) type
     } else {
         inputNames = {"input_ids", "attention_mask", "position_ids", "logits_index"};
     }
@@ -525,7 +528,11 @@ std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::V
     mGenerateParam->outputs.clear();
     mGenerateParam->validLogitSize = 0;
     mGenerateParam->validLogitStart = 0;
-    std::vector<Express::VARP> inputs {hiddenState, mask, inputPos, logitsIndex};
+    std::vector<Express::VARP> inputs {hiddenState, mask, inputPos};
+    // logitsIndex for speculative decoding; skip if model expects <= 3 inputs
+    if (selectModule->getInfo()->inputNames.size() > 3) {
+        inputs.push_back(logitsIndex);
+    }
     inputs.insert(inputs.end(), extraArgs.begin(), extraArgs.end());
     std::vector<Express::VARP> outputs = selectModule->onForward(inputs);
 
