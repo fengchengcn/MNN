@@ -419,3 +419,10 @@ apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen2.5-Omni-3B-MNN
 # smoke models converted on the host by ./test_ci.sh local (sources are fetched
 # into /smoke_sources/, then MNNConvert writes the .caffe.mnn here)
 /resource/model/**/*.caffe.mnn
+
+# mnn-models — local model files for development/testing
+/mnn-models/*-MNN/
+/mnn-models/Qwen3-ASR-0.6B/
+/mnn-models/venv/
+/mnn-models/*.cpp
+/mnn-models/*.bin
