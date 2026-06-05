@@ -460,6 +460,115 @@ class Qwen3Decoder(nn.Module):
             print("  Decoder weights loaded successfully")
 
 
+class Qwen3DecoderWithKVCache(nn.Module):
+    """Qwen3 decoder with explicit K/V cache (all 28 layers in single forward).
+
+    Design:
+    - K/V cache is stored as a flat 5D tensor: [L, B, Hk, C, Hd] = [28,1,8,C,128]
+    - Works for both prefill (C=0) and decode (C>0)
+    - Single onForward call processes all 28 layers with cache management
+
+    Inputs:
+        inputs_embeds:   [B, S, D]      token embeddings
+        position_ids:    [B, S]         absolute positions
+        attention_mask:  [B, 1, S, C+S] causal mask
+        k_cache:         [L, B, Hk, C, Hd] cached K for all layers
+        v_cache:         [L, B, Hk, C, Hd] cached V for all layers
+    Outputs:
+        logits:  [B, S, V]
+        new_k:   [L, B, Hk, C+S, Hd] updated K cache
+        new_v:   [L, B, Hk, C+S, Hd] updated V cache
+    """
+    NUM_LAYERS = 28
+    NUM_KV_HEADS = 8
+    HEAD_DIM = 128
+    HIDDEN = 1024
+
+    def __init__(self, decoder):
+        super().__init__()
+        # Take only the decoder guts (no embed_tokens)
+        self.layers = decoder.layers
+        self.norm = decoder.norm
+        self.lm_head = decoder.lm_head
+        self.rotary = decoder.rotary
+        self.head_dim = decoder.head_dim
+        self.num_heads = decoder.num_heads
+        self.num_kv_heads = decoder.num_kv_heads
+        self.num_key_value_groups = decoder.num_heads // decoder.num_kv_heads
+
+    def forward(self, inputs_embeds, position_ids, attention_mask, k_cache, v_cache):
+        B, S, D = inputs_embeds.shape
+        past_len = k_cache.shape[3]
+
+        # Precompute RoPE for all S positions in this step
+        cos, sin = self.rotary(inputs_embeds, position_ids)
+
+        new_keys = []
+        new_values = []
+
+        hidden_states = inputs_embeds
+
+        for i in range(self.NUM_LAYERS):
+            layer = self.layers[i]
+            past_k = k_cache[i]   # [B, Hk, past_len, Hd]
+            past_v = v_cache[i]   # [B, Hk, past_len, Hd]
+
+            # === Self-attention ===
+            residual = hidden_states
+            hidden_states = layer.input_layernorm(hidden_states)
+
+            q = layer.self_attn.q_proj(hidden_states)
+            k = layer.self_attn.k_proj(hidden_states)
+            v = layer.self_attn.v_proj(hidden_states)
+
+            q = q.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
+            k = k.view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+            v = v.view(B, S, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+            # QK-Norm
+            q = layer.self_attn.q_norm(q.float()).to(q.dtype)
+            k = layer.self_attn.k_norm(k.float()).to(k.dtype)
+
+            # RoPE
+            q, k_rope = apply_rotary_pos_emb(q, k, cos, sin)
+
+            # KV Cache: concat with past
+            k_full = torch.cat([past_k, k_rope], dim=2)  # [B, Hk, past_len+S, Hd]
+            v_full = torch.cat([past_v, v], dim=2)       # [B, Hk, past_len+S, Hd]
+            new_keys.append(k_full)
+            new_values.append(v_full)
+
+            # GQA: expand KV heads to match Q heads
+            k_attn = k_full.repeat_interleave(self.num_key_value_groups, dim=1)
+            v_attn = v_full.repeat_interleave(self.num_key_value_groups, dim=1)
+
+            # Attention
+            attn = torch.matmul(q, k_attn.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if attention_mask is not None:
+                attn = attn + attention_mask
+            attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
+            hidden_states = torch.matmul(attn, v_attn)
+            hidden_states = hidden_states.transpose(1, 2).reshape(B, S, self.num_heads * self.head_dim)
+            hidden_states = layer.self_attn.o_proj(hidden_states)
+            hidden_states = residual + hidden_states
+
+            # === MLP ===
+            residual = hidden_states
+            hidden_states = layer.post_attention_layernorm(hidden_states)
+            hidden_states = layer.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+
+        # Final norm + lm_head
+        hidden_states = self.norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+
+        # Stack all layer caches back to 5D
+        new_k = torch.stack(new_keys, dim=0)  # [L, B, Hk, past_len+S, Hd]
+        new_v = torch.stack(new_values, dim=0)
+
+        return logits, new_k, new_v
+
+
 # ============================================================
 # Tokenizer handling
 # ============================================================
@@ -584,6 +693,8 @@ def main():
                         help='Export audio encoder')
     parser.add_argument('--export_decoder', action='store_true', default=True,
                         help='Export LLM decoder')
+    parser.add_argument('--export_kv_cache', action='store_true', default=True,
+                        help='Export LLM decoder with KV cache support')
     parser.add_argument('--skip_onnx', action='store_true',
                         help='Skip ONNX export (use existing ONNX files)')
     args = parser.parse_args()
@@ -757,8 +868,58 @@ def main():
             print(f"\n  Saved: embeddings_bf16.bin ({embed_weight.shape})")
 
     # =========================================
-    # Create config for MNN runtime
+    # Export LLM Decoder with KV Cache
     # =========================================
+    if args.export_kv_cache and args.export_decoder:
+        print("\n" + "=" * 60)
+        print("EXPORTING LLM DECODER WITH KV CACHE")
+        print("=" * 60)
+
+        # Reuse the decoder loaded above (or load if skipped)
+        if 'decoder' not in dir():
+            decoder = Qwen3Decoder(decoder_config)
+            decoder.load_weights(state_dict)
+
+        kv_decoder = Qwen3DecoderWithKVCache(decoder)
+
+        kv_onnx_path = os.path.join(onnx_dir, 'llm_kv.onnx')
+        kv_mnn_path = os.path.join(args.dst_path, 'llm_kv.mnn')
+
+        if not args.skip_onnx:
+            B, S, D = 1, 16, 1024
+            L, Hk, Hd = 28, 8, 128
+            past_len = 1  # non-zero to avoid ONNX zero-dim edge cases
+
+            dummy_embeds = torch.randn(B, S, D)
+            dummy_pos = torch.arange(S, dtype=torch.long).unsqueeze(0)
+            dummy_mask = torch.zeros(B, 1, S, past_len + S).float()
+            dummy_k_cache = torch.randn(L, B, Hk, past_len, Hd)
+            dummy_v_cache = torch.randn(L, B, Hk, past_len, Hd)
+
+            export_onnx(
+                kv_decoder,
+                kv_onnx_path,
+                (dummy_embeds, dummy_pos, dummy_mask, dummy_k_cache, dummy_v_cache),
+                input_names=['inputs_embeds', 'position_ids', 'attention_mask',
+                             'k_cache', 'v_cache'],
+                output_names=['logits', 'k_cache_out', 'v_cache_out'],
+                dynamic_axes={
+                    'inputs_embeds': {0: 'batch', 1: 'seq_len'},
+                    'position_ids': {0: 'batch', 1: 'seq_len'},
+                    'attention_mask': {0: 'batch', 2: 'seq_len', 3: 'total_len'},
+                    'k_cache': {3: 'cache_len'},
+                    'v_cache': {3: 'cache_len'},
+                    'logits': {0: 'batch', 1: 'seq_len'},
+                    'k_cache_out': {3: 'new_len'},
+                    'v_cache_out': {3: 'new_len'},
+                },
+                model_name='LLM Decoder (KV Cache)'
+            )
+
+        if args.mnnconvert and os.path.exists(kv_onnx_path):
+            convert_to_mnn(kv_onnx_path, kv_mnn_path, args.mnnconvert,
+                          quant_bit=args.quant_bit,
+                          quant_block=args.quant_block)
     print("\n" + "=" * 60)
     print("CREATING RUNTIME CONFIG")
     print("=" * 60)

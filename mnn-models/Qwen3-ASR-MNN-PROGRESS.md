@@ -1,6 +1,6 @@
 # Qwen3-ASR → MNN 项目状态
 
-> 更新：2026-06-06（修订版）
+> 更新：2026-06-06（v2 — KV Cache + 8-bit 量化完成）
 >
 > **前期阻塞已解决。** 之前报告的「28层 decoder 精度问题（cosine 相似度 0.814）」经过系统排查，**根因不在 MNN runtime**（MNN decoder vs ONNX Runtime 的 cosim=1.0，audio encoder cosim=0.999）。实际问题是：
 > 1. asr_direct.cpp 缺少 text prompt token → 模型立即输出 EOS
@@ -20,15 +20,17 @@
 - `/root/projects/mnn-models/venv/` (torch 2.12, transformers 5.10, onnx)
 - `source /root/projects/mnn-models/venv/bin/activate`
 
-### 3. 模型导出（通过 export_qwen3_asr.py）
+### 3. 模型导出（通过 export_qwen3_asr.py  + MNNConvert）
 | 文件 | 大小 | 说明 |
 |------|------|------|
-| `audio_encoder.mnn` | 190 MB | 3 Conv2d + 18层 Transformer Encoder |
-| `llm.mnn` | 0.4 MB | 28层 Qwen3 Decoder 结构 |
-| `llm.mnn.weight` | 2.27 GB | FP32 权重（非量化） |
-| `embeddings_bf16.bin` | 297 MB | 词嵌入 |
+| `audio_encoder.mnn` | 190 MB | 3 Conv2d + 18层 Transformer Encoder (8-bit) |
+| `embeddings_bf16.bin` | 297 MB | 词嵌入 (BF16) |
 | `tokenizer.txt` | 3 MB | MNN 标准格式 |
 | `config.json` | - | 运行时配置 |
+| `llm_kv_8bit.mnn` | 0.5 MB | 28层 Qwen3 Decoder 结构 (KV Cache, 8-bit) |
+| `llm_kv_8bit.mnn.weight` | **575 MB** | 8-bit 量化权重（原 FP32 2.27GB） |
+| `llm_8bit.mnn` | 0.4 MB | 无 KV 版结构 (8-bit，保留兼容) |
+| `llm_8bit.mnn.weight` | 575 MB | 8-bit 量化权重 |
 
 ### 4. 引擎集成（MNN 源码修改）
 | 文件 | 修改 | 说明 |
@@ -64,6 +66,38 @@ MNN 全管道对真实语音生成正确转录：
 ```
 39 tokens，EOS 结束。
 
+### 8. ✅ KV Cache 实现（新增）
+在 `export_qwen3_asr.py` 中新增 `Qwen3DecoderWithKVCache` 类，导出单模型支持 prefill + decode 两阶段推理：
+
+**设计要点：**
+- K/V cache 存储在单个 5D 张量 `[28, 1, 8, past_len, 128]` 中（= 所有 28 层 × batch1 × 8 KV heads × cache长度 × 128 head_dim）
+- Prefill：传空 cache（`past_len=0`），返回满 cache + 首 token logits
+- Decode：传 cache + 单 token embedding，返回更新 cache + 下一个 token logits
+- 一个 `onForward` 调用处理全部 28 层
+
+**性能提升（x86 服务器）：**
+| 指标 | 无 KV Cache | 有 KV Cache | 提升 |
+|:----|:----------:|:----------:|:----:|
+| Decode 每步 | 1634 ms | **218 ms** | **7.5x** |
+| Decode 吞吐 | 0.6 tok/s | **4.6 tok/s** | **7.5x** |
+
+### 9. ✅ 8-bit 量化完成（新增）
+通过 MNNConvert `--weightQuantBits 8` 对 decoder 做权重量化。
+
+| 版本 | 权重文件大小 | Cosine Similarity | 结论 |
+|:----|:----------:|:----------------:|:----:|
+| FP32 | 2.27 GB | 1.0 (基准) | 精度完美 |
+| **8-bit** | **575 MB** | **0.997** | ✅ **推荐选用** |
+| 4-bit | 290 MB | 0.527 | ❌ 精度损失过大 |
+
+**量化精度对比（Prefill 最后位置，53 tokens）：**
+- Top-1 匹配：FP32=11528, 8-bit=11528 ✅
+- Top-10 重叠：8/10 ✅
+- Max diff：0.45 (vs 4-bit 的 4.19)
+- Mean diff：0.063 (vs 4-bit 的 0.74)
+
+**4-bit 精度不足的原因：** MNNConvert 的 `--weightQuantBits` 使用朴素 min-max 对称量化，无校准数据。对于有权重异常值的模型，4-bit 动态范围不够。如有校准数据需求，后续可使用 AWQ/SmoothQuant 工具。
+
 ---
 
 ## 二、技术方案说明
@@ -93,13 +127,13 @@ Qwen3-ASR 的 decoder 接受 `inputs_embeds`（float32 预计算 embedding），
 | QK-Norm 处理 | 分解为 RMSNorm → RoPE → Attention | 模型映射中显式处理 ✓ |
 | 权重格式 | 通过 ONNX 序列化再反序列化，FP32 | 直接从 PyTorch 导出，支持 BF16/INT8/INT4 |
 | 外部权重 | MNNConvert 自动生成 `.mnn.weight` | 由 RemoveParams 流程显式控制 |
-| KV Cache | 不涉及（需手写 decode 循环） | 引擎内置 ✓ |
+| KV Cache | ✅ 已实现（手写管理，7.5x 加速） | 引擎内置 ✓ |
 | 采样策略 | 手写 argmax | 引擎内置（top-k/top-p/temperature）✓ |
 | 音频集成 | 手写 audio_encoder 推理 + embedding 注入 | Omni 引擎统一处理 ✓ |
 
 **当前路径的核心缺陷：**
 1. ONNX 作为中间格式引入了额外的序列化/反序列化步骤，权重可能被隐式转换
-2. 没有 KV Cache → decode 循环每次重新计算全部历史
+2. ~~没有 KV Cache~~ → ✅ **已实现**（7.5x 加速）
 3. 没有采样策略 → 只能 argmax
 4. 没有集成到 Omni 引擎 → 无法使用 MNN 已有的多模态推理能力
 
@@ -109,24 +143,39 @@ Qwen3-ASR 的 decoder 接受 `inputs_embeds`（float32 预计算 embedding），
 3. 在 `omni.cpp` 中完善 `qwen3_asr` 分支的 KV Cache 和采样逻辑
 4. 在 `llmconfig.hpp` 中添加 `qwen3_asr` 默认配置
 
-**暂不迁移的理由：**
-- 当前路径已验证数值正确性（cosim=1.0），无精度损失
-- 对于原型验证和简单 ASR 场景，当前路径功能完整
-- 迁移到 llmexport.py 需要理解其整体架构，投入较大
-- 可安排在中期完善阶段进行
+**暂不迁移的理由（更新 2026-06-06）：**
+- 当前路径已实现 KV Cache（7.5x) + 8-bit 量化（体积降 4x），功能趋于完整
+- 迁移到 llmexport.py 需要修改其 `inputs_embeds` 假设，架构调整较大
+- 可安排在 Android 集成完成后进行
 
-### 推理流水线
+### 推理流水线（KV Cache）
 
 ```
 WAV → MNN::AUDIO::load() → waveform
   → whisper_fbank(128mel, 400fft, 160hop) → [1,128,T]
   → audio_encoder.mnn → Module::forward → [1,T/8,1024]
   → _Permute({1,0,2}) → [T/8,1,1024]
-  → 拼接 token 序列 [prompt_tokens, audio_start, pad*T, audio_end, suffix_tokens]
-  → embed_lookup() → merged embedding [1, S, 1024]
-  → llm.mnn → Module::onForward({embeds, mask, pos})
-  → argmax → 下一个 token
-  → 循环直到 EOS
+
+  → 拼接 token 序列 → embed_lookup() → merged [1, S, 1024]
+
+  ┌── Prefill ──────────────────────────────────────┐
+  │  k_cache = [28,1,8,0,128] (empty)               │
+  │  llm_kv_8bit.mnn({merged, pos, mask, ∅, ∅})    │
+  │  → logits + k_cache([28,1,8,S,128])             │
+  └─────────────────────────────────────────────────┘
+          │
+          ▼ first_token = argmax(logits[S-1])
+          │
+  ┌── Decode Loop ───────────────────────────────────┐
+  │  while token != EOS:                             │
+  │    tok_emb = embed_lookup({token})  [1,1,1024]   │
+  │    pos = [cache_len]                             │
+  │    mask = causal(1, cache_len)  [1,1,1,C+1]      │
+  │    llm_kv_8bit.mnn({tok_emb, pos, mask,          │
+  │                     k_cache, v_cache})            │
+  │    → logits + updated k_cache, v_cache           │
+  │    token = argmax(logits[0])                     │
+  └──────────────────────────────────────────────────┘
 ```
 
 ### Prompt 格式
@@ -172,7 +221,16 @@ Token IDs:
 | Top-1 logit | 6.44680 | 6.44679 | ✅ |
 | Top-5 排序 | — | — | 完全相同 ✅ |
 
-### 3.4 关于前期「0.814 cosine 相似度」的根因分析
+### 3.4 8-bit 量化精度验证
+
+| 对比项 | Cosine Similarity | Max Diff | Top-1 匹配 | 结论 |
+|--------|:-:|:-:|:--------:|:----:|
+| FP32 vs 8-bit (Prefill) | **0.997** | 0.452 | ✅ 11528 | 精度基本无损 |
+| FP32 vs 4-bit (Prefill) | 0.527 | 4.186 | ✅ 11528 (巧合) | ❌ 精度不够 |
+
+**结论**：8-bit 量化精度满足 ASR 需求。4-bit 精度不足以直接使用，后续可研究 AWQ/SmoothQuant 校准量化。
+
+### 3.5 关于前期「0.814 cosine 相似度」的根因分析
 
 经系统排查，**根因不在 MNN runtime**。可能原因：
 
@@ -225,25 +283,49 @@ Token IDs:
 
 ---
 
-## 五、后续路线图
+## 五、性能基线（Xeon Gold 6148，x86）
 
-### 短期（Android 部署）
-- [ ] 交叉编译 MNN for Android（arm64-v8a）
-  ```bash
-  cmake .. -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/.../android.toolchain.cmake \
-           -DANDROID_ABI=arm64-v8a \
-           -DMNN_BUILD_LLM=ON -DMNN_BUILD_AUDIO=ON
-  make -j$(nproc) asr_demo
-  ```
-- [ ] 将模型文件（~3GB）推送到手机测试
-- [ ] MNN 的 ARM NEON 后端经过充分测试，精度不会比 x86 差
+### 5.1 阶段耗时分解（3s 音频，S=53 tokens）
+
+| 阶段 | 耗时 | 占比 | 瓶颈类型 |
+|:----|:---:|:----:|:--------|
+| Audio Encoder | **~5000 ms** | **67%** | 🔴 Conv2d+18层 Transformer，x86 无优化 |
+| Decoder Prefill | ~1480 ms | 21% | ⚠️ 53 tokens × 28 layers FP32 |
+| Decode (4步×~230ms) | ~920 ms | 12% | — |
+| **总计** | **~7.4 s** | | **RTF = 2.4** |
+
+### 5.2 预期 Android 旗舰机性能（推算）
+
+基于 MNN ARM NEON 优化预估：
+
+| 阶段 | x86 实测 | ARM 预期 | 依据 |
+|:----|:-------:|:--------:|:----:|
+| Audio Encoder | ~5000 ms | **~200-500 ms** | Conv2d/Transformer 在 ARM NEON 上有 10x+ 提升 |
+| Decoder Prefill | ~1500 ms | **~200 ms** | 4 核并行，ARM SDOT |
+| Decode/步 | ~230 ms | **~20-30 ms** | 8-bit 权重 + NEON 量化内核 |
+| 30 步 decode | ~7 s | **~0.6-0.9 s** | |
+| **Total** | **~7.4 s** | **~1.0-1.6 s** | **RTF 0.33-0.53** |
+
+### 5.3 当前关键瓶颈
+
+1. **Audio Encoder (~5s)** — 当前最严重的问题。180M 参数在 x86 上跑 5 秒不正常。怀疑 MNN x86 后端对 Conv2d + Transformer Encoder 组合的算子融合不足。ARM 移动端通常无此问题。
+2. **Prefill (~1500ms)** — 53 tokens 的 28 层全推理。与 decode 不同，prefill 天然无法用 KV cache 加速。在手机上可通过 GPU (OpenCL/Vulkan) 卸载实现 <200ms。
+3. **Decode (~230ms/步)** — 瓶颈在 LM Head（词表 151936，每步 155M MACs）。x86 上 8-bit 权重仍慢，ARM 上预期 20-30ms/步。
+
+## 六、后续路线图
+
+### 短期（瓶颈攻关）
+- [ ] 诊断 Audio Encoder 性能：排查 x86 上 5s 根因（算子融合/调度/数据搬运）
+- [ ] Prefill GPU 加速：将 53 tokens 的 prefill 放到 OpenCL 后端
+- [ ] 交叉编译 MNN for Android（arm64-v8a），获取真实 ARM 性能数据
+- [ ] Android 模型部署：将 8-bit 模型（~900MB + 编码器）推送到手机测试
 
 ### 中期（完善）
-- [ ] 在 asr_direct.cpp 中实现 beam search 或采样解码
+- [ ] 在 asr_direct.cpp 中实现采样解码（top-k/top-p）
 - [ ] 添加 repetition penalty 防止重复
-- [ ] 支持流式 ASR
+- [ ] 支持流式 ASR（音频分块 + encoder 增量推理）
 - [ ] 集成到 MNN LLM Omni 引擎
 
 ### 长期（验证）
 - [ ] 待 transformers 官方支持 `qwen3_asr` 后，对比标准 RoPE vs mRoPE 差异
-- [ ] 研究 4-bit 量化对精度的影响（当前 FP32 权重 2.27GB 对移动端偏大）
+- [ ] 研究 AWQ/SmoothQuant 校准量化，尝试恢复 4-bit 精度
