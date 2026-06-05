@@ -123,10 +123,23 @@ int main(int argc, char* argv[]) {
     std::cout << "  Audio frames: " << T << " ("
               << (nsamples / 16000.0) << "s audio, ~" << (nsamples / 160 / 8) << " expected)" << std::endl;
 
-    // Build token sequence: [audio_start, pad*T, audio_end]
-    std::vector<int> tokens = {AUDIO_START};
+    // Build token sequence from the Qwen3-ASR chat template:
+    //   <|im_start|>system\n<|im_end|>\n
+    //   <|im_start|>user\n<|audio_start|><|audio_pad|>*T<|audio_end|><|im_end|>\n
+    //   <|im_start|>assistant\n
+    // The single <|audio_pad|> gets expanded to T audio frames during embedding injection
+    std::vector<int> prefix_tokens = {151644, 8948, 198, 151645, 198,  // system header
+                                      151644, 872, 198};               // user header
+    // audio_start inserted here
+    // audio_pad * T inserted here (replaced with actual embeddings)
+    std::vector<int> suffix_tokens = {151670,                          // audio_end
+                                      151645, 198,                     // <|im_end|>\n
+                                      151644, 77091, 198};             // assistant header
+    std::vector<int> tokens;
+    tokens.insert(tokens.end(), prefix_tokens.begin(), prefix_tokens.end());
+    tokens.push_back(AUDIO_START);
     tokens.insert(tokens.end(), T, AUDIO_PAD);
-    tokens.push_back(AUDIO_END);
+    tokens.insert(tokens.end(), suffix_tokens.begin(), suffix_tokens.end());
 
     // Build merged embeddings: replace audio_pad → actual audio embeddings
     auto txt_emb = embed_lookup(embed_tbl, tokens);
@@ -166,65 +179,63 @@ int main(int argc, char* argv[]) {
     // ======= 5. Generate =======
     std::cout << "[5/5] Generating..." << std::endl << "  ";
     int gen_len = 0, max_new = 100;
-    bool first = true;
     int current_token = -1;
-    bool stop = false;
 
-    // Prefill & decode loop
-    while (!stop && gen_len < max_new) {
-        if (first) {
-            // Prefill: run full sequence
-            auto out = llm_mod->onForward({merged, mask, pos});
-            if (out.empty()) break;
-            const float* lp = out[0]->readMap<float>();
-            current_token = argmax(lp + (S - 1) * VOCAB);
-            first = false;
-        } else {
-            // Decode: single token, extend sequence
-            auto tok_emb = embed_lookup(embed_tbl, {current_token});
-            // Concatenate with previous embeddings (simple approach)
-            int prev_len = S;
-            S = prev_len + 1;
-            auto new_merged = _Input({1, S, HIDDEN}, NCHW, halide_type_of<float>());
-            float* nmd = new_merged->writeMap<float>();
-            memcpy(nmd, merged->readMap<float>(), prev_len * HIDDEN * sizeof(float));
-            memcpy(nmd + prev_len * HIDDEN, tok_emb->readMap<float>(), HIDDEN * sizeof(float));
-            merged = new_merged;
+    // Prefill: run full sequence
+    auto out = llm_mod->onForward({merged, mask, pos});
+    if (out.empty()) { std::cerr << "Prefill failed\n"; return 1; }
+    current_token = argmax(out[0]->readMap<float>() + (S - 1) * VOCAB);
 
-            // New mask
-            mask = _Input({1, 1, S, S}, NCHW, halide_type_of<float>());
-            mp = mask->writeMap<float>();
-            for (int i = 0; i < S; i++)
-                for (int j = 0; j < S; j++)
-                    mp[i * S + j] = (j <= i) ? 0.0f : -1e9f;
+    // Show top-5 logits at last position for debugging
+    std::cout << "\n  [Prefill] top-5 tokens: ";
+    const float* lp = out[0]->readMap<float>();
+    int last_pos = S - 1;
+    std::vector<std::pair<float,int>> scores;
+    for (int i = 0; i < VOCAB; i++)
+        scores.push_back({lp[last_pos * VOCAB + i], i});
+    std::sort(scores.rbegin(), scores.rend());
+    for (int i = 0; i < 5; i++)
+        std::cout << scores[i].second << "(" << scores[i].first << ") ";
+    std::cout << "| EOS=" << lp[last_pos * VOCAB + 151645];
 
-            // New pos
-            pos = _Input({1, S}, NCHW, halide_type_of<int32_t>());
-            pp = pos->writeMap<int32_t>();
-            for (int i = 0; i < S; i++) pp[i] = i;
+    if (current_token == EOS_TOKEN || current_token == 151645) {
+        std::cout << "\n  [EOS immediately - audio embeddings may not be effective]" << std::endl;
+    }
 
-            auto out = llm_mod->onForward({merged, mask, pos});
-            if (out.empty()) break;
-            const float* lp = out[0]->readMap<float>();
-            current_token = argmax(lp + (S - 1) * VOCAB);
-        }
+    gen_len++;
+    while (gen_len < max_new && current_token != EOS_TOKEN && current_token != 151645) {
+        // Decode: single token
+        auto tok_emb = embed_lookup(embed_tbl, {current_token});
+        int prev_len = S;
+        S = prev_len + 1;
+        auto new_merged = _Input({1, S, HIDDEN}, NCHW, halide_type_of<float>());
+        float* nmd = new_merged->writeMap<float>();
+        memcpy(nmd, merged->readMap<float>(), prev_len * HIDDEN * sizeof(float));
+        memcpy(nmd + prev_len * HIDDEN, tok_emb->readMap<float>(), HIDDEN * sizeof(float));
+        merged = new_merged;
 
+        mask = _Input({1, 1, S, S}, NCHW, halide_type_of<float>());
+        mp = mask->writeMap<float>();
+        for (int i = 0; i < S; i++)
+            for (int j = 0; j < S; j++)
+                mp[i * S + j] = (j <= i) ? 0.0f : -1e9f;
+
+        pos = _Input({1, S}, NCHW, halide_type_of<int32_t>());
+        pp = pos->writeMap<int32_t>();
+        for (int i = 0; i < S; i++) pp[i] = i;
+
+        out = llm_mod->onForward({merged, mask, pos});
+        if (out.empty()) break;
+        current_token = argmax(out[0]->readMap<float>() + (S - 1) * VOCAB);
         gen_len++;
-        if (current_token == EOS_TOKEN || current_token == 151645) {
-            stop = true;
-            // Print decoded token
-            std::string piece = "[" + std::to_string(current_token) + "|EOS]";
-            std::cout << piece << std::flush;
-        } else {
-            // For now, just print token ID (real decode needs tokenizer)
-            if (gen_len <= 20) {
-                std::cout << current_token << " " << std::flush;
-            }
-        }
+
+        if (gen_len <= 20)
+            std::cout << current_token << " " << std::flush;
     }
     std::cout << std::endl;
+    std::cout << std::endl;
     std::cout << "Generated " << gen_len << " tokens" << std::endl;
-    if (stop) std::cout << "EOS reached." << std::endl;
+    if (current_token == EOS_TOKEN || current_token == 151645) std::cout << "EOS reached." << std::endl;
 
     std::cout << "\nDONE." << std::endl;
     return 0;

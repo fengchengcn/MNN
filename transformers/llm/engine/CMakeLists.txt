@@ -95,6 +95,18 @@ if(MNN_LLM_BUILD_DEMO)
 
     add_executable(asr_demo ${CMAKE_CURRENT_LIST_DIR}/demo/asr_direct.cpp)
     target_link_libraries(asr_demo ${LLM_DEPS})
+
+    add_executable(test_compare_models ${CMAKE_CURRENT_LIST_DIR}/demo/test_compare_models.cpp)
+    target_link_libraries(test_compare_models ${LLM_DEPS})
+
+    add_executable(test_audio_encoder ${CMAKE_CURRENT_LIST_DIR}/demo/test_audio_encoder.cpp)
+    target_link_libraries(test_audio_encoder ${LLM_DEPS})
+
+    add_executable(test_ae_real ${CMAKE_CURRENT_LIST_DIR}/demo/test_ae_real.cpp)
+    target_link_libraries(test_ae_real ${LLM_DEPS})
+
+    add_executable(test_hf_ae ${CMAKE_CURRENT_LIST_DIR}/demo/test_hf_ae.cpp)
+    target_link_libraries(test_hf_ae ${LLM_DEPS})
 endif()
 
 option(MNN_LLM_BUILD_TEST "Build LLM unit tests" OFF)
