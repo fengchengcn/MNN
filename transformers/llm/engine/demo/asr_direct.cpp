@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cmath>
 #include <chrono>
+#include <thread>
 
 using timepoint = std::chrono::high_resolution_clock::time_point;
 #define NOW() std::chrono::high_resolution_clock::now()
@@ -103,7 +104,10 @@ int main(int argc, char* argv[]) {
     if (argc > 1) dir = argv[1];
     if (argc > 2) wav = argv[2];
 
-    auto executor = Executor::newExecutor(MNN_FORWARD_CPU, MNN::BackendConfig(), 1);
+    int num_threads = (int)std::thread::hardware_concurrency();
+    if (num_threads < 1) num_threads = 1;
+    if (num_threads > 8) num_threads = 8;
+    auto executor = Executor::newExecutor(MNN_FORWARD_CPU, MNN::BackendConfig(), num_threads);
     ExecutorScope scope(executor);
 
     // ======= 1. Load audio encoder =======
@@ -145,6 +149,10 @@ int main(int argc, char* argv[]) {
     { auto info = feat->getInfo(); auto p = feat->readMap<float>();
       auto f = _Input(info->dim, NCHW, halide_type_of<float>());
       memcpy(f->writeMap<float>(), p, info->size * sizeof(float)); feat = f; }
+
+    // Warmup encoder: 2 runs (first run penalized by shape inference + alloc)
+    audio_mod->onForward({feat});
+    audio_mod->onForward({feat});
 
     auto t0 = NOW();
     auto aout = audio_mod->onForward({feat});

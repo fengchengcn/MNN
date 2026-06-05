@@ -107,6 +107,9 @@ if(MNN_LLM_BUILD_DEMO)
 
     add_executable(test_hf_ae ${CMAKE_CURRENT_LIST_DIR}/demo/test_hf_ae.cpp)
     target_link_libraries(test_hf_ae ${LLM_DEPS})
+
+    add_executable(test_ae_perf ${CMAKE_CURRENT_LIST_DIR}/demo/test_ae_perf.cpp)
+    target_link_libraries(test_ae_perf ${LLM_DEPS})
 endif()
 
 option(MNN_LLM_BUILD_TEST "Build LLM unit tests" OFF)

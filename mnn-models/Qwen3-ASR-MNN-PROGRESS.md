@@ -285,14 +285,14 @@ Token IDs:
 
 ## 五、性能基线（Xeon Gold 6148，x86）
 
-### 5.1 阶段耗时分解（3s 音频，S=53 tokens）
+### 5.1 阶段耗时分解（3s 音频，S=53 tokens，4线程，warm 后）
 
 | 阶段 | 耗时 | 占比 | 瓶颈类型 |
 |:----|:---:|:----:|:--------|
-| Audio Encoder | **~5000 ms** | **67%** | 🔴 Conv2d+18层 Transformer，x86 无优化 |
-| Decoder Prefill | ~1480 ms | 21% | ⚠️ 53 tokens × 28 layers FP32 |
-| Decode (4步×~230ms) | ~920 ms | 12% | — |
-| **总计** | **~7.4 s** | | **RTF = 2.4** |
+| Audio Encoder | **~780 ms** | **25%** | ✅ 已修复（原 ~5000ms，6.4x 提升） |
+| Decoder Prefill | ~1400 ms | 45% | ⚠️ 53 tokens × 28 layers FP32 |
+| Decode (4步×~230ms) | ~920 ms | 30% | — |
+| **总计** | **~3.1 s** | | **RTF = 1.03** |
 
 ### 5.2 预期 Android 旗舰机性能（推算）
 
@@ -300,25 +300,26 @@ Token IDs:
 
 | 阶段 | x86 实测 | ARM 预期 | 依据 |
 |:----|:-------:|:--------:|:----:|
-| Audio Encoder | ~5000 ms | **~200-500 ms** | Conv2d/Transformer 在 ARM NEON 上有 10x+ 提升 |
-| Decoder Prefill | ~1500 ms | **~200 ms** | 4 核并行，ARM SDOT |
-| Decode/步 | ~230 ms | **~20-30 ms** | 8-bit 权重 + NEON 量化内核 |
-| 30 步 decode | ~7 s | **~0.6-0.9 s** | |
-| **Total** | **~7.4 s** | **~1.0-1.6 s** | **RTF 0.33-0.53** |
+| Audio Encoder | **~780 ms** ✅ | **~100-300 ms** | 已修复单线程+首次惩罚，ARM NEON 可更快 |
+| Decoder Prefill | **~1400 ms** | **~200 ms** | 4 核并行，ARM SDOT |
+| Decode/步 | **~230 ms** | **~20-30 ms** | 8-bit 权重 + NEON 量化内核 |
+| 30 步 decode | ~6.9 s | **~0.6-0.9 s** | |
+| **Total** | **~3.1 s** | **~0.9-1.4 s** | **RTF 0.3-0.47** |
 
 ### 5.3 当前关键瓶颈
 
-1. **Audio Encoder (~5s)** — 当前最严重的问题。180M 参数在 x86 上跑 5 秒不正常。怀疑 MNN x86 后端对 Conv2d + Transformer Encoder 组合的算子融合不足。ARM 移动端通常无此问题。
-2. **Prefill (~1500ms)** — 53 tokens 的 28 层全推理。与 decode 不同，prefill 天然无法用 KV cache 加速。在手机上可通过 GPU (OpenCL/Vulkan) 卸载实现 <200ms。
-3. **Decode (~230ms/步)** — 瓶颈在 LM Head（词表 151936，每步 155M MACs）。x86 上 8-bit 权重仍慢，ARM 上预期 20-30ms/步。
+1. **Prefill (~1400ms)** — 当前最重。53 tokens × 28 layers 全推理。MNN x86 上无有效加速手段。手机上可通过多线程 ARM NEON 量化内核或 GPU (OpenCL/Vulkan) 卸载改善。
+2. **Decode (~230ms/步)** — 瓶颈在 LM Head（词表 151936，每步 155M MACs）。x86 上 8-bit 量化的内存带宽受限，ARM 上 NEON SDOT 内核预期 20-30ms/步。
+3. ~~Audio Encoder (~5s)~~ → ✅ 已修复（6.4x 提升）。根因：单线程 + 首次调用 shape 推断惩罚。
 
 ## 六、后续路线图
 
-### 短期（瓶颈攻关）
-- [ ] 诊断 Audio Encoder 性能：排查 x86 上 5s 根因（算子融合/调度/数据搬运）
-- [ ] Prefill GPU 加速：将 53 tokens 的 prefill 放到 OpenCL 后端
+### 短期（Android 验证）
+- [x] 诊断 Audio Encoder 性能：根因=单线程 + 首次调用惩罚（从 5s → 0.78s）
 - [ ] 交叉编译 MNN for Android（arm64-v8a），获取真实 ARM 性能数据
-- [ ] Android 模型部署：将 8-bit 模型（~900MB + 编码器）推送到手机测试
+  - 这是目前最关键的一步：x86 数据只能推算，ARM 实测才知真 RTF
+- [ ] Android 模型部署：将 8-bit 模型（~1.5GB）推送到手机测试
+- [ ] 如 ARM 上 RTF 仍 > 0.6，研究 GPU (OpenCL/Vulkan) 卸载 Prefill
 
 ### 中期（完善）
 - [ ] 在 asr_direct.cpp 中实现采样解码（top-k/top-p）
