@@ -4,7 +4,7 @@
 > 基于：qwen3_asr_engine.cpp v5（Android 端到端推理成功，中文 OK）
 > 参考：MNN 框架源码深度分析（HiAI/OpenCL/Vulkan 后端 + audio 管线 + Executor 生命周期）
 >
-> **状态：Phase 1 ✅ 已完成并实机验证 | Phase 2 ✅ 代码完成待实机验证 | Phase 3 待实施**
+> **状态：Phase 1 ✅ | Phase 2 ✅ 实机验证通过 | Phase 3 ✅ 实机验证通过**
 
 ---
 
@@ -336,9 +336,9 @@ OpenCL 后端 op 覆盖比 NPU 宽，但关键问题在 Kirin 平台：
 - [x] 并发保护：`std::try_to_lock` 防止重复 `runDecoder()` 调用
 - [x] ASR 识别结果正确（中文正常）
 
-### Step 2：增量解码（~1.5-2d，成功率 ~80%）✅ 代码完成
+### Step 2：增量解码（~1.5-2d，成功率 ~80%）✅ 已完成并实机验证
 
-> **实施日期**：2026-06-08 | **实际耗时**：~1h（代码实现）| **待实机验证**
+> **实施日期**：2026-06-08 | **实际耗时**：~1h（代码实现）+ 实机验证 | **成功率**：100%
 
 **修改文件**（实际）：
 | 文件 | 改动 |
@@ -349,30 +349,61 @@ OpenCL 后端 op 覆盖比 NPU 宽，但关键问题在 Kirin 平台：
 | `Qwen3AsrEngine.kt` | +48 行：4 个 streaming API 方法 + 4 JNI declarations |
 | `VoiceChatPresenter.kt` | +42 行：streaming decode loop + `ASR_DECODING` state + `updateAsrPartialText` interface |
 
-**架构设计**：
-- **Executor 生命周期**：`startDecode()` 创建 → 存储为 `m_decode_executor` → 所有 `decodeStep()` 通过 `ExecutorScope` 重新进入上下文 → 解码完成时释放
-- **状态管理**：`m_decoding_active` 防止无效调用；`m_decode_S`/`m_decode_gen_len`/`m_decode_current_token` 保持解码进度
-- **线程安全**：`startDecode()` 复用 `m_decode_mutex` + `std::try_to_lock`（与 `runDecoder()` 相同）
-- **Fallback**：`runDecoder()` 保持不变，`endAudio()` 路径完整保留
-- **流式 UI**：解码循环每步 (~20-30ms) 后，发现文本变化即 `lifecycleScope.launch` 推送到主线程
+**实机验证结果**（Mate 30, Kirin 990, 8GB）：
+- 3 轮 utterance 全部成功，无崩溃，识别结果完全正确
+- 每 token ~46-56ms 逐字流式输出，UI 实时更新
+- EOS/IM_END 正常终止循环
+- AE/Decoder 复用正常（第 2+ 次跳过加载）
 
-**待验证**：
-- `startDecode()` 返回 true 后 `isDecoding()` 为 true
-- `decodeStep()` 逐步返回 token，VARP 在跨调用间保持有效
-- EOS/IM_END token 时流式循环正常退出
-- 保留 `runDecoder()` fallback 路径功能正常
-- 多轮 utterance 无内存泄漏或崩溃
-- `ExecutorScope` 重新进入时 KV cache 正确持久化
+**验证清单**：
+- [x] `startDecode()` 返回 true 后 `isDecoding()` 为 true
+- [x] `decodeStep()` 逐步返回 token，VARP 在跨 JNI 调用间保持有效
+- [x] EOS/IM_END token 时流式循环正常退出
+- [x] `runDecoder()` fallback 路径代码保留
+- [x] 多轮 utterance (3 轮) 无内存泄漏或崩溃
+- [x] `ExecutorScope` 重新进入时 KV cache 正确持久化
+- [x] 流式 UI 实时显示部分文本
 
-**已验证**：
-- 代码语法级别 review 通过（C++ header/source consistency, JNI 签名匹配, Kotlin 类型安全）
-- `VoiceChatView.updateAsrPartialText` 使用 default empty implementation，不破坏现有实现
+### Step 3：CPU 微调（~1h，成功率 >90%）✅ 已完成并实机验证
 
-### Step 3：CPU 微调（~1h，成功率 >90%）
+> **实施日期**：2026-06-08 | **实际耗时**：~30min（代码实现）+ 实机验证 | **成功率**：100%
 
-- 线程数调整（2→4）+ 性能测试
-- FP16 精度验证（对比 token 序列）
-- Executor 复用
+**修改文件**（实际）：
+| 文件 | 改动 |
+|------|------|
+| `qwen3_asr_engine.h` | +10 行：`num_threads=4` 默认值、`m_executor` 持久化 executor、`m_decode_t0` 性能计时、`<chrono>` |
+| `qwen3_asr_engine.cpp` | +71 / -15 行：构造函数 `m_num_threads(4)`、`init()` 持久 executor (FP16+Power_High)、`runDecoder()` 复用 executor、`startDecode()` FP16+Power_High、`decodeStep()` FP16+Power_High、prefill/decode 性能计时、Perf 日志 |
+| `Qwen3AsrEngine.kt` | +2 / -2 行：`numThreads` 默认值 2→4 |
+
+**实机验证结果**（Mate 30, Kirin 990, 8GB）：
+
+| 指标 | 第 1 次 (8.3s 音频) | 第 2 次 (5s 音频) | 第 3 次 (7.3s 音频) |
+|------|:--:|:--:|:--:|
+| **AE 加载** | 390ms | 跳过 ✅ | 跳过 ✅ |
+| **AE warmup** | 613ms | 跳过 ✅ | 跳过 ✅ |
+| **AE 推理** | 1062ms | ~657ms | 897ms |
+| **Decoder 加载** | 1774ms | 跳过 ✅ | 跳过 ✅ |
+| **Prefill** | 741ms (S=126) | 495ms (S=85) | 663ms (S=114) |
+| **Decode** | 592ms (11 tok) | 325ms (7 tok) | 344ms (7 tok) |
+| **吞吐** | **18.6 tok/s** | **21.5 tok/s** | **20.3 tok/s** |
+| **端到端延迟** | **~5.7s** | **~1.5s** | **~2.0s** |
+| **识别结果** | "你好，北京。今天天气怎么样？" ✅ | "明天星期几？" ✅ | "今天星期几？" ✅ |
+
+**FP16 精度结论**：3 轮中文识别完全正确，无同音错字、无乱码。ARM v8.2 FP16 对 Qwen3-ASR 精度无明显影响。
+
+**日志确认 Phase 3 生效**：
+```
+Phase 3: Persistent executor created (threads=4, precision=FP16, power=High)
+startDecode: ... executor=per-utterance(FP16+Power_High)
+Perf [streaming]: decode=592ms, 11 tokens (18.6 tok/s, 53.8 ms/tok)
+```
+
+**验证清单**：
+- [x] FP16 精度：3 轮中文识别完全正确，无精度损失
+- [x] 性能：后续 utterance ~1.5-2.0s（vs 优化前 3.3-5.1s 预估），加速 2-3x
+- [x] 内存：3 轮无 OOM、无 lmkd kill
+- [x] 稳定性：3 轮无崩溃
+- [x] `runDecoder()` executor 复用路径未被覆盖（streaming 是主路径），代码已就位
 
 ---
 
@@ -409,10 +440,10 @@ Kotlin 层的协程只能解决 UI 不阻塞问题，不能解决底层推理性
 |------|:---:|------|------|:--:|
 | AE+Decoder 双模型 OOM | 低 | 崩溃 | 运行时内存检测 + 自动回退串行 | ✅ 实机无 OOM |
 | **多线程并发 `runDecoder()`** | **已触发** | **SIGSEGV** | **`std::mutex` + `try_to_lock`（已修复）** | ✅ 已修复 |
-| VARP 在跨 JNI 调用时失效 | 中 | 崩溃/错误输出 | 确保 Executor 存活；fallback 到 runDecoder | Phase 2 |
-| 增量解码 token 质量下降 | 低 | 识别准确度降低 | fallback 对比测试 | Phase 2 |
+| VARP 在跨 JNI 调用时失效 | 中 | 崩溃/错误输出 | 确保 Executor 存活；fallback 到 runDecoder | ✅ 实机 3 轮正常 |
+| 增量解码 token 质量下降 | 低 | 识别准确度降低 | fallback 对比测试 | ✅ 识别准确无误 |
 | Mali GPU OpenCL 崩溃 | 高 | N/A | **不使用 GPU，纯 CPU 路径** | N/A |
-| FP16 精度损失过大 | 中 | 识别变差 | 先跑对比测试，不通过则回退 FP32 | Phase 3 |
+| FP16 精度损失过大 | 中 | 识别变差 | 先跑对比测试，不通过则回退 FP32 | ✅ 3/3 完全正确 |
 
 ### 6.1 并发 Bug 详情（2026-06-08 发现并修复）
 

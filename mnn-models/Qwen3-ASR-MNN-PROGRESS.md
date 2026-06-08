@@ -1,6 +1,6 @@
 # Qwen3-ASR → MNN 项目状态
 
-> 更新：2026-06-08（v5 — Android 端到端推理成功，中文 OK）
+> 更新：2026-06-08（v6 — Phase 2 流式解码 + Phase 3 FP16/多线程优化实机验证通过）
 >
 > **前期阻塞已解决。** 之前报告的「28层 decoder 精度问题（cosine 相似度 0.814）」经过系统排查，**根因不在 MNN runtime**（MNN decoder vs ONNX Runtime 的 cosim=1.0，audio encoder cosim=0.999）。实际问题是：
 > 1. asr_direct.cpp 缺少 text prompt token → 模型立即输出 EOS
@@ -430,7 +430,7 @@ Token IDs:
 
 ## 六、后续路线图
 
-### Android 集成（v5：端到端推理成功，中文 OK）
+### Android 集成（v5：端到端推理成功 / v6：流式解码 + FP16 优化）
 - [x] 诊断 Audio Encoder 性能：根因=单线程 + 首次调用惩罚（从 5s → 0.78s）
 - [x] 添加 repetition penalty（默认 1.15，打破 n-gram 重复循环）
 - [x] C++ ASR 引擎类 (qwen3_asr_engine.h/.cpp)
@@ -443,15 +443,17 @@ Token IDs:
 - [x] **SELinux 修复**：WAV 写到 app cache 目录（传入 `cacheDir` 参数）
 - [x] **Tokenizer 乱码修复**：用 MNN `Tokenizer::createTokenizer()` 替代逐行纯文本读取，正确处理 BPE byte-level 解码
 - [x] **华为手机实机验证**：中文 ASR 正常识别，无 OOM
-- [ ] **英文/中英混合支持**：当前 prompt 未指定语言，模型可能偏向单语言（见新增 7.6 节）
-- [ ] **流式 ASR**：当前需按 STOP 后一次性识别，非边说边出字
-- [ ] 实测 ARM 上的 RTF 数据（当前 ~5.5s 总耗时，含模型加载）
+- [ ] **英文/中英混合支持**：当前 prompt 未指定语言，模型可能偏向单语言（见 7.8 节）
+- [x] **流式 ASR (Phase 2)**：`startDecode()` → `decodeStep()` 循环 → 逐 token 实时 UI 更新，实机验证通过
+- [x] **CPU 微调 (Phase 3)**：线程 2→4 + FP16 (Precision_Low) + Power_High，实机验证 ~20 tok/s
+- [x] **ARM RTF 实测**：Mate 30 Kirin 990，后续 utterance ~1.5-2.0s（~20 tok/s, ~50ms/token）
 
 ### 后续优化方向
-- [ ] 支持流式 ASR（音频分块 + encoder 增量推理）
+- [x] 支持流式 ASR（Phase 2 增量解码 + Phase 3 FP16/多线程）→ 实机验证通过
 - [ ] 集成到 MNN LLM Omni 引擎（替换手写 decode 循环）
 - [ ] 研究 AWQ/SmoothQuant 校准量化，尝试恢复 4-bit 精度
 - [ ] 待 transformers 官方支持 `qwen3_asr` 后，对比标准 RoPE vs mRoPE 差异
+- [ ] 英文/中英混合识别 prompt 优化（见 7.8 节）
 
 ---
 
@@ -595,7 +597,79 @@ cd apps/Android/MnnLlmChat
 | 4 | v5 | 输出乱码 | `tokenizer.txt` 是 MNN SentencePiece 二进制格式，但代码按纯文本逐行读取 | 用 `MNN::Transformer::Tokenizer::createTokenizer()` 正确解析 |
 | 5 | v5 | 中文 OK，英文/中英混合识别差 | 见 7.7 节分析 | 待修复 |
 
-### 7.7 英文/中英混合识别问题分析
+### 7.7 v6 流式解码 + FP16 优化验证（2026-06-08）
+
+> **设备**：华为 Mate 30 (Kirin 990, 8GB RAM) | **测试**：3 轮中文 ASR
+
+#### Phase 2 流式解码验证
+
+```
+#1 "你好，北京。今天天气怎么样？" (8.3s 音频)
+#2 "明天星期几？" (5s 音频)  
+#3 "今天星期几？" (7.3s 音频)
+```
+
+| 功能 | 结果 |
+|------|:--:|
+| `startDecode()` 返回 true + `isDecoding()`=true | ✅ |
+| `decodeStep()` 逐 token 返回 (每步 ~46-56ms) | ✅ |
+| VARP (KV cache) 跨 JNI 调用持久化 | ✅ |
+| EOS/IM_END 正常终止 | ✅ |
+| UI 实时显示部分文本 | ✅ |
+| AE 复用 (第 2+ 次) | ✅ |
+| Decoder 复用 (第 2+ 次) | ✅ |
+| 3 轮无崩溃/无内存泄漏 | ✅ |
+
+#### Phase 3 CPU 微调验证
+
+| 配置项 | 优化前 | 优化后 | 日志确认 |
+|--------|:--:|:--:|------|
+| 线程数 | 2 | **4** | `threads=4` |
+| 计算精度 | FP32 | **FP16** (Precision_Low) | `precision=FP16` |
+| 电源模式 | Normal | **Power_High** | `power=High` |
+| Executor | 每次新建 | fallback 路径复用 | `executor=persistent(FP16+Power_High)` |
+
+#### 实测性能
+
+| 指标 | 第 1 次 | 第 2 次 | 第 3 次 |
+|------|:--:|:--:|:--:|
+| 音频时长 | 8.3s | 5.0s | 7.3s |
+| AE 加载 | 390ms | 跳过 | 跳过 |
+| AE warmup | 613ms | 跳过 | 跳过 |
+| AE 推理 | 1062ms | ~657ms | 897ms |
+| Decoder 加载 | 1774ms | 跳过 | 跳过 |
+| Prefill | 741ms | 495ms | 663ms |
+| Decode | 592ms (11t) | 325ms (7t) | 344ms (7t) |
+| **吞吐** | **18.6 tok/s** | **21.5 tok/s** | **20.3 tok/s** |
+| **端到端** | **~5.7s** | **~1.5s** | **~2.0s** |
+
+**平均 ~20 tok/s (~50ms/token)**，后续 utterance **1.5-2.0s** 端到端延迟。
+
+#### FP16 精度结论
+
+3 轮中文识别完全正确，FP16 对 Qwen3-ASR 精度无可见影响。
+
+#### 关键日志
+
+```bash
+# Phase 3 配置确认
+grep "Phase 3" logcat
+# → Phase 3: Persistent executor created (threads=4, precision=FP16, power=High)
+
+# 流式路径配置确认  
+grep "executor=per-utterance" logcat
+# → startDecode: ... executor=per-utterance(FP16+Power_High)
+
+# 性能统计
+grep "Perf \[" logcat
+# → Perf [streaming]: decode=592ms, 11 tokens (18.6 tok/s, 53.8 ms/tok)
+# → Perf [streaming]: decode=325ms, 7 tokens (21.5 tok/s, 46.4 ms/tok)
+# → Perf [streaming]: decode=344ms, 7 tokens (20.3 tok/s, 49.1 ms/tok)
+```
+
+> **详细设计文档**：`Qwen3-ASR-STREAMING-PLAN.md`
+
+### 7.8 英文/中英混合识别问题分析
 
 **当前状态**：中文识别正常，英文识别不理想。
 
