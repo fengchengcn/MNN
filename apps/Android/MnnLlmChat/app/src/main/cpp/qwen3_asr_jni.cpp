@@ -127,6 +127,79 @@ Java_com_alibaba_mnnllm_android_asr_Qwen3AsrEngine_nativeGetResultText(
 }
 
 /**
+ * Phase 2 Streaming: Start incremental decode.
+ * Runs audio encoder + prefill, returns true if first token is ready.
+ * After this, call nativeDecodeStep() repeatedly to get tokens one by one.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_alibaba_mnnllm_android_asr_Qwen3AsrEngine_nativeStartDecode(
+    JNIEnv* env, jobject thiz) {
+
+    auto* engine = getNativePtr(env, thiz);
+    if (!engine) {
+        LOGE("startDecode: engine not initialized");
+        return JNI_FALSE;
+    }
+    bool ok = engine->startDecode();
+    LOGI("startDecode: %s", ok ? "OK" : "FAILED");
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+/**
+ * Phase 2 Streaming: Single decode step.
+ * Returns JNI_TRUE if more tokens are expected, JNI_FALSE if decode is complete.
+ * The generated token is passed back through the IntArray parameter.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_alibaba_mnnllm_android_asr_Qwen3AsrEngine_nativeDecodeStep(
+    JNIEnv* env, jobject thiz, jintArray token_out) {
+
+    auto* engine = getNativePtr(env, thiz);
+    if (!engine) {
+        LOGE("decodeStep: engine not initialized");
+        return JNI_FALSE;
+    }
+
+    int token = 0;
+    bool more = engine->decodeStep(&token);
+
+    if (token_out) {
+        jint val = static_cast<jint>(token);
+        env->SetIntArrayRegion(token_out, 0, 1, &val);
+    }
+
+    return more ? JNI_TRUE : JNI_FALSE;
+}
+
+/**
+ * Phase 2 Streaming: Check if incremental decode is active.
+ */
+JNIEXPORT jboolean JNICALL
+Java_com_alibaba_mnnllm_android_asr_Qwen3AsrEngine_nativeIsDecoding(
+    JNIEnv* env, jobject thiz) {
+
+    auto* engine = getNativePtr(env, thiz);
+    if (!engine) return JNI_FALSE;
+    return engine->isDecoding() ? JNI_TRUE : JNI_FALSE;
+}
+
+/**
+ * Phase 2 Streaming: Get partial result text during decode (non-blocking).
+ * Returns the current transcription based on tokens generated so far.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_alibaba_mnnllm_android_asr_Qwen3AsrEngine_nativeGetPartialResult(
+    JNIEnv* env, jobject thiz) {
+
+    auto* engine = getNativePtr(env, thiz);
+    if (!engine) {
+        return env->NewStringUTF("");
+    }
+    std::string result = engine->getPartialResult();
+    return env->NewStringUTF(result.c_str());
+}
+
+/**
  * Reset engine state for new utterance (keeps models loaded).
  */
 JNIEXPORT void JNICALL

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <mutex>
 #include <MNN/expr/Module.hpp>
 #include <MNN/expr/Executor.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
@@ -39,6 +40,17 @@ public:
 
     bool isInitialized() const { return m_initialized; }
 
+    // Phase 2: Streaming incremental decode API
+    // Call sequence: startDecode() → decodeStep() loop → getPartialResult() → reset()
+    // Returns true if prefill succeeded and first token is ready
+    bool startDecode();
+    // Single decode step. Sets *token_out to the new token (if any). Returns true if more tokens expected.
+    bool decodeStep(int* token_out);
+    // Returns true while decode loop is active (between startDecode and final EOS/IM_END)
+    bool isDecoding() const;
+    // Returns current partial result text (non-blocking, valid during decode loop)
+    std::string getPartialResult() const;
+
     // Reset engine state for new utterance (keeps decoder loaded, clears audio+KV cache)
     void reset();
 
@@ -53,7 +65,8 @@ private:
     void closeEmbeddingFile();
     void embedLookup(const std::vector<int>& ids, float* dst);
 
-    // Model loading (on-demand, serial: AE loaded → used → freed, then decoder loaded)
+    // Model loading (AE kept resident across utterances for streaming latency)
+    bool ensureAudioEncoderLoaded();
     std::shared_ptr<MNN::Express::Module> loadAudioEncoder();
     bool ensureDecoderLoaded();
 
@@ -61,6 +74,10 @@ private:
     std::shared_ptr<MNN::Express::Module> m_llm_mod;
     std::shared_ptr<MNN::Express::Executor::RuntimeManager> m_rt;
     bool m_decoder_loaded;
+
+    // Audio encoder (kept resident across utterances for streaming latency)
+    std::shared_ptr<MNN::Express::Module> m_ae_mod;
+    bool m_ae_loaded;
 
     // Decoder state (KV cache)
     MNN::Express::VARP m_k_cache;
@@ -94,6 +111,17 @@ private:
 
     // Reusable buffers
     std::vector<float> m_penalty_buf;
+
+    // Concurrency guard: prevent concurrent runDecoder() calls from multi-threaded JNI
+    std::mutex m_decode_mutex;
+
+    // Incremental decode state (Phase 2 streaming)
+    bool m_decoding_active = false;
+    int m_decode_gen_len = 0;              // Tokens generated so far in current session
+    int m_decode_S = 0;                    // Current sequence length (prefill tokens + generated)
+    int m_decode_current_token = 0;        // Latest generated token
+    int m_decode_T = 0;                    // Audio frames count (for logging)
+    std::shared_ptr<MNN::Express::Executor> m_decode_executor;  // Decode session executor
 
     // Constants
     static constexpr int HIDDEN = 1024;

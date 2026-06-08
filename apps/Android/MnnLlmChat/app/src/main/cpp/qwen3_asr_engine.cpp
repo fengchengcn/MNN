@@ -1,7 +1,6 @@
 #include "qwen3_asr_engine.h"
 #include <MNN/Interpreter.hpp>
 #include <cerrno>
-#include <fstream>
 #include <cstring>
 #include <algorithm>
 #include <thread>
@@ -17,6 +16,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 
 using namespace MNN::Express;
 
@@ -24,6 +24,7 @@ using namespace MNN::Express;
 
 Qwen3AsrEngine::Qwen3AsrEngine()
     : m_decoder_loaded(false)
+    , m_ae_loaded(false)
     , m_prefill_token_count(0)
     , m_num_threads(2)
     , m_initialized(false)
@@ -168,6 +169,42 @@ std::shared_ptr<Module> Qwen3AsrEngine::loadAudioEncoder() {
         LOGI("Audio encoder loaded");
     }
     return mod;
+}
+
+bool Qwen3AsrEngine::ensureAudioEncoderLoaded() {
+    if (m_ae_loaded) {
+        LOGI("Audio encoder already loaded, reusing");
+        return true;
+    }
+
+    LOGI("Loading audio encoder (first use, will keep resident)...");
+    m_ae_mod = loadAudioEncoder();
+    if (!m_ae_mod) {
+        LOGE("Failed to load audio encoder");
+        return false;
+    }
+
+    // Warmup: run twice with a synthetic input to trigger shape inference
+    // and memory allocation once, not on every utterance.
+    // Audio encoder input shape is [1, 128, T] where T varies per utterance,
+    // so we warm up with T=50 (typical for ~3s audio at 16kHz with 160-hop fbank).
+    // MNN will auto-recompile on first real input if T differs significantly;
+    // this is still far cheaper than reloading the model.
+    {
+        // Create a minimal fbank-like input for warmup (128 mel bins × 50 frames)
+        auto warmup_in = _Input({1, 128, 50}, NCHW, halide_type_of<float>());
+        auto p = warmup_in->writeMap<float>();
+        memset(p, 0, 1 * 128 * 50 * sizeof(float));
+        // Pre-fill with tiny random values to avoid degenerate edge cases
+        for (int i = 0; i < 128 * 50; i++) p[i] = (i % 255 - 127) / 12700.0f;
+        m_ae_mod->onForward({warmup_in});
+        m_ae_mod->onForward({warmup_in});
+        LOGI("Audio encoder warmup complete (2× synthetic forward, T=50)");
+    }
+
+    m_ae_loaded = true;
+    LOGI("Audio encoder resident (will not be released until engine shutdown)");
+    return true;
 }
 
 bool Qwen3AsrEngine::ensureDecoderLoaded() {
@@ -324,6 +361,237 @@ std::string Qwen3AsrEngine::getResultText() const {
     return getResult();
 }
 
+// ====== Phase 2: Streaming incremental decode (non-blocking, call from JNI) ======
+
+bool Qwen3AsrEngine::startDecode() {
+    // Guard against concurrent calls from multi-threaded JNI (same pattern as runDecoder)
+    std::unique_lock<std::mutex> lock(m_decode_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        LOGW("startDecode skipped: another decode is already in progress");
+        return false;
+    }
+
+    if (!m_initialized || m_audio_buffer.empty()) {
+        LOGW("startDecode: not initialized or no audio");
+        return false;
+    }
+    LOGI("startDecode: %zu audio samples, threads=%d", m_audio_buffer.size(), m_num_threads);
+
+    // Create executor (stored as member for lifecycle across decode steps)
+    MNN::BackendConfig bc;
+    bc.precision = MNN::BackendConfig::Precision_Normal;
+    bc.memory = MNN::BackendConfig::Memory_Low;
+    m_decode_executor = Executor::newExecutor(MNN_FORWARD_CPU, bc, m_num_threads);
+    ExecutorScope scope(m_decode_executor);
+    (void)scope;
+
+#ifdef LLM_SUPPORT_AUDIO
+    int nsamples = (int)m_audio_buffer.size();
+
+    // ====== Phase 1: Audio Encoder (kept resident across utterances) ======
+    auto wf = _Input({nsamples}, NHWC, halide_type_of<float>());
+    memcpy(wf->writeMap<float>(), m_audio_buffer.data(), nsamples * sizeof(float));
+
+    auto feat = MNN::AUDIO::whisper_fbank(wf);
+    if (feat.get() == nullptr || feat->getInfo() == nullptr) {
+        LOGE("startDecode: whisper_fbank failed");
+        m_decode_executor.reset();
+        return false;
+    }
+
+    // Materialize fbank tensor (ensure data is in contiguous memory for AE)
+    {
+        auto info = feat->getInfo();
+        auto p = feat->readMap<float>();
+        auto f = _Input(info->dim, NCHW, halide_type_of<float>());
+        memcpy(f->writeMap<float>(), p, info->size * sizeof(float));
+        feat = f;
+    }
+
+    LOGI("=== Phase 1: Audio Encoder (streaming) ===");
+    if (!ensureAudioEncoderLoaded()) { m_decode_executor.reset(); return false; }
+
+    auto aout = m_ae_mod->onForward({feat});
+    if (aout.empty()) {
+        LOGE("startDecode: Audio encoder inference failed");
+        m_decode_executor.reset();
+        return false;
+    }
+
+    auto audio_emb = _Permute(aout[0], {1, 0, 2});
+    m_decode_T = audio_emb->getInfo()->dim[0];
+    LOGI("startDecode: Audio frames=%d", m_decode_T);
+
+    // ====== Phase 2: Load LLM decoder ======
+    LOGI("=== Phase 2: LLM Decoder (streaming) ===");
+    if (!ensureDecoderLoaded()) { m_decode_executor.reset(); return false; }
+
+    // ====== Build token sequence ======
+    std::vector<int> tokens;
+    tokens.insert(tokens.end(), m_prefix_tokens.begin(), m_prefix_tokens.end());
+    tokens.push_back(AUDIO_START);
+    tokens.insert(tokens.end(), m_decode_T, AUDIO_PAD);
+    tokens.insert(tokens.end(), m_suffix_tokens.begin(), m_suffix_tokens.end());
+
+    int S = (int)tokens.size();
+
+    // Build merged embeddings
+    auto merged = _Input({1, S, HIDDEN}, NCHW, halide_type_of<float>());
+    float* md = merged->writeMap<float>();
+    embedLookup(tokens, md);
+
+    // Replace AUDIO_PAD positions with audio encoder output
+    const float* ad = audio_emb->readMap<float>();
+    int ai = 0;
+    for (int i = 0; i < S; i++) {
+        if (tokens[i] == AUDIO_PAD && ai < m_decode_T) {
+            memcpy(md + i * HIDDEN, ad + ai * HIDDEN, HIDDEN * sizeof(float));
+            ai++;
+        }
+    }
+
+    // ====== Prefill ======
+    auto pos = _Input({1, S}, NCHW, halide_type_of<int32_t>());
+    auto pp = pos->writeMap<int32_t>();
+    for (int i = 0; i < S; i++) pp[i] = i;
+
+    auto mask = createCausalMask(S, 0);
+    auto cache = createEmptyCache();
+    m_k_cache = cache[0];
+    m_v_cache = cache[1];
+
+    auto out = m_llm_mod->onForward({merged, pos, mask, m_k_cache, m_v_cache});
+    if (out.size() < 3) {
+        LOGE("startDecode: Prefill failed");
+        m_decode_executor.reset();
+        return false;
+    }
+
+    auto logits = out[0];
+    m_k_cache = out[1];
+    m_v_cache = out[2];
+
+    // Extract first token from prefill output (last position logits)
+    m_decode_current_token = argmaxPenalized(
+        logits->readMap<float>() + (S - 1) * VOCAB,
+        m_penalty_buf.data(), {}, 1.0f);
+    m_token_ids.clear();
+    m_token_ids.push_back(m_decode_current_token);
+    m_prefill_token_count = S;
+    m_decode_S = S;
+    m_decode_gen_len = 1;
+    m_decoder_ran = true;
+
+    // If the first token is already a stop token, no decode steps needed
+    if (m_decode_current_token == EOS_TOKEN || m_decode_current_token == IM_END_TOKEN) {
+        m_decoding_active = false;
+        m_decode_executor.reset();
+        LOGI("startDecode: Prefill produced stop token (id=%d), decode complete", m_decode_current_token);
+        return true;
+    }
+
+    m_decoding_active = true;
+    LOGI("startDecode: Prefill done — S=%d, first_token=%d, audio_frames=%d, ready for streaming",
+         S, m_decode_current_token, m_decode_T);
+    return true;
+#else
+    LOGE("LLM_SUPPORT_AUDIO not defined at compile time — startDecode is a no-op!");
+    m_decode_executor.reset();
+    return false;
+#endif
+}
+
+bool Qwen3AsrEngine::decodeStep(int* token_out) {
+    if (!m_decoding_active) {
+        LOGW("decodeStep: decode not active");
+        return false;
+    }
+
+    // Check termination conditions (from previous step)
+    if (m_decode_current_token == EOS_TOKEN || m_decode_current_token == IM_END_TOKEN) {
+        m_decoding_active = false;
+        m_decode_executor.reset();
+        LOGI("decodeStep: stop token reached, decode complete");
+        return false;
+    }
+    if (m_decode_gen_len >= MAX_NEW_TOKENS) {
+        m_decoding_active = false;
+        m_decode_executor.reset();
+        LOGI("decodeStep: max tokens reached (%d), decode complete", MAX_NEW_TOKENS);
+        return false;
+    }
+
+    // Re-enter executor context for this step
+    if (!m_decode_executor) {
+        LOGE("decodeStep: executor is null (should not happen while decoding_active)");
+        m_decoding_active = false;
+        return false;
+    }
+    ExecutorScope scope(m_decode_executor);
+    (void)scope;
+
+    std::vector<float> single_tok_emb(HIDDEN);
+    embedLookup({m_decode_current_token}, single_tok_emb.data());
+
+    int cache_len = m_decode_S;
+    m_decode_S = cache_len + 1;
+
+    auto tok_emb = _Input({1, 1, HIDDEN}, NCHW, halide_type_of<float>());
+    memcpy(tok_emb->writeMap<float>(), single_tok_emb.data(), HIDDEN * sizeof(float));
+
+    auto pos_decode = _Input({1, 1}, NCHW, halide_type_of<int32_t>());
+    auto ppd = pos_decode->writeMap<int32_t>();
+    ppd[0] = cache_len;
+
+    auto mask_decode = createCausalMask(1, cache_len);
+
+    auto out = m_llm_mod->onForward({tok_emb, pos_decode, mask_decode, m_k_cache, m_v_cache});
+    if (out.size() < 3) {
+        LOGE("decodeStep: forward failed");
+        m_decoding_active = false;
+        m_decode_executor.reset();
+        return false;
+    }
+
+    auto logits = out[0];
+    m_k_cache = out[1];
+    m_v_cache = out[2];
+
+    m_decode_current_token = argmaxPenalized(logits->readMap<float>(), m_penalty_buf.data(),
+                                              m_token_ids, REP_PENALTY);
+    m_token_ids.push_back(m_decode_current_token);
+    m_decode_gen_len++;
+
+    if (token_out) *token_out = m_decode_current_token;
+
+    LOGD("decodeStep: token=%d, gen=%d/%d", m_decode_current_token, m_decode_gen_len, MAX_NEW_TOKENS);
+
+    // Check termination after this step
+    if (m_decode_current_token == EOS_TOKEN || m_decode_current_token == IM_END_TOKEN) {
+        m_decoding_active = false;
+        m_decode_executor.reset();
+        LOGI("decodeStep: stop token %d, decode complete (%d tokens total)",
+             m_decode_current_token, m_decode_gen_len);
+        return false;
+    }
+    if (m_decode_gen_len >= MAX_NEW_TOKENS) {
+        m_decoding_active = false;
+        m_decode_executor.reset();
+        LOGI("decodeStep: max tokens reached, decode complete (%d tokens total)", m_decode_gen_len);
+        return false;
+    }
+
+    return true;  // More tokens expected
+}
+
+bool Qwen3AsrEngine::isDecoding() const {
+    return m_decoding_active;
+}
+
+std::string Qwen3AsrEngine::getPartialResult() const {
+    return getResultText();
+}
+
 // ====== Reset (keep decoder loaded, clear transient state) ======
 
 void Qwen3AsrEngine::reset() {
@@ -333,10 +601,19 @@ void Qwen3AsrEngine::reset() {
     m_decoder_ran = false;
     m_k_cache = VARP();
     m_v_cache = VARP();
+    // Phase 2 streaming state cleanup
+    m_decoding_active = false;
+    m_decode_gen_len = 0;
+    m_decode_S = 0;
+    m_decode_current_token = 0;
+    m_decode_T = 0;
+    m_decode_executor.reset();
 }
 
 void Qwen3AsrEngine::release() {
     reset();
+    m_ae_mod.reset();
+    m_ae_loaded = false;
     m_llm_mod.reset();
     m_rt.reset();
     m_decoder_loaded = false;
@@ -353,6 +630,14 @@ void Qwen3AsrEngine::release() {
 // ====== Main decoder (models loaded on-demand) ======
 
 std::string Qwen3AsrEngine::runDecoder() {
+    // Guard against concurrent calls from multi-threaded JNI (e.g. duplicate endpoint detection).
+    // If another thread is already decoding, this call returns immediately with an empty result.
+    std::unique_lock<std::mutex> lock(m_decode_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        LOGW("runDecoder skipped: another decode is already in progress");
+        return "";
+    }
+
     if (!m_initialized) return "";
     LOGI("Starting decoder with %zu audio samples, threads=%d", m_audio_buffer.size(), m_num_threads);
 
@@ -367,52 +652,12 @@ std::string Qwen3AsrEngine::runDecoder() {
 #ifdef LLM_SUPPORT_AUDIO
     int nsamples = (int)m_audio_buffer.size();
 
-    // ====== Phase 1: Audio Encoder (loaded on-demand, released immediately) ======
-    // Write temp WAV to app's cache dir (the only writable location for untrusted_app)
-    std::string tmp_wav = m_cache_dir + "/_asr_tmp.wav";
-    {
-        std::ofstream wav_file(tmp_wav, std::ios::binary);
-        if (!wav_file.is_open()) {
-            LOGE("Failed to write temp WAV to %s (errno=%d)", tmp_wav.c_str(), errno);
-            return "";
-        }
-        int16_t fmt = 1, channels = 1, bits_per_sample = 16;
-        int sample_rate = 16000;
-        int data_size = nsamples * 2;
-        int16_t block_align = channels * bits_per_sample / 8;
-        int byte_rate = sample_rate * block_align;
-
-        wav_file.write("RIFF", 4);
-        int32_t chunk_size = 36 + data_size;
-        wav_file.write((char*)&chunk_size, 4);
-        wav_file.write("WAVE", 4);
-        wav_file.write("fmt ", 4);
-        int32_t subchunk1_size = 16;
-        wav_file.write((char*)&subchunk1_size, 4);
-        wav_file.write((char*)&fmt, 2);
-        wav_file.write((char*)&channels, 2);
-        wav_file.write((char*)&sample_rate, 4);
-        wav_file.write((char*)&byte_rate, 4);
-        wav_file.write((char*)&block_align, 2);
-        wav_file.write((char*)&bits_per_sample, 2);
-        wav_file.write("data", 4);
-        wav_file.write((char*)&data_size, 4);
-
-        for (int i = 0; i < nsamples; i++) {
-            int16_t val = (int16_t)(m_audio_buffer[i] * 32767.0f);
-            if (val > 32767) val = 32767;
-            if (val < -32768) val = -32768;
-            wav_file.write((char*)&val, 2);
-        }
-    }
-
-    auto lr = MNN::AUDIO::load(tmp_wav, 16000);
-    auto wf = lr.first;
-    std::remove(tmp_wav.c_str());
-    if (wf.get() == nullptr) {
-        LOGE("Failed to load audio for fbank");
-        return "";
-    }
+    // ====== Phase 1: Audio Encoder (kept resident across utterances) ======
+    // Build waveform VARP directly from float buffer — no WAV file roundtrip.
+    // This eliminates: float→int16 quantization, disk I/O, RIFF header parsing,
+    // and the SELinux risk of temp files. ~140 lines removed vs v5.
+    auto wf = _Input({nsamples}, NHWC, halide_type_of<float>());
+    memcpy(wf->writeMap<float>(), m_audio_buffer.data(), nsamples * sizeof(float));
 
     auto feat = MNN::AUDIO::whisper_fbank(wf);
     if (feat.get() == nullptr || feat->getInfo() == nullptr) {
@@ -420,7 +665,7 @@ std::string Qwen3AsrEngine::runDecoder() {
         return "";
     }
 
-    // Materialize fbank tensor
+    // Materialize fbank tensor (ensure data is in contiguous memory for AE)
     {
         auto info = feat->getInfo();
         auto p = feat->readMap<float>();
@@ -429,14 +674,10 @@ std::string Qwen3AsrEngine::runDecoder() {
         feat = f;
     }
 
-    // --- Load AE → warmup → infer → release ---
     LOGI("=== Phase 1: Audio Encoder ===");
-    auto ae_mod = loadAudioEncoder();
-    if (!ae_mod) return "";
+    if (!ensureAudioEncoderLoaded()) return "";
 
-    ae_mod->onForward({feat});
-    ae_mod->onForward({feat});  // warmup
-    auto aout = ae_mod->onForward({feat});
+    auto aout = m_ae_mod->onForward({feat});
     if (aout.empty()) {
         LOGE("Audio encoder inference failed");
         return "";
@@ -446,9 +687,7 @@ std::string Qwen3AsrEngine::runDecoder() {
     int T = audio_emb->getInfo()->dim[0];
     LOGI("Audio frames: %d", T);
 
-    // RELEASE audio encoder NOW — peak memory drops by ~500 MB
-    ae_mod.reset();
-    LOGI("Audio encoder released (memory freed)");
+    // NOTE: m_ae_mod is kept alive — NOT reset. Next utterance reuses cached AE.
 
     // ====== Phase 2: Load LLM decoder (only model in memory now) ======
     LOGI("=== Phase 2: LLM Decoder ===");

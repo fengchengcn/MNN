@@ -496,6 +496,7 @@ class VoiceChatFragment : Fragment(), VoiceChatView {
             VoiceChatState.GREETING -> getString(R.string.voice_chat_greeting)
             VoiceChatState.LISTENING -> getString(R.string.voice_chat_listening)
             VoiceChatState.PROCESSING -> getString(R.string.voice_chat_stop) // Show "Stop" when processing
+            VoiceChatState.ASR_DECODING -> getString(R.string.voice_chat_stop) // Show "Stop" while ASR decoding
             VoiceChatState.THINKING -> getString(R.string.voice_chat_thinking)
             VoiceChatState.SPEAKING -> getString(R.string.voice_chat_stop) // Show "Stop" when speaking
             VoiceChatState.STOPPING -> getString(R.string.voice_chat_stopping)

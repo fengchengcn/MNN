@@ -52,9 +52,48 @@ class Qwen3AsrEngine {
 
     /**
      * Signal end of audio. Triggers decoder inference.
+     * For streaming mode, use {@link #startDecode()} instead.
      */
     fun endAudio() {
         nativeEndAudio()
+    }
+
+    /**
+     * Phase 2 Streaming: Start incremental decode.
+     * Runs audio encoder + prefill. Returns true if first token is ready.
+     * After this, call {@link #decodeStep()} in a loop for each subsequent token.
+     */
+    fun startDecode(): Boolean {
+        val ok = nativeStartDecode()
+        Log.i(TAG, "startDecode: $ok")
+        return ok
+    }
+
+    /**
+     * Phase 2 Streaming: Single decode step.
+     * @return Pair(hasMoreTokens, tokenId) — hasMoreTokens=false when EOS/max reached.
+     */
+    fun decodeStep(): Pair<Boolean, Int> {
+        val tokenOut = IntArray(1)
+        val more = nativeDecodeStep(tokenOut)
+        return Pair(more, tokenOut[0])
+    }
+
+    /**
+     * Phase 2 Streaming: Check if incremental decode is active.
+     * Returns true between startDecode() and decode loop completion.
+     */
+    fun isDecoding(): Boolean {
+        return nativeIsDecoding()
+    }
+
+    /**
+     * Phase 2 Streaming: Get partial result text during decode (non-blocking).
+     * Returns the current transcription based on tokens generated so far.
+     * For the final result after decode completes, use {@link #getResultText()}.
+     */
+    fun getPartialResult(): String {
+        return nativeGetPartialResult()
     }
 
     /**
@@ -98,4 +137,10 @@ class Qwen3AsrEngine {
     private external fun nativeGetResultText(): String
     private external fun nativeReset()
     private external fun nativeRelease()
+
+    // Phase 2 Streaming JNI
+    private external fun nativeStartDecode(): Boolean
+    private external fun nativeDecodeStep(tokenOut: IntArray): Boolean
+    private external fun nativeIsDecoding(): Boolean
+    private external fun nativeGetPartialResult(): String
 }

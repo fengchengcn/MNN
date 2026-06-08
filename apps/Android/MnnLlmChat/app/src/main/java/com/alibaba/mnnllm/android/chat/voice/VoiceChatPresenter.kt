@@ -48,6 +48,7 @@ enum class VoiceChatState {
     GREETING,
     LISTENING,
     PROCESSING,
+    ASR_DECODING,   // Qwen3-ASR streaming decode in progress (partial result updates)
     THINKING,
     SPEAKING,
     STOPPING,
@@ -569,17 +570,55 @@ class VoiceChatPresenter(
         qwen3AudioRecord = null
         isRecording = false
 
-        // Run decoder if we had speech
+        // Run streaming decode if we had speech (Phase 2: non-blocking incremental)
         if (speechDetectedForQwen3) {
-            Log.i(TAG, "Qwen3 running decoder...")
-            engine.endAudio()
-            val text = engine.getResultText()
-            Log.i(TAG, "Qwen3 ASR result: $text")
-            engine.reset()
+            Log.i(TAG, "Qwen3 starting streaming decode...")
+            lifecycleScope.launch {
+                withContext(Dispatchers.Main) {
+                    view.updateStatus(VoiceChatState.ASR_DECODING)
+                }
+            }
 
-            if (text.isNotEmpty() && !isStopped && !isSpeaking && !isProcessingLlm) {
+            val ok = engine.startDecode()
+            Log.i(TAG, "Qwen3 startDecode: $ok, isDecoding=${engine.isDecoding()}")
+
+            if (ok) {
+                var lastPartial = ""
+                while (engine.isDecoding() && !isStopped) {
+                    engine.decodeStep()
+                    val partialText = engine.getPartialResult()
+                    if (partialText.isNotEmpty() && partialText != lastPartial) {
+                        lastPartial = partialText
+                        Log.d(TAG, "Qwen3 ASR partial: $partialText")
+                        lifecycleScope.launch {
+                            withContext(Dispatchers.Main) {
+                                view.updateAsrPartialText(partialText)
+                            }
+                        }
+                    }
+                }
+                val text = engine.getResultText()
+                Log.i(TAG, "Qwen3 ASR final: $text, tokens=${engine.getResult()}")
+                engine.reset()
+
+                if (text.isNotEmpty() && !isStopped && !isSpeaking && !isProcessingLlm) {
+                    lifecycleScope.launch {
+                        taskChannel.send(SerialTask.HandleAsrResult(text))
+                    }
+                } else if (!isStopped) {
+                    // No text produced — restart listening
+                    lifecycleScope.launch {
+                        kotlinx.coroutines.delay(200)
+                        if (!isStopped) startQwen3Record()
+                    }
+                }
+            } else {
+                Log.w(TAG, "Qwen3 startDecode failed")
+                engine.reset()
+                // Restart listening on decode failure
                 lifecycleScope.launch {
-                    taskChannel.send(SerialTask.HandleAsrResult(text))
+                    kotlinx.coroutines.delay(500)
+                    if (!isStopped) startQwen3Record()
                 }
             }
         } else {
@@ -994,6 +1033,8 @@ interface VoiceChatView {
     fun getCapturedImageUri(): android.net.Uri?
     fun clearCapturedImageUri()
     fun isCameraEnabled(): Boolean
+    // Qwen3-ASR streaming partial result (updates live during decoding)
+    fun updateAsrPartialText(text: String) {}
 }
 
 interface TtsClient {

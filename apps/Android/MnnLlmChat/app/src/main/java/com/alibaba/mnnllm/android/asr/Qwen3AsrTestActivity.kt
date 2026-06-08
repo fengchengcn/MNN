@@ -357,9 +357,24 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     // ══════════════════════════════════════════════
 
     private fun decodeAndHandleStreamingResult() {
-        // endAudio + getResultText are blocking — run on current (background) thread
-        engine?.endAudio()
+        // Phase 2: Incremental streaming decode — non-blocking per-token
+        val ok = engine?.startDecode() ?: false
+        Log.i(TAG, "Streaming startDecode: $ok, isDecoding=${engine?.isDecoding()}")
+
+        if (ok) {
+            var lastPartial = ""
+            while (engine?.isDecoding() == true) {
+                engine?.decodeStep()
+                val partial = engine?.getPartialResult() ?: ""
+                if (partial.isNotEmpty() && partial != lastPartial) {
+                    lastPartial = partial
+                    Log.d(TAG, "Streaming partial: $partial")
+                    runOnUiThread { setStatus("Decoding: $partial") }
+                }
+            }
+        }
         val text = engine?.getResultText() ?: ""
+        Log.i(TAG, "Streaming final: $text, tokens=${engine?.getResult() ?: ""}")
         engine?.reset()
 
         runOnUiThread {
