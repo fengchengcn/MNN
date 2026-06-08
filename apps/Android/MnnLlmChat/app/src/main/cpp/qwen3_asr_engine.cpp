@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <thread>
 #include <unordered_map>
 #include <android/log.h>
@@ -26,7 +27,7 @@ Qwen3AsrEngine::Qwen3AsrEngine()
     : m_decoder_loaded(false)
     , m_ae_loaded(false)
     , m_prefill_token_count(0)
-    , m_num_threads(2)
+    , m_num_threads(4)
     , m_initialized(false)
     , m_decoder_ran(false) {
 }
@@ -315,6 +316,19 @@ bool Qwen3AsrEngine::init(const std::string& model_dir, const std::string& cache
         return false;
     }
 
+    // Phase 3: Create persistent CPU executor with FP16 + Power_High + 4 threads.
+    // Reused across utterances by runDecoder() to avoid ~10ms per-call executor creation.
+    // ARM v8.2 NEON FP16 (A76/A77 on Kirin 990/9000) doubles theoretical throughput at
+    // Precision_Low. Power_High binds to big cores and raises CPU frequency.
+    {
+        MNN::BackendConfig bc;
+        bc.precision = MNN::BackendConfig::Precision_Low;   // FP16 on ARM v8.2
+        bc.power     = MNN::BackendConfig::Power_High;      // Bind big cores, raise freq
+        bc.memory    = MNN::BackendConfig::Memory_Low;      // Reduce internal memory pool
+        m_executor = Executor::newExecutor(MNN_FORWARD_CPU, bc, m_num_threads);
+        LOGI("Phase 3: Persistent executor created (threads=%d, precision=FP16, power=High)", m_num_threads);
+    }
+
     m_initialized = true;
     LOGI("Qwen3-ASR Engine initialized (models loaded on-demand, threads=%d)", m_num_threads);
     return true;
@@ -375,12 +389,16 @@ bool Qwen3AsrEngine::startDecode() {
         LOGW("startDecode: not initialized or no audio");
         return false;
     }
-    LOGI("startDecode: %zu audio samples, threads=%d", m_audio_buffer.size(), m_num_threads);
+    LOGI("startDecode: %zu audio samples, threads=%d, executor=per-utterance(FP16+Power_High)",
+         m_audio_buffer.size(), m_num_threads);
 
     // Create executor (stored as member for lifecycle across decode steps)
+    // Phase 3: FP16 precision + Power_High for streaming path too.
+    // Executor is per-utterance (not reused) to avoid memory pool fragmentation (see D3).
     MNN::BackendConfig bc;
-    bc.precision = MNN::BackendConfig::Precision_Normal;
-    bc.memory = MNN::BackendConfig::Memory_Low;
+    bc.precision = MNN::BackendConfig::Precision_Low;   // FP16 on ARM v8.2
+    bc.power     = MNN::BackendConfig::Power_High;      // Bind big cores, raise freq
+    bc.memory    = MNN::BackendConfig::Memory_Low;
     m_decode_executor = Executor::newExecutor(MNN_FORWARD_CPU, bc, m_num_threads);
     ExecutorScope scope(m_decode_executor);
     (void)scope;
@@ -451,6 +469,8 @@ bool Qwen3AsrEngine::startDecode() {
     }
 
     // ====== Prefill ======
+    auto t_prefill_0 = std::chrono::steady_clock::now();
+
     auto pos = _Input({1, S}, NCHW, halide_type_of<int32_t>());
     auto pp = pos->writeMap<int32_t>();
     for (int i = 0; i < S; i++) pp[i] = i;
@@ -482,17 +502,22 @@ bool Qwen3AsrEngine::startDecode() {
     m_decode_gen_len = 1;
     m_decoder_ran = true;
 
+    auto t_prefill_1 = std::chrono::steady_clock::now();
+    auto prefill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_prefill_1 - t_prefill_0).count();
+    m_decode_t0 = t_prefill_1;  // start decode loop timer (after prefill, incl. first token)
+
     // If the first token is already a stop token, no decode steps needed
     if (m_decode_current_token == EOS_TOKEN || m_decode_current_token == IM_END_TOKEN) {
         m_decoding_active = false;
         m_decode_executor.reset();
-        LOGI("startDecode: Prefill produced stop token (id=%d), decode complete", m_decode_current_token);
+        LOGI("startDecode: Prefill done — S=%d, stop_token=%d, prefill=%lldms",
+             S, m_decode_current_token, (long long)prefill_ms);
         return true;
     }
 
     m_decoding_active = true;
-    LOGI("startDecode: Prefill done — S=%d, first_token=%d, audio_frames=%d, ready for streaming",
-         S, m_decode_current_token, m_decode_T);
+    LOGI("startDecode: Prefill done — S=%d, first_token=%d, audio_frames=%d, prefill=%lldms, ready for streaming",
+         S, m_decode_current_token, m_decode_T, (long long)prefill_ms);
     return true;
 #else
     LOGE("LLM_SUPPORT_AUDIO not defined at compile time — startDecode is a no-op!");
@@ -507,17 +532,29 @@ bool Qwen3AsrEngine::decodeStep(int* token_out) {
         return false;
     }
 
+    auto log_perf = [&]() {
+        auto t_now = std::chrono::steady_clock::now();
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_now - m_decode_t0).count();
+        int decode_tokens = m_decode_gen_len - 1;  // exclude first token (from prefill)
+        double tok_per_s = elapsed_ms > 0 ? (decode_tokens * 1000.0 / elapsed_ms) : 0;
+        double ms_per_tok = decode_tokens > 0 ? (elapsed_ms / (double)decode_tokens) : 0;
+        LOGI("Perf [streaming]: decode=%lldms, %d tokens (%.1f tok/s, %.1f ms/tok)",
+             (long long)elapsed_ms, decode_tokens, tok_per_s, ms_per_tok);
+    };
+
     // Check termination conditions (from previous step)
     if (m_decode_current_token == EOS_TOKEN || m_decode_current_token == IM_END_TOKEN) {
         m_decoding_active = false;
         m_decode_executor.reset();
         LOGI("decodeStep: stop token reached, decode complete");
+        log_perf();
         return false;
     }
     if (m_decode_gen_len >= MAX_NEW_TOKENS) {
         m_decoding_active = false;
         m_decode_executor.reset();
         LOGI("decodeStep: max tokens reached (%d), decode complete", MAX_NEW_TOKENS);
+        log_perf();
         return false;
     }
 
@@ -550,6 +587,7 @@ bool Qwen3AsrEngine::decodeStep(int* token_out) {
         LOGE("decodeStep: forward failed");
         m_decoding_active = false;
         m_decode_executor.reset();
+        log_perf();
         return false;
     }
 
@@ -572,12 +610,14 @@ bool Qwen3AsrEngine::decodeStep(int* token_out) {
         m_decode_executor.reset();
         LOGI("decodeStep: stop token %d, decode complete (%d tokens total)",
              m_decode_current_token, m_decode_gen_len);
+        log_perf();
         return false;
     }
     if (m_decode_gen_len >= MAX_NEW_TOKENS) {
         m_decoding_active = false;
         m_decode_executor.reset();
         LOGI("decodeStep: max tokens reached, decode complete (%d tokens total)", m_decode_gen_len);
+        log_perf();
         return false;
     }
 
@@ -612,6 +652,7 @@ void Qwen3AsrEngine::reset() {
 
 void Qwen3AsrEngine::release() {
     reset();
+    m_executor.reset();  // Phase 3: release persistent executor
     m_ae_mod.reset();
     m_ae_loaded = false;
     m_llm_mod.reset();
@@ -639,14 +680,16 @@ std::string Qwen3AsrEngine::runDecoder() {
     }
 
     if (!m_initialized) return "";
-    LOGI("Starting decoder with %zu audio samples, threads=%d", m_audio_buffer.size(), m_num_threads);
+    LOGI("runDecoder: %zu audio samples, threads=%d, executor=persistent(FP16+Power_High)",
+         m_audio_buffer.size(), m_num_threads);
 
-    // Create executor with memory-saving config
-    MNN::BackendConfig bc;
-    bc.precision = MNN::BackendConfig::Precision_Normal;
-    bc.memory = MNN::BackendConfig::Memory_Low;
-    auto executor = Executor::newExecutor(MNN_FORWARD_CPU, bc, m_num_threads);
-    ExecutorScope scope(executor);
+    // Phase 3: Reuse persistent executor (FP16 + Power_High) created in init().
+    // Avoids ~10ms per-utterance executor creation + benefits from FP16 acceleration.
+    if (!m_executor) {
+        LOGE("Persistent executor is null (should have been created in init)");
+        return "";
+    }
+    ExecutorScope scope(m_executor);
     (void)scope;
 
 #ifdef LLM_SUPPORT_AUDIO
@@ -718,6 +761,8 @@ std::string Qwen3AsrEngine::runDecoder() {
     }
 
     // ====== Prefill ======
+    auto t_prefill_0 = std::chrono::steady_clock::now();
+
     auto pos = _Input({1, S}, NCHW, halide_type_of<int32_t>());
     auto pp = pos->writeMap<int32_t>();
     for (int i = 0; i < S; i++) pp[i] = i;
@@ -745,8 +790,12 @@ std::string Qwen3AsrEngine::runDecoder() {
     m_prefill_token_count = S;
     int gen_len = 1;
 
+    auto t_prefill_1 = std::chrono::steady_clock::now();
+    auto prefill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_prefill_1 - t_prefill_0).count();
+
     // ====== Decode loop ======
     std::vector<float> single_tok_emb(HIDDEN);
+    auto t_decode_0 = std::chrono::steady_clock::now();
 
     while (gen_len < MAX_NEW_TOKENS && current_token != EOS_TOKEN && current_token != IM_END_TOKEN) {
         embedLookup({current_token}, single_tok_emb.data());
@@ -776,7 +825,14 @@ std::string Qwen3AsrEngine::runDecoder() {
         gen_len++;
     }
 
-    LOGI("Generated %d tokens", gen_len);
+    auto t_decode_1 = std::chrono::steady_clock::now();
+    auto decode_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_decode_1 - t_decode_0).count();
+    auto decode_tokens = gen_len - 1;  // exclude first token (from prefill)
+    double tok_per_s = decode_ms > 0 ? (decode_tokens * 1000.0 / decode_ms) : 0;
+    double ms_per_tok = decode_tokens > 0 ? (decode_ms / (double)decode_tokens) : 0;
+    LOGI("Perf [runDecoder]: prefill=%lldms (S=%d) | decode=%lldms, %d tokens (%.1f tok/s, %.1f ms/tok)",
+         (long long)prefill_ms, m_prefill_token_count,
+         (long long)decode_ms, decode_tokens, tok_per_s, ms_per_tok);
     m_decoder_ran = true;
 
 #else

@@ -32,10 +32,10 @@ class Qwen3AsrEngine {
      * @param modelDir Path to directory containing:
      *   audio_encoder.mnn, llm_kv_8bit.mnn, llm_kv_8bit.mnn.weight, embeddings_bf16.bin
      * @param cacheDir App's internal cache directory for temp files (must be writable)
-     * @param numThreads Number of inference threads (default: 2)
+     * @param numThreads Number of inference threads (default: 4, Phase 3: raised from 2)
      * @return true if initialization succeeded
      */
-    fun init(modelDir: String, cacheDir: String, numThreads: Int = 2): Boolean {
+    fun init(modelDir: String, cacheDir: String, numThreads: Int = 4): Boolean {
         Log.i(TAG, "init: modelDir=$modelDir, cacheDir=$cacheDir, numThreads=$numThreads")
         val result = nativeInit(modelDir, cacheDir, numThreads)
         Log.i(TAG, "init result: $result")

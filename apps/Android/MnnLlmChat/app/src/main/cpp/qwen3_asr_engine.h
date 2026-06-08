@@ -8,6 +8,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <chrono>
 #include <MNN/expr/Module.hpp>
 #include <MNN/expr/Executor.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
@@ -26,7 +27,8 @@ public:
 
     // Initialize engine: load tokenizer + mmap embeddings, models on-demand
     // cache_dir: app's internal cache dir for temp files (e.g. /data/data/.../cache)
-    bool init(const std::string& model_dir, const std::string& cache_dir, int num_threads = 2);
+    // Phase 3: num_threads default raised to 4 for ARM big-core saturation; FP16 via Precision_Low
+    bool init(const std::string& model_dir, const std::string& cache_dir, int num_threads = 4);
 
     // Feed PCM float samples (16kHz mono, normalized to [-1, 1])
     bool pushAudio(const float* samples, int num_samples);
@@ -75,6 +77,11 @@ private:
     std::shared_ptr<MNN::Express::Executor::RuntimeManager> m_rt;
     bool m_decoder_loaded;
 
+    // Phase 3: Persistent CPU executor (created in init, reused across utterances).
+    // Avoids ~10ms per-utterance executor creation overhead.
+    // Only used by runDecoder() fallback path; streaming path uses m_decode_executor.
+    std::shared_ptr<MNN::Express::Executor> m_executor;
+
     // Audio encoder (kept resident across utterances for streaming latency)
     std::shared_ptr<MNN::Express::Module> m_ae_mod;
     bool m_ae_loaded;
@@ -122,6 +129,7 @@ private:
     int m_decode_current_token = 0;        // Latest generated token
     int m_decode_T = 0;                    // Audio frames count (for logging)
     std::shared_ptr<MNN::Express::Executor> m_decode_executor;  // Decode session executor
+    std::chrono::steady_clock::time_point m_decode_t0;           // Start of decode loop (for tok/s)
 
     // Constants
     static constexpr int HIDDEN = 1024;
