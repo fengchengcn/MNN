@@ -21,8 +21,11 @@ class ModelDownloadManager(context: Context) : ModelRepoDownloader.ModelRepoDown
         var sCacheDir: String? = null
 
         const val REQUEST_CODE_POST_NOTIFICATIONS = 1001
+        private const val PERSIST_INTERVAL_MS = 1000L
+        private const val PERSIST_MIN_DELTA_BYTES = 1024L * 1024L
 
         @Volatile private var instance: ModelDownloadManager? = null
+        @Volatile private var progressCallbackIntervalMs: Long = 0L
 
         @JvmStatic
         fun setCacheDir(path: String) {
@@ -486,28 +489,4 @@ class ModelDownloadManager(context: Context) : ModelRepoDownloader.ModelRepoDown
         return if (downloadPath.exists()) downloadPath.lastModified() else 0L
     }
 
-    companion object {
-        const val REQUEST_CODE_POST_NOTIFICATIONS = 1001  // Stub constant for foreground service notifications
-        private const val PERSIST_INTERVAL_MS = 1000L
-        private const val PERSIST_MIN_DELTA_BYTES = 1024L * 1024L
-        @Volatile
-        private var progressCallbackIntervalMs: Long = 0L
-
-        @Volatile
-        private var instance: ModelDownloadManager? = null
-
-        @JvmStatic
-        fun getInstance(context: Context): ModelDownloadManager {
-            return instance ?: synchronized(this) {
-                instance ?: ModelDownloadManager(context.applicationContext).also {
-                    instance = it
-                }
-            }
-        }
-
-        @JvmStatic
-        fun getInstance(): ModelDownloadManager {
-            return getInstance(ApplicationProvider.get())
-        }
-    }
 }

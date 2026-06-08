@@ -21,7 +21,25 @@ object VoiceModelPathUtils {
     // Fallback paths when no default model is set
     private const val FALLBACK_ASR_MODEL_DIR = "/data/local/tmp/asr_models"
     private const val FALLBACK_TTS_MODEL_DIR = "/data/local/tmp/test_new_tts/bert-vits/"
-    
+    private const val LOCAL_MODELS_DIR = "/data/local/tmp/mnn_models"
+
+    /**
+     * Scan /data/local/tmp/mnn_models/ for a Qwen3-ASR model directory.
+     * A Qwen3-ASR directory is identified by the presence of audio_encoder.mnn.
+     * @return the first matching directory path, or null if none found.
+     */
+    private fun findQwen3AsrInLocalModels(): String? {
+        val localDir = File(LOCAL_MODELS_DIR)
+        if (!localDir.exists() || !localDir.isDirectory) return null
+        localDir.listFiles()?.forEach { subdir ->
+            if (subdir.isDirectory && File(subdir, "audio_encoder.mnn").exists()) {
+                Log.i(TAG, "Found Qwen3-ASR model in local models: ${subdir.absolutePath}")
+                return subdir.absolutePath
+            }
+        }
+        return null
+    }
+
     /**
      * Get the ASR model directory path based on the default ASR model setting
      * @param context Android context
@@ -30,9 +48,22 @@ object VoiceModelPathUtils {
     fun getAsrModelPath(context: Context): String {
         val defaultAsrModel = MainSettings.getDefaultAsrModel(context)
         Log.d(TAG, "Getting ASR model path for default model: $defaultAsrModel")
-        
+
         if (defaultAsrModel.isNullOrEmpty()) {
-            Log.w(TAG, "No default ASR model set, using fallback path: $FALLBACK_ASR_MODEL_DIR")
+            // Scan mnn_models for Qwen3-ASR first
+            val qwen3Path = findQwen3AsrInLocalModels()
+            if (qwen3Path != null) {
+                Log.i(TAG, "Using Qwen3-ASR from local models: $qwen3Path")
+                return qwen3Path
+            }
+            // Check legacy asr_models path
+            if (File(FALLBACK_ASR_MODEL_DIR, "audio_encoder.mnn").exists() ||
+                File(FALLBACK_ASR_MODEL_DIR).exists()) {
+                Log.w(TAG, "No default ASR model set, using fallback path: $FALLBACK_ASR_MODEL_DIR")
+                return FALLBACK_ASR_MODEL_DIR
+            }
+            // Last resort
+            Log.w(TAG, "No ASR model found, returning fallback: $FALLBACK_ASR_MODEL_DIR")
             return FALLBACK_ASR_MODEL_DIR
         }
         

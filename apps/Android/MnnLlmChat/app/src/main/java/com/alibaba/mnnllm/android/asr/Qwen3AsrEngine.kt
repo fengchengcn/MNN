@@ -31,12 +31,13 @@ class Qwen3AsrEngine {
      * Initialize the ASR engine.
      * @param modelDir Path to directory containing:
      *   audio_encoder.mnn, llm_kv_8bit.mnn, llm_kv_8bit.mnn.weight, embeddings_bf16.bin
-     * @param numThreads Number of inference threads (default: 4)
+     * @param cacheDir App's internal cache directory for temp files (must be writable)
+     * @param numThreads Number of inference threads (default: 2)
      * @return true if initialization succeeded
      */
-    fun init(modelDir: String, numThreads: Int = 4): Boolean {
-        Log.i(TAG, "init: modelDir=$modelDir, numThreads=$numThreads")
-        val result = nativeInit(modelDir, numThreads)
+    fun init(modelDir: String, cacheDir: String, numThreads: Int = 2): Boolean {
+        Log.i(TAG, "init: modelDir=$modelDir, cacheDir=$cacheDir, numThreads=$numThreads")
+        val result = nativeInit(modelDir, cacheDir, numThreads)
         Log.i(TAG, "init result: $result")
         return result
     }
@@ -90,7 +91,7 @@ class Qwen3AsrEngine {
     }
 
     // JNI declarations
-    private external fun nativeInit(modelDir: String, numThreads: Int): Boolean
+    private external fun nativeInit(modelDir: String, cacheDir: String, numThreads: Int): Boolean
     private external fun nativePushAudio(pcmData: FloatArray)
     private external fun nativeEndAudio()
     private external fun nativeGetResult(): String

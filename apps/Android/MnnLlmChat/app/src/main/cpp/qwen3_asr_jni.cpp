@@ -36,16 +36,21 @@ static void setNativePtr(JNIEnv* env, jobject thiz, Qwen3AsrEngine* ptr) {
  */
 JNIEXPORT jboolean JNICALL
 Java_com_alibaba_mnnllm_android_asr_Qwen3AsrEngine_nativeInit(
-    JNIEnv* env, jobject thiz, jstring model_dir, jint num_threads) {
+    JNIEnv* env, jobject thiz, jstring model_dir, jstring cache_dir, jint num_threads) {
 
     const char* dir_chars = env->GetStringUTFChars(model_dir, nullptr);
     std::string dir(dir_chars);
     env->ReleaseStringUTFChars(model_dir, dir_chars);
 
-    LOGI("Initializing engine with model dir: %s, threads: %d", dir.c_str(), (int)num_threads);
+    const char* cache_chars = env->GetStringUTFChars(cache_dir, nullptr);
+    std::string cache(cache_chars);
+    env->ReleaseStringUTFChars(cache_dir, cache_chars);
+
+    LOGI("Initializing engine with model dir: %s, cache: %s, threads: %d",
+         dir.c_str(), cache.c_str(), (int)num_threads);
 
     auto* engine = new Qwen3AsrEngine();
-    if (!engine->init(dir, (int)num_threads)) {
+    if (!engine->init(dir, cache, (int)num_threads)) {
         LOGE("Engine initialization failed");
         delete engine;
         return JNI_FALSE;

@@ -4,14 +4,22 @@
 package com.alibaba.mnnllm.android.chat.voice
 
 import android.app.Activity
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.NoiseSuppressor
 import android.util.Log
 import com.alibaba.mnnllm.android.asr.AsrService
+import com.alibaba.mnnllm.android.asr.Qwen3AsrEngine
 import com.alibaba.mnnllm.android.audio.AudioChunksPlayer
 import com.alibaba.mnnllm.android.chat.ChatPresenter
 import com.alibaba.mnnllm.android.chat.GenerateResultProcessor
 import com.alibaba.mnnllm.android.utils.VoiceModelPathUtils
 import com.taobao.meta.avatar.tts.TtsService
+import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
@@ -57,7 +65,23 @@ class VoiceChatPresenter(
         const val TAG = "VoiceChatPresenter"
     }
 
+    // --- Sherpa MNN ASR ---
     private var asrService: AsrService? = null
+
+    // --- Qwen3-ASR ---
+    private var qwen3AsrEngine: Qwen3AsrEngine? = null
+    private var qwen3AudioRecord: AudioRecord? = null
+    private var qwen3RecordingThread: Thread? = null
+    private var isQwen3Mode = false
+    private val qwen3IsRecording = AtomicBoolean(false)
+    // Silence-based endpoint detection for Qwen3-ASR
+    private var silenceChunkCount = 0
+    private var speechDetectedForQwen3 = false
+    private val silenceRmsThreshold = 100.0f   // RMS below this = silence
+    private val speechRmsThreshold = 400.0f    // RMS above this = speech (for interruption)
+    private val maxSilenceChunks = 15           // ~1.5s silence triggers endpoint
+    private val qwen3SampleRate = 16000
+
     private var ttsService: TtsClient? = null
     private var audioPlayer: AudioChunksPlayer? = null
     private var audioManager: AudioManager = activity.getSystemService(Activity.AUDIO_SERVICE) as AudioManager
@@ -328,64 +352,257 @@ class VoiceChatPresenter(
         }
     }
 
+    /**
+     * Detect whether the model directory is a Qwen3-ASR model
+     * (by checking for the presence of audio_encoder.mnn).
+     */
+    private fun isQwen3AsrModel(modelDir: String): Boolean {
+        val markerFile = File(modelDir, "audio_encoder.mnn")
+        val result = markerFile.exists()
+        Log.d(TAG, "ASR model type check: $modelDir → isQwen3=$result")
+        return result
+    }
+
     private fun startAsr() {
         CoroutineScope(Dispatchers.Main).launch {
             try {
                 if (isStopped) return@launch
-                
+
                 Log.d(TAG, "Initializing ASR Service...")
                 val modelDir = VoiceModelPathUtils.getAsrModelPath(activity)
                 Log.i(TAG, "Using ASR model path: $modelDir")
-                asrService = AsrService(activity, modelDir)
 
-                withContext(Dispatchers.IO) {
-                    if (isStopped) return@withContext
-                    asrService?.initRecognizer()
-                }
+                // --- Detect model type ---
+                isQwen3Mode = isQwen3AsrModel(modelDir)
 
-                if (isStopped) return@launch
-
-                asrService?.onRecognizeText = { text ->
-                    lifecycleScope.launch {
-                        if (!isStopped && text.isNotEmpty() && !isSpeaking && !isProcessingLlm) {
-                            Log.i(TAG, "ASR Result: $text")
-                            taskChannel.send(SerialTask.HandleAsrResult(text))
-                        } else {
-                            Log.d(TAG, "ASR ignored: text='$text', isSpeaking=$isSpeaking, isProcessingLlm=$isProcessingLlm, isStopped=$isStopped")
-                        }
-                    }
+                if (isQwen3Mode) {
+                    startQwen3Asr(modelDir)
+                } else {
+                    startSherpaAsr(modelDir)
                 }
-
-                // Interruption Support: Listen for speech onset even while AI is speaking or thinking. If the user speaks, we cancel ongoing LLM generation and audio playback immediately.
-                asrService?.onSpeechDetected = {
-                    lifecycleScope.launch(Dispatchers.Main) {
-                        if (!isStopped && (isSpeaking || isProcessingLlm)) {
-                            Log.i(TAG, "Speech detected during AI output, interrupting...")
-                            stopGeneration()
-                        }
-                        if (view.isCameraEnabled() && !isSpeaking && !isProcessingLlm) {
-                            Log.d(TAG, "Speech detected, capturing photo...")
-                            view.capturePhoto()
-                        }
-                    }
-                }
-                
-                // Reset generation state when ASR is ready
-                isGenerationFinished = false
-                
-                startRecord()
-                currentStatus = VoiceChatPresenterState.LISTENING
-                if (!isStopped) withContext(Dispatchers.Main) { 
-                    view.updateStatus(VoiceChatState.LISTENING)
-                    // Show and speak greeting message when all systems are ready
-                    view.showGreetingMessage()
-                    speakGreetingMessage()
-                }
-                Log.i(TAG, "ASR started successfully. Now listening.")
             } catch (e: Exception) {
                 Log.e(TAG, "ASR initialization or start failed", e)
                 if (!isStopped) withContext(Dispatchers.Main) { view.showError("ASR init failed: ${e.message}") }
             }
+        }
+    }
+
+    // ==================== Sherpa MNN ASR (original flow) ====================
+
+    private suspend fun startSherpaAsr(modelDir: String) {
+        asrService = AsrService(activity, modelDir)
+
+        withContext(Dispatchers.IO) {
+            if (isStopped) return@withContext
+            asrService?.initRecognizer()
+        }
+
+        if (isStopped) return
+
+        asrService?.onRecognizeText = { text ->
+            lifecycleScope.launch {
+                if (!isStopped && text.isNotEmpty() && !isSpeaking && !isProcessingLlm) {
+                    Log.i(TAG, "ASR Result: $text")
+                    taskChannel.send(SerialTask.HandleAsrResult(text))
+                } else {
+                    Log.d(TAG, "ASR ignored: text='$text', isSpeaking=$isSpeaking, isProcessingLlm=$isProcessingLlm, isStopped=$isStopped")
+                }
+            }
+        }
+
+        asrService?.onSpeechDetected = {
+            lifecycleScope.launch(Dispatchers.Main) {
+                if (!isStopped && (isSpeaking || isProcessingLlm)) {
+                    Log.i(TAG, "Speech detected during AI output, interrupting...")
+                    stopGeneration()
+                }
+                if (view.isCameraEnabled() && !isSpeaking && !isProcessingLlm) {
+                    Log.d(TAG, "Speech detected, capturing photo...")
+                    view.capturePhoto()
+                }
+            }
+        }
+
+        isGenerationFinished = false
+        startRecord()
+        currentStatus = VoiceChatPresenterState.LISTENING
+        if (!isStopped) withContext(Dispatchers.Main) {
+            view.updateStatus(VoiceChatState.LISTENING)
+            view.showGreetingMessage()
+            speakGreetingMessage()
+        }
+        Log.i(TAG, "Sherpa ASR started. Now listening.")
+    }
+
+    // ==================== Qwen3-ASR (batch processing) ====================
+
+    private suspend fun startQwen3Asr(modelDir: String) {
+        withContext(Dispatchers.IO) {
+            if (isStopped) return@withContext
+
+            qwen3AsrEngine = Qwen3AsrEngine()
+            val ok = qwen3AsrEngine!!.init(modelDir, activity.cacheDir.absolutePath, numThreads = 4)
+            if (!ok) {
+                Log.e(TAG, "Qwen3AsrEngine init failed")
+                withContext(Dispatchers.Main) { view.showError("Qwen3-ASR init failed") }
+                return@withContext
+            }
+            Log.i(TAG, "Qwen3AsrEngine initialized successfully")
+        }
+
+        if (isStopped) return
+
+        isGenerationFinished = false
+        startQwen3Record()
+        currentStatus = VoiceChatPresenterState.LISTENING
+        if (!isStopped) withContext(Dispatchers.Main) {
+            view.updateStatus(VoiceChatState.LISTENING)
+            view.showGreetingMessage()
+            speakGreetingMessage()
+        }
+        Log.i(TAG, "Qwen3-ASR started. Now listening.")
+    }
+
+    private fun startQwen3Record() {
+        if (qwen3IsRecording.get()) return
+
+        val minBufSize = AudioRecord.getMinBufferSize(qwen3SampleRate,
+            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        qwen3AudioRecord = AudioRecord(
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            qwen3SampleRate,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            minBufSize * 2
+        )
+
+        // Try to enable AEC and NS (same as AsrService)
+        try {
+            if (AcousticEchoCanceler.isAvailable()) {
+                val aec = AcousticEchoCanceler.create(qwen3AudioRecord!!.audioSessionId)
+                aec.enabled = true
+                Log.i(TAG, "Qwen3: AEC enabled")
+            }
+        } catch (_: Exception) {}
+        try {
+            if (NoiseSuppressor.isAvailable()) {
+                val ns = NoiseSuppressor.create(qwen3AudioRecord!!.audioSessionId)
+                ns.enabled = true
+                Log.i(TAG, "Qwen3: NS enabled")
+            }
+        } catch (_: Exception) {}
+
+        qwen3AudioRecord!!.startRecording()
+        qwen3IsRecording.set(true)
+        isRecording = true
+        silenceChunkCount = 0
+        speechDetectedForQwen3 = false
+
+        qwen3RecordingThread = Thread { processQwen3Samples() }
+        qwen3RecordingThread!!.start()
+        Log.i(TAG, "Qwen3 recording started")
+    }
+
+    private fun processQwen3Samples() {
+        val interval = 0.1  // 100ms chunks
+        val chunkSize = (interval * qwen3SampleRate).toInt()
+        val shortBuf = ShortArray(chunkSize)
+        val engine = qwen3AsrEngine ?: return
+
+        val maxChunks = 300  // 30s max recording to prevent infinite loop
+        var totalChunks = 0
+
+        Log.i(TAG, "Qwen3 sample processing started")
+
+        while (qwen3IsRecording.get() && qwen3AudioRecord != null && totalChunks < maxChunks) {
+            totalChunks++
+            val ret = qwen3AudioRecord!!.read(shortBuf, 0, chunkSize)
+            if (ret <= 0) continue
+
+            // Mute handling
+            if (isMuted) {
+                shortBuf.fill(0)
+            }
+
+            // Convert int16 → float32 [-1, 1]
+            val floatBuf = FloatArray(ret) { i -> shortBuf[i] / 32768.0f }
+
+            // RMS energy for silence/speech detection
+            var sumSq = 0.0f
+            for (s in floatBuf) sumSq += s * s
+            val rms = kotlin.math.sqrt(sumSq / ret)
+
+            if (rms > speechRmsThreshold) {
+                speechDetectedForQwen3 = true
+                // Interruption support: if AI is speaking and user starts talking
+                if (!isStopped && (isSpeaking || isProcessingLlm)) {
+                    Log.i(TAG, "Qwen3 speech detected during AI output, interrupting...")
+                    lifecycleScope.launch(Dispatchers.Main) { stopGeneration() }
+                }
+            }
+
+            if (speechDetectedForQwen3 && rms < silenceRmsThreshold) {
+                silenceChunkCount++
+            } else if (rms >= silenceRmsThreshold) {
+                silenceChunkCount = 0
+            }
+
+            // Push audio to engine (even during silence — engine needs full utterance)
+            engine.pushAudio(floatBuf)
+
+            // Endpoint: sustained silence after speech
+            if (speechDetectedForQwen3 && silenceChunkCount >= maxSilenceChunks) {
+                Log.i(TAG, "Qwen3 endpoint detected (${silenceChunkCount} silence chunks)")
+                break
+            }
+        }
+
+        if (totalChunks >= maxChunks) {
+            Log.w(TAG, "Qwen3 max recording duration reached, forcing endpoint")
+            speechDetectedForQwen3 = true  // force decode
+        }
+
+        // Stop recording
+        qwen3IsRecording.set(false)
+        qwen3AudioRecord?.stop()
+        qwen3AudioRecord?.release()
+        qwen3AudioRecord = null
+        isRecording = false
+
+        // Run decoder if we had speech
+        if (speechDetectedForQwen3) {
+            Log.i(TAG, "Qwen3 running decoder...")
+            engine.endAudio()
+            val text = engine.getResultText()
+            Log.i(TAG, "Qwen3 ASR result: $text")
+            engine.reset()
+
+            if (text.isNotEmpty() && !isStopped && !isSpeaking && !isProcessingLlm) {
+                lifecycleScope.launch {
+                    taskChannel.send(SerialTask.HandleAsrResult(text))
+                }
+            }
+        } else {
+            // No speech detected — restart listening
+            Log.d(TAG, "Qwen3: no speech detected, restarting record")
+            lifecycleScope.launch {
+                kotlinx.coroutines.delay(200)
+                if (!isStopped) startQwen3Record()
+            }
+        }
+    }
+
+    private fun stopQwen3Record() {
+        if (qwen3IsRecording.get()) {
+            qwen3IsRecording.set(false)
+            isRecording = false
+            try {
+                qwen3AudioRecord?.stop()
+                qwen3AudioRecord?.release()
+            } catch (_: Exception) {}
+            qwen3AudioRecord = null
+            qwen3RecordingThread = null
+            Log.d(TAG, "Qwen3 recording stopped")
         }
     }
 
@@ -406,18 +623,26 @@ class VoiceChatPresenter(
     }
 
     private fun stopRecord() {
-        if (isRecording) {
-            asrService?.stopRecord()
-            isRecording = false
-            Log.d(TAG, "Recording stopped")
+        if (isQwen3Mode) {
+            stopQwen3Record()
+        } else {
+            if (isRecording) {
+                asrService?.stopRecord()
+                isRecording = false
+                Log.d(TAG, "Recording stopped")
+            }
         }
     }
 
     private fun startRecord() {
         if (!isRecording && !isSpeaking && !isProcessingLlm) {
-            asrService?.startRecord()
-            isRecording = true
-            Log.d(TAG, "Recording started")
+            if (isQwen3Mode) {
+                startQwen3Record()
+            } else {
+                asrService?.startRecord()
+                isRecording = true
+                Log.d(TAG, "Recording started")
+            }
         }
     }
 
@@ -559,8 +784,14 @@ class VoiceChatPresenter(
         
         if (isRecording) {
             try {
-                asrService?.stopRecord()
-                asrService = null
+                if (isQwen3Mode) {
+                    stopQwen3Record()
+                    qwen3AsrEngine?.release()
+                    qwen3AsrEngine = null
+                } else {
+                    asrService?.stopRecord()
+                    asrService = null
+                }
                 isRecording = false
                 Log.d(TAG, "ASR record stopped.")
             } catch (e: Exception) {
@@ -598,9 +829,12 @@ class VoiceChatPresenter(
     private fun muteMicrophone(mute: Boolean) {
         if (isMuted != mute) {
             isMuted = mute
-            asrService?.setMuted(isMuted)
+            if (!isQwen3Mode) {
+                asrService?.setMuted(isMuted)
+            }
+            // For Qwen3, isMuted flag is checked directly in processQwen3Samples()
             view.updateMuteButtonState(isMuted)
-            Log.d(TAG, "Microphone mute state changed: $isMuted")
+            Log.d(TAG, "Microphone mute state changed: $isMuted (qwen3Mode=$isQwen3Mode)")
         }
     }
 
@@ -669,8 +903,15 @@ class VoiceChatPresenter(
                 isGenerationFinished = false
                 
                 // Cleanup existing services
-                asrService?.stopRecord()
-                asrService = null
+                if (isQwen3Mode) {
+                    stopQwen3Record()
+                    qwen3AsrEngine?.release()
+                    qwen3AsrEngine = null
+                    isQwen3Mode = false
+                } else {
+                    asrService?.stopRecord()
+                    asrService = null
+                }
                 
                 ttsService?.destroy()
                 ttsService = null

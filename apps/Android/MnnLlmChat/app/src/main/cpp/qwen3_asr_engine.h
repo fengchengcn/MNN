@@ -1,5 +1,6 @@
 // Qwen3-ASR Engine — C++ inference class for Android JNI
 // Encapsulates audio encoder + decoder with KV cache + repetition penalty
+// Memory-optimized: mmap embeddings, lazy model loading, on-demand audio encoder
 #ifndef QWEN3_ASR_ENGINE_H
 #define QWEN3_ASR_ENGINE_H
 
@@ -9,47 +10,57 @@
 #include <MNN/expr/Module.hpp>
 #include <MNN/expr/Executor.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
+#include <MNN/expr/NeuralNetWorkOp.hpp>
+
+// POSIX mmap for embedding file (Android/Linux)
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 class Qwen3AsrEngine {
 public:
     Qwen3AsrEngine();
     ~Qwen3AsrEngine();
 
-    // Initialize engine: load models from directory
-    // model_dir must contain: audio_encoder.mnn, llm_kv_8bit.mnn,
-    //   llm_kv_8bit.mnn.weight, embeddings_bf16.bin
-    bool init(const std::string& model_dir, int num_threads = 4);
+    // Initialize engine: load tokenizer + mmap embeddings, models on-demand
+    // cache_dir: app's internal cache dir for temp files (e.g. /data/data/.../cache)
+    bool init(const std::string& model_dir, const std::string& cache_dir, int num_threads = 2);
 
     // Feed PCM float samples (16kHz mono, normalized to [-1, 1])
-    // Returns true if audio was accepted
     bool pushAudio(const float* samples, int num_samples);
 
     // Signal end of audio input, run decoder to get final result
     void endAudio();
 
-    // Get current transcription result (space-separated token IDs)
+    // Get current transcription result
     std::string getResult() const;
-
-    // Get decoded text result (requires tokenizer.txt in model directory)
     std::string getResultText() const;
 
-    // Returns true if the engine has been initialized
     bool isInitialized() const { return m_initialized; }
 
-    // Reset engine state for new utterance (keeps models loaded)
+    // Reset engine state for new utterance (keeps decoder loaded, clears audio+KV cache)
     void reset();
 
     // Release all resources
     void release();
 
 private:
-    // Internal: run decoder inference on accumulated audio
     std::string runDecoder();
 
-    // Model handles
-    std::shared_ptr<MNN::Express::Module> m_audio_mod;     // audio_encoder.mnn
-    std::shared_ptr<MNN::Express::Module> m_llm_mod;       // llm_kv_8bit.mnn
-    MNN::Express::VARP m_embed_tbl;                         // embeddings_bf16.bin
+    // Embedding file management (mmap-based)
+    bool openEmbeddingFile(const std::string& path);
+    void closeEmbeddingFile();
+    void embedLookup(const std::vector<int>& ids, float* dst);
+
+    // Model loading (on-demand, serial: AE loaded → used → freed, then decoder loaded)
+    std::shared_ptr<MNN::Express::Module> loadAudioEncoder();
+    bool ensureDecoderLoaded();
+
+    // LLM decoder (loaded once, kept across utterances)
+    std::shared_ptr<MNN::Express::Module> m_llm_mod;
+    std::shared_ptr<MNN::Express::Executor::RuntimeManager> m_rt;
+    bool m_decoder_loaded;
 
     // Decoder state (KV cache)
     MNN::Express::VARP m_k_cache;
@@ -59,20 +70,30 @@ private:
     std::vector<int> m_token_ids;
     int m_prefill_token_count;
 
-    // Audio buffer (accumulated across pushAudio calls)
+    // Audio buffer
     std::vector<float> m_audio_buffer;
 
-    // Runtime manager for external weights
-    std::shared_ptr<MNN::Express::Executor::RuntimeManager> m_rt;
-
-    // Tokenizer: id → token string (loaded from tokenizer.txt)
-    std::vector<std::string> m_token_table;
+    // Tokenizer (MNN SentencePiece/Tiktoken proper decoder)
+    void* m_tokenizer = nullptr;  // MNN::Transformer::Tokenizer* (opaque to avoid header dep)
+    // Prompt token cache (built in init() using tokenizer->encode())
+    std::vector<int> m_prefix_tokens;   // system + user prefix
+    std::vector<int> m_suffix_tokens;   // audio_end + assistant suffix
+    void buildPromptTokens();
 
     // Config
     std::string m_model_dir;
+    std::string m_cache_dir;
     int m_num_threads;
     bool m_initialized;
     bool m_decoder_ran;
+
+    // Embedding via mmap
+    int m_embed_fd = -1;
+    void* m_embed_mmap = MAP_FAILED;
+    size_t m_embed_file_size = 0;
+
+    // Reusable buffers
+    std::vector<float> m_penalty_buf;
 
     // Constants
     static constexpr int HIDDEN = 1024;
@@ -87,11 +108,9 @@ private:
     static constexpr float REP_PENALTY = 1.15f;
     static constexpr int MAX_NEW_TOKENS = 100;
 
-    // Helper methods
+    // Helpers
     static float bf16_to_f32(uint16_t v);
-    MNN::Express::VARP loadEmbedding(const std::string& path);
-    MNN::Express::VARP embedLookup(MNN::Express::VARP tbl, const std::vector<int>& ids);
-    static int argmaxPenalized(const float* logits, const std::vector<int>& history, float penalty);
+    static int argmaxPenalized(const float* logits, float* penalized_buf, const std::vector<int>& history, float penalty);
     MNN::Express::VARP createCausalMask(int S_new, int past_len);
     std::vector<MNN::Express::VARP> createEmptyCache();
 };

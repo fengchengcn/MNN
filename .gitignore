@@ -426,3 +426,6 @@ apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen2.5-Omni-3B-MNN
 /mnn-models/venv/
 /mnn-models/*.cpp
 /mnn-models/*.bin
+
+# large model archives (too big for GitHub)
+qwen3_asr_models.zip

@@ -40,7 +40,7 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         qwen3_asr_jni.cpp
 )
 
-target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE GIT_COMMIT_ID="${GIT_COMMIT_ID_VALUE}")
+target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE GIT_COMMIT_ID="${GIT_COMMIT_ID_VALUE}" LLM_SUPPORT_AUDIO)
 
 # Add 16KB page size support (required for Android 15+ devices)
 target_link_options(${CMAKE_PROJECT_NAME} PRIVATE "-Wl,-z,max-page-size=16384")
@@ -67,6 +67,8 @@ include_directories("${MNN_SOURCE_ROOT}/transformers/llm/engine/include")
 
 #audio
 include_directories("${MNN_SOURCE_ROOT}/tools/audio/include")
+#tokenizer (from LLM engine)
+include_directories("${MNN_SOURCE_ROOT}/transformers/llm/engine/src/tokenizer")
 include_directories("${MNN_SOURCE_ROOT}/3rd_party/")
 include_directories("${CMAKE_SOURCE_DIR}/third_party")
 # Link the shared library

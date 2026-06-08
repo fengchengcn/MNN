@@ -1,12 +1,14 @@
 # Qwen3-ASR → MNN 项目状态
 
-> 更新：2026-06-06（v2 — KV Cache + 8-bit 量化完成）
+> 更新：2026-06-08（v5 — Android 端到端推理成功，中文 OK）
 >
 > **前期阻塞已解决。** 之前报告的「28层 decoder 精度问题（cosine 相似度 0.814）」经过系统排查，**根因不在 MNN runtime**（MNN decoder vs ONNX Runtime 的 cosim=1.0，audio encoder cosim=0.999）。实际问题是：
 > 1. asr_direct.cpp 缺少 text prompt token → 模型立即输出 EOS
 > 2. 早期对比使用了不同条件/不同版本的模型
 >
 > **修复 prompt 后，MNN 全管道成功生成正确转录。详见第三节。**
+>
+> **v4→v5 更新：** 经过四个版本的迭代调试，Android 端到端推理已跑通。中文识别正常。修复链路：OOM（mmap embedding + 延迟加载 + 串行化 AE/Decoder）→ `LLM_SUPPORT_AUDIO` 宏缺失 → SELinux WAV 写入拒绝 → 改用 MNN `Tokenizer` 类替代纯文本 token 表修复乱码。**详见第七节。**
 
 ---
 
@@ -97,6 +99,120 @@ MNN 全管道对真实语音生成正确转录：
 - Mean diff：0.063 (vs 4-bit 的 0.74)
 
 **4-bit 精度不足的原因：** MNNConvert 的 `--weightQuantBits` 使用朴素 min-max 对称量化，无校准数据。对于有权重异常值的模型，4-bit 动态范围不够。如有校准数据需求，后续可使用 AWQ/SmoothQuant 工具。
+
+### 10. ✅ Android OOM 内存优化（v3→v4，2026-06-08）
+Android 实机测试（`com.alibaba.mnnllm.android`）发现启动 Qwen3AsrTestActivity 时触发 lmkd 强杀：
+
+**v3 首次优化后仍崩溃：**
+```
+lowmemorykiller: Kill 'com.alibaba.mnnllm.android' (13538),
+  to free 3261040kB rss, 418212kb swap   ← 甚至比优化前更差 (3.26 GB vs 2.5 GB)
+```
+
+崩溃仍然发生在 `Loading LLM decoder (KV Cache)...` 期间——在 embedding mmap 代码执行**之前**。说明 embedding 优化未命中真正的内存杀手。
+
+**根因重新定位：**
+- 崩溃时间线：`trimMemory:15` → `Loading LLM decoder...` → `trimMemory:15` → `lmkd kill`
+- 第一个 `trimMemory:15` 在 "Loading LLM decoder" 日志**之前**出现 → Audio Encoder 加载（190 MB .mnn 文件）已经开始触发内存压力
+- 第二个模型（LLM Decoder, 575 MB 外部权重）加载时，两个模型同时驻留 → RSS 直接冲破 3 GB
+
+**v4 修复策略：延迟加载 + 串行化（两模型不同时驻留）**
+
+修改文件：`qwen3_asr_engine.h`、`qwen3_asr_engine.cpp`
+
+| 阶段 | 原来（v3） | v4 |
+|------|-----------|-----|
+| `init()` | 加载 AE + Decoder + Embedding → **双模型同时驻留** | 只加载 tokenizer + mmap embedding → **~5 MB** |
+| `runDecoder()` 开始 | — | 加载 Audio Encoder → 推理 |
+| AE 推理完成 | — | **立即 `ae_mod.reset()` 释放 AE** |
+| Decoder 加载 | 已在 init 中加载 | `ensureDecoderLoaded()` → 此时只有 Decoder 在内存 |
+| 后续 utterance | — | Decoder 复用（已加载），AE 每次重新加载→推理→释放 |
+
+关键代码变更：
+- 移除 `m_audio_mod` 成员变量 → 改为 `runDecoder()` 中的局部变量，用完立即 `reset()`
+- 新增 `m_decoder_loaded` 标志 → Decoder 只在第一次使用时加载，后续复用
+- 线程数从 4 降到 2 → 减少 per-thread 内存池分配
+- `BackendConfig::memory = Memory_Low` → 缩小 MNN 内部内存池
+
+**预期效果（v4）：**
+
+| 阶段 | 驻留模型 | 峰值 Native 内存 |
+|------|----------|:-:|
+| init() 完成 | 无模型 | ~5 MB |
+| Audio Encoder 推理 | AE | ~500 MB |
+| AE 释放后 | 无模型 | ~5 MB |
+| Decoder 加载+推理 | Decoder | ~800 MB |
+| **峰值（取 max）** | — | **~800 MB** |
+
+vs v3 原始：AE + Decoder 同时驻留 = ~500 + ~800 = **~1,300 MB**
+
+加上 JVM 开销，进程 RSS 预期从 3.26 GB 降至 ~1.2-1.5 GB。
+
+```
+lowmemorykiller: Kill 'com.alibaba.mnnllm.android' (8049), uid 10237,
+  oom_score_adj 0 to free 2538868kB rss, 987256kb swap
+```
+
+关键日志：连续三次 `trimMemory level: 15`（TRIM_MEMORY_RUNNING_CRITICAL），最终被 lmkd 杀掉。
+
+#### 根因分析：内存占用分解
+
+| 组件 | 原始占用 | 说明 |
+|------|----------|------|
+| **Embedding 表** (float32) | **622 MB** | `VOCAB=151936 × HIDDEN=1024 × 4 bytes`，全量常驻内存 |
+| Embedding 源文件 (bf16) | 311 MB（磁盘） | 被完整读入后转为 float32 |
+| LLM Decoder 权重 | ~200-300 MB | `llm_kv_8bit.mnn.weight` 575 MB 外部文件，全量读入 RAM |
+| Audio Encoder 权重 | ~200 MB | `audio_encoder.mnn` 190 MB |
+| KV Cache (30s 语音) | ~140 MB | 28 layers × 2(K+V) × 8 heads × 128 dim × seq_len |
+| 临时分配 | ~50-100 MB | causal mask, merged embedding, fbank tensor 等 |
+| **峰值合计** | **~1.3-1.5 GB** | 加上 JVM 堆和系统开销 → 实际 RSS ~2.5 GB |
+
+**核心问题**：151,936 行的 embedding 表中，ASR 推理全程只需要访问 **~113 个不同的 token**（< 0.1%），但原始代码将整张表以 float32 加载到内存中。
+
+#### 优化方案：两项改动
+
+**① Embedding 改为 mmap 按需读取（最关键，节省 ~622 MB）**
+
+修改文件：`qwen3_asr_engine.h`、`qwen3_asr_engine.cpp`
+
+- 移除 `MNN::Express::VARP m_embed_tbl`（622 MB float32 张量）
+- 新增 `openEmbeddingFile()`：用 POSIX `open()` + `mmap()` 映射 311 MB 的 bf16 文件，设置 `madvise(MADV_RANDOM)` 避免顺序预读浪费
+- 新增 `embedLookup(ids, float* dst)`：从 mmap 区域按 token ID 偏移直接读取 bf16 行，即时转换为 float32；批次内重复 token 用 `unordered_map` 缓存
+- 3 个系统调用替代 622 MB 常驻内存
+
+**② 临时缓冲区预分配 + 复用（消除抖动）**
+
+- `m_penalty_buf`：预分配 VOCAB 大小的 float 数组（607 KB），`argmaxPenalized()` 不再每次调用时分配
+- `single_tok_emb`：解码循环中复用单 token embedding 缓冲区（HIDDEN × 4 = 4 KB）
+- `largeHeap="true"`：AndroidManifest 申请更大 Java 堆
+
+> **注（v4 更新）**：虽然 `MNN::BackendConfig` 公开结构体不包含 `mmapFileSize`/`useCachedMmap`，但 `RuntimeManager::setHint()` 提供了等效的公开 API（定义在 `Interpreter.hpp` 的 `HintMode` 枚举中）。v4 参考 LLM 引擎的 `Llm::setRuntimeHint()` 模式（`llm.cpp:126-164`），通过以下 hints 启用了权重 mmap：
+> ```cpp
+> m_rt->setHint(MNN::Interpreter::USE_CACHED_MMAP, 1);       // mmap 权重文件
+> m_rt->setHint(MNN::Interpreter::MEM_ALLOCATOR_TYPE, 0);    // 延迟分配，降低峰值
+> m_rt->setHint(MNN::Interpreter::WINOGRAD_MEMORY_LEVEL, 0); // 最小化 winograd 内存
+> m_rt->setHint(MNN::Interpreter::DYNAMIC_QUANT_OPTIONS, 1); // 逐张量动态量化
+> ```
+
+#### 优化效果预估
+
+| 组件 | 优化前 | 优化后 | 节省 |
+|------|--------|--------|------|
+| Embedding 表 | 622 MB (float32 全量) | ~0 MB (mmap, 按需分页) | **622 MB** |
+| LLM Decoder 权重 | ~200-300 MB (全量读入) | ~200-300 MB (不变) | — |
+| argmaxPenalized 临时分配 | ~607 KB/次 × N次 | 607 KB × 1次（预分配复用） | 抖动消除 |
+| **峰值 Native 合计** | **~1.3-1.5 GB** | **~700-900 MB** | **~40-50%** |
+| **进程 RSS 预估** | **~2.5 GB** | **~1.2-1.5 GB** | **~40-50%** |
+
+> **原理**：mmap 利用 OS 的 demand paging。151,936 行 × 2 KB/行 = ~300 MB 的嵌入文件，只访问 113 行 → 实际只触发 ~226 KB 数据传输。其余页面从不加载到物理内存。
+
+#### 修改文件清单
+
+| 文件 | 修改内容 |
+|------|----------|
+| `qwen3_asr_engine.h` | 移除 `VARP m_embed_tbl`，新增 mmap 成员 + 预分配缓冲区；`embedLookup`/`argmaxPenalized` 签名变更 |
+| `qwen3_asr_engine.cpp` | 实现 `openEmbeddingFile`/`closeEmbeddingFile`/`embedLookup`（mmap）；`init()` 添加 `useCachedMmap`；`runDecoder()` 使用新 API |
+| `AndroidManifest.xml` | 添加 `android:largeHeap="true"` |
 
 ---
 
@@ -314,7 +430,7 @@ Token IDs:
 
 ## 六、后续路线图
 
-### Android 集成（代码已完成，待编译测试）
+### Android 集成（v5：端到端推理成功，中文 OK）
 - [x] 诊断 Audio Encoder 性能：根因=单线程 + 首次调用惩罚（从 5s → 0.78s）
 - [x] 添加 repetition penalty（默认 1.15，打破 n-gram 重复循环）
 - [x] C++ ASR 引擎类 (qwen3_asr_engine.h/.cpp)
@@ -322,15 +438,205 @@ Token IDs:
 - [x] Kotlin 包装类 (Qwen3AsrEngine.kt)
 - [x] CMakeLists.txt 更新（加入新源文件）
 - [x] Android 集成指南 (QWEN3_ASR_ANDROID_INTEGRATION.md)
-- [ ] **待你在 Windows 上操作：**
-  - 用 Android Studio + NDK 交叉编译 MNN（需加 LLM/AUDIO 编译 flags）
-  - 用 Android Studio 打开 MnnLlmChat 工程编译
-  - 将 8-bit 模型（~1.1GB）推送到手机
-  - 实测 ARM 上的 RTF
-  - 如 RTF > 0.6，考虑 GPU (OpenCL/Vulkan) 卸载 Prefill
+- [x] **OOM 修复**：mmap embedding (622MB→0) + 延迟加载 + 串行化 AE/Decoder（双模型峰值 ~1.5GB → ~800MB）
+- [x] **LLM_SUPPORT_AUDIO 宏**：CMakeLists.txt 补定义，修复解码器空壳问题
+- [x] **SELinux 修复**：WAV 写到 app cache 目录（传入 `cacheDir` 参数）
+- [x] **Tokenizer 乱码修复**：用 MNN `Tokenizer::createTokenizer()` 替代逐行纯文本读取，正确处理 BPE byte-level 解码
+- [x] **华为手机实机验证**：中文 ASR 正常识别，无 OOM
+- [ ] **英文/中英混合支持**：当前 prompt 未指定语言，模型可能偏向单语言（见新增 7.6 节）
+- [ ] **流式 ASR**：当前需按 STOP 后一次性识别，非边说边出字
+- [ ] 实测 ARM 上的 RTF 数据（当前 ~5.5s 总耗时，含模型加载）
 
 ### 后续优化方向
 - [ ] 支持流式 ASR（音频分块 + encoder 增量推理）
 - [ ] 集成到 MNN LLM Omni 引擎（替换手写 decode 循环）
 - [ ] 研究 AWQ/SmoothQuant 校准量化，尝试恢复 4-bit 精度
 - [ ] 待 transformers 官方支持 `qwen3_asr` 后，对比标准 RoPE vs mRoPE 差异
+
+---
+
+## 七、Android OOM 内存优化详情（2026-06-08）
+
+### 7.1 崩溃现场
+
+```
+14:11:03.047  Qwen3AsrEngine  ... init: modelDir=.../Qwen3-ASR-0.6B, numThreads=4
+14:11:03.538  Qwen3AsrEngine  ... Loading LLM decoder (KV Cache)...
+14:11:04.922  WindowManager   ... trimMemory level: 15    ← TRIM_MEMORY_RUNNING_CRITICAL
+14:11:06.032  WindowManager   ... trimMemory level: 15
+14:11:07.815  WindowManager   ... trimMemory level: 10
+14:11:07.915  lmkd            ... Kill 'com.alibaba.mnnllm.android' (8049),
+                              oom_score_adj 0 to free 2538868kB rss, 987256kb swap
+---------------------------- PROCESS ENDED (8049) ----------------------------
+```
+
+**关键事实：**
+- 被杀瞬间：RSS **2.5 GB** + swap **~1 GB** = 总占用 ~3.5 GB
+- 触发点：`Loading LLM decoder (KV Cache)...` 期间
+- 连续 3 次 `TRIM_MEMORY_RUNNING_CRITICAL`（Android 最严重的内存警告级别）
+- 最终 `lmkd` 以 `oom_score_adj 0`（前台应用最高优先级）强杀
+
+### 7.2 内存占用详细分解
+
+```
+常量定义（来自 qwen3_asr_engine.h）：
+  VOCAB=151936  HIDDEN=1024  LAYERS=28  KV_HEADS=8  HEAD_DIM=128
+
+原始内存占用：
+
+┌─────────────────────────────────────────────────────────────────┐
+│  Embedding 表 (float32)    622 MB  ████████████████████████      │
+│  LLM Decoder 权重          300 MB  ████████████                  │
+│  Audio Encoder 权重        200 MB  ████████                      │
+│  KV Cache (S~200 tokens)   140 MB  ██████                        │
+│  临时 tensor / buffer       80 MB  ███                           │
+│  JVM / Native overhead     150 MB  ██████                        │
+│  文件读取 chunk buffer       20 MB  █                             │
+├─────────────────────────────────────────────────────────────────┤
+│  Native 合计              ~1,512 MB                              │
+│  进程 RSS 合计            ~2,500 MB  (含共享库、JVM、graphics)    │
+└─────────────────────────────────────────────────────────────────┘
+
+优化后：
+
+┌─────────────────────────────────────────────────────────────────┐
+│  Embedding 表 (mmap)        ~0 MB                                │
+│  LLM Decoder 权重 (全量)    300 MB  ████████████████████          │
+│  Audio Encoder 权重        200 MB  ██████████████                │
+│  KV Cache (S~200 tokens)   140 MB  ██████████                    │
+│  临时 tensor / buffer       40 MB  ███                            │
+│  JVM / Native overhead     150 MB  ██████████                    │
+│  Penalty buffer (复用)     0.6 MB                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  Native 合计               ~830 MB                               │
+│  进程 RSS 合计             ~1,200-1,500 MB (预期)                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 7.3 为什么 Embedding mmap 能省 622 MB
+
+原始代码的数据流：
+
+```
+embeddings_bf16.bin (311 MB on disk)
+    │
+    ▼ loadEmbedding()
+  读取全部 151936×1024 个 bf16 值
+  每个 bf16 → float32 转换
+    │
+    ▼ _Input({151936, 1024}, float32)
+  常驻内存 622 MB ←── 这是 OOM 的直接原因
+    │
+    ▼ embedLookup(tbl, ids)
+  memcpy 对应行到输出
+```
+
+优化后的数据流：
+
+```
+embeddings_bf16.bin (311 MB on disk)
+    │
+    ▼ open() + mmap(MAP_SHARED)
+  建立虚拟地址映射（0 字节数据拷贝）
+  madvise(MADV_RANDOM) → 内核不执行预读
+    │
+    ▼ embedLookup(ids, dst)
+  对每个 token ID：
+    计算偏移: id × 1024 × 2 bytes
+    从 mmap 区域读取 1 行 bf16 (2 KB)
+    即时转换为 float32
+    │
+  实际物理内存：只加载被访问的页（~113 个 token × 2 KB ≈ 226 KB）
+```
+
+**核心洞察：** ASR 推理的 token 访问模式极度稀疏。全程只需要：
+- 7 个 prefix text tokens（system/user 模板）
+- 1 个 AUDIO_START token
+- 5 个 suffix text tokens（im_end/assistant 模板）
+- 最多 100 个生成 tokens（MAX_NEW_TOKENS）
+
+合计 ~113 个不同 token，不到词汇表（151,936）的 0.1%。传统「全部加载到内存」的做法浪费了 99.9% 的内存。
+
+### 7.4 权重 mmap 的实现方式：`RuntimeManager::setHint()`
+
+虽然 `MNN::BackendConfig` 公开结构体（`include/MNN/MNNForwardType.h`）不直接包含 mmap 字段，但 MNN 通过 `RuntimeManager::setHint()` 提供了等效的公开 API。这些 hint 在 `Interpreter.hpp` 的 `HintMode` 枚举中定义。
+
+**参考源码**：`transformers/llm/engine/src/llm.cpp:126-164`（`Llm::setRuntimeHint()`）是 MNN 官方的标准配置模式。
+
+**v4 借鉴的关键 hints：**
+
+| Hint | 值 | 作用 |
+|------|----|------|
+| `MEM_ALLOCATOR_TYPE` | 0 | 延迟分配（Defer），先计算总内存需求再一次性分配，降低碎片和峰值 |
+| `USE_CACHED_MMAP` | 1 | 对 `.mnn.weight` 外部权重文件使用 cached mmap，而非全量 read() |
+| `WINOGRAD_MEMORY_LEVEL` | 0 | Winograd 算法候选集最小化，减少中间缓冲区 |
+| `DYNAMIC_QUANT_OPTIONS` | 1 | 逐张量（per-tensor）动态量化，保持 int8 权重不解压为 float32 |
+
+这些 hints 通过 `m_rt->setHint(...)` 在 `ensureDecoderLoaded()` 中设置，作用于 LLM Decoder 的权重加载过程。Audio Encoder 因为体量较小（190 MB）且用后立即释放，不需要额外配置。
+
+### 7.5 编译注意事项
+
+重新编译 native library 时无需额外配置。所有改动在应用层（`apps/Android/MnnLlmChat/app/src/main/cpp/`），MNN 库本身无需重新编译。
+
+```bash
+cd apps/Android/MnnLlmChat
+./gradlew assembleDebug
+```
+
+如果 Gradle 报 mmap/madvise 找不到符号，确认 NDK 版本 ≥ 21（Android API 21+ / NDK r21+），这些 POSIX API 自 API 21 起全部可用。
+
+### 7.6 v5 故障修复全时间线
+
+| # | 版本 | 失败现象 | 根因 | 修复 |
+|---|------|----------|------|------|
+| 1 | v1 | OOM 闪退（RSS 3.26 GB，lmkd kill） | AE + Decoder 双模型同时驻留 + embedding 全量加载 622 MB | 延迟加载 + 串行化 + mmap embedding + `setHint` 权重 mmap |
+| 2 | v3 | 10ms "光速返回"，显示 "no speech detected" | `LLM_SUPPORT_AUDIO` 宏未在 CMakeLists.txt 定义 → 解码器编译为空壳 | `target_compile_definitions` 加 `LLM_SUPPORT_AUDIO` |
+| 3 | v3 | `Failed to write temp WAV` (errno=13 EACCES) | SELinux 禁止 untrusted_app 写 `/data/local/tmp/mnn_models/` | 传入 app `cacheDir`，WAV 写到 `/data/data/<pkg>/cache/` |
+| 4 | v5 | 输出乱码 | `tokenizer.txt` 是 MNN SentencePiece 二进制格式，但代码按纯文本逐行读取 | 用 `MNN::Transformer::Tokenizer::createTokenizer()` 正确解析 |
+| 5 | v5 | 中文 OK，英文/中英混合识别差 | 见 7.7 节分析 | 待修复 |
+
+### 7.7 英文/中英混合识别问题分析
+
+**当前状态**：中文识别正常，英文识别不理想。
+
+**当前 prompt 格式**（来自 `qwen3_asr_engine.cpp`）：
+```
+<|im_start|>system
+<|im_end|>
+<|im_start|>user
+<|audio_start|><|audio_pad|>*T<|audio_end|><|im_end|>
+<|im_start|>assistant
+```
+
+**可能原因分析**：
+
+1. **System prompt 为空**：当前 system 部分只有换行符，没有任务描述。虽然 `asr_direct.cpp` demo 用同样的空 system prompt 生成了正确的英文结果（"He hoped there would be stew..."），但那个测试使用的是标准英文数据集样本，模型可能更容易识别。
+
+2. **模型训练数据偏向中文**：Qwen3-ASR 以中文为主要训练语言，对英文的 zero-shot 能力可能需要更强引导。
+
+3. **Auto-detection 不完美**：Qwen3-ASR 理论支持语言自动检测，但在短音频/边界情况下可能默认偏向中文。
+
+**建议修复方向**：
+
+1. **添加 system prompt 内容**（最可能有效）：
+   ```
+   <|im_start|>system
+   You are a helpful assistant.<|im_end|>
+   ```
+   或尝试明确语言引导（需测试是否有效）：
+   ```
+   <|im_start|>system
+   You are a multilingual speech recognition assistant. Transcribe the audio accurately in its original language.<|im_end|>
+   ```
+
+2. **在 user prompt 中加 task 描述**：
+   ```
+   <|im_start|>user
+   Transcribe the following speech:<|audio_start|>...<|audio_end|><|im_end|>
+   ```
+
+3. **检查 tokenizer 的 decode 输出**：先用 `getResult()` 获取原始 token IDs，确认是模型生成的 token 就不对，还是 tokenizer decode 环节有问题。
+
+4. **对比 x86 和 ARM 推理输出**：同一段英文音频在 x86 demo (`asr_direct.cpp`) 和手机上的输出 token 序列是否一致，排除精度/platform 差异。
+
+**需修改的文件**：`qwen3_asr_engine.cpp` 中的 `prefix_tokens` / `suffix_tokens` 数组。

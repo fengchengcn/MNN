@@ -1,9 +1,13 @@
 #include "qwen3_asr_engine.h"
+#include <MNN/Interpreter.hpp>
+#include <cerrno>
 #include <fstream>
 #include <cstring>
 #include <algorithm>
 #include <thread>
+#include <unordered_map>
 #include <android/log.h>
+#include "tokenizer.hpp"
 
 #ifdef LLM_SUPPORT_AUDIO
 #include "audio/audio.hpp"
@@ -11,20 +15,26 @@
 
 #define LOG_TAG "Qwen3AsrEngine"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 using namespace MNN::Express;
 
+// ====== Constructor / Destructor ======
+
 Qwen3AsrEngine::Qwen3AsrEngine()
-    : m_num_threads(4)
+    : m_decoder_loaded(false)
+    , m_prefill_token_count(0)
+    , m_num_threads(2)
     , m_initialized(false)
-    , m_decoder_ran(false)
-    , m_prefill_token_count(0) {
+    , m_decoder_ran(false) {
 }
 
 Qwen3AsrEngine::~Qwen3AsrEngine() {
     release();
 }
+
+// ====== bf16 conversion ======
 
 float Qwen3AsrEngine::bf16_to_f32(uint16_t v) {
     uint32_t bits = (uint32_t)v << 16;
@@ -33,51 +43,101 @@ float Qwen3AsrEngine::bf16_to_f32(uint16_t v) {
     return r;
 }
 
-VARP Qwen3AsrEngine::loadEmbedding(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) return nullptr;
-    size_t n = (size_t)VOCAB * HIDDEN;
-    std::vector<uint16_t> buf(n);
-    f.read((char*)buf.data(), n * 2);
-    f.close();
-    auto t = _Input({VOCAB, HIDDEN}, NCHW, halide_type_of<float>());
-    float* d = t->writeMap<float>();
-    for (size_t i = 0; i < n; i++) d[i] = bf16_to_f32(buf[i]);
-    return t;
+// ====== Embedding via mmap (zero-RAM, on-demand paging) ======
+
+bool Qwen3AsrEngine::openEmbeddingFile(const std::string& path) {
+    m_embed_fd = open(path.c_str(), O_RDONLY);
+    if (m_embed_fd < 0) {
+        LOGE("Cannot open embedding file: %s (errno=%d)", path.c_str(), errno);
+        return false;
+    }
+
+    struct stat st;
+    if (fstat(m_embed_fd, &st) != 0) {
+        LOGE("fstat failed on embedding file (errno=%d)", errno);
+        close(m_embed_fd);
+        m_embed_fd = -1;
+        return false;
+    }
+    m_embed_file_size = st.st_size;
+
+    size_t expected = (size_t)VOCAB * HIDDEN * 2;
+    if (m_embed_file_size < expected) {
+        LOGW("Embedding file size %zu < expected %zu", m_embed_file_size, expected);
+    }
+
+    m_embed_mmap = mmap(nullptr, m_embed_file_size, PROT_READ, MAP_SHARED, m_embed_fd, 0);
+    if (m_embed_mmap == MAP_FAILED) {
+        LOGE("mmap failed on embedding file (errno=%d)", errno);
+        close(m_embed_fd);
+        m_embed_fd = -1;
+        return false;
+    }
+
+    madvise(m_embed_mmap, m_embed_file_size, MADV_RANDOM);
+    LOGI("Embedding mmap'd: %zu MB (on-demand paging)", m_embed_file_size / (1024 * 1024));
+    return true;
 }
 
-VARP Qwen3AsrEngine::embedLookup(VARP tbl, const std::vector<int>& ids) {
-    int S = (int)ids.size();
-    auto r = _Input({1, S, HIDDEN}, NCHW, halide_type_of<float>());
-    float* dst = r->writeMap<float>();
-    const float* src = tbl->readMap<float>();
-    for (int i = 0; i < S; i++) {
+void Qwen3AsrEngine::closeEmbeddingFile() {
+    if (m_embed_mmap != MAP_FAILED) {
+        munmap(m_embed_mmap, m_embed_file_size);
+        m_embed_mmap = MAP_FAILED;
+    }
+    if (m_embed_fd >= 0) {
+        close(m_embed_fd);
+        m_embed_fd = -1;
+    }
+    m_embed_file_size = 0;
+}
+
+void Qwen3AsrEngine::embedLookup(const std::vector<int>& ids, float* dst) {
+    const uint16_t* src = static_cast<const uint16_t*>(m_embed_mmap);
+    const size_t row_vals = HIDDEN;
+
+    std::unordered_map<int, int> seen;
+    for (size_t i = 0; i < ids.size(); i++) {
         int id = ids[i];
         if (id < 0 || id >= VOCAB) id = 0;
-        memcpy(dst + i * HIDDEN, src + id * HIDDEN, HIDDEN * sizeof(float));
+
+        auto it = seen.find(id);
+        if (it != seen.end()) {
+            memcpy(dst + i * row_vals, dst + it->second * row_vals, row_vals * sizeof(float));
+            continue;
+        }
+        seen[id] = (int)i;
+
+        const uint16_t* row = src + id * row_vals;
+        float* out = dst + i * row_vals;
+        for (int j = 0; j < HIDDEN; j++) {
+            out[j] = bf16_to_f32(row[j]);
+        }
     }
-    return r;
 }
 
-int Qwen3AsrEngine::argmaxPenalized(const float* logits, const std::vector<int>& history, float penalty) {
+// ====== argmax with repetition penalty ======
+
+int Qwen3AsrEngine::argmaxPenalized(const float* logits, float* penalized_buf,
+                                     const std::vector<int>& history, float penalty) {
     if (penalty <= 1.0f || history.empty()) {
         int idx = 0;
         for (int i = 1; i < VOCAB; i++) if (logits[i] > logits[idx]) idx = i;
         return idx;
     }
-    std::vector<float> penalized(VOCAB);
-    memcpy(penalized.data(), logits, VOCAB * sizeof(float));
+    memcpy(penalized_buf, logits, VOCAB * sizeof(float));
     for (int id : history) {
         if (id < 0 || id >= VOCAB) continue;
-        if (penalized[id] < 0)
-            penalized[id] *= penalty;
+        if (penalized_buf[id] < 0)
+            penalized_buf[id] *= penalty;
         else
-            penalized[id] /= penalty;
+            penalized_buf[id] /= penalty;
     }
     int idx = 0;
-    for (int i = 1; i < VOCAB; i++) if (penalized[i] > penalized[idx]) idx = i;
+    for (int i = 1; i < VOCAB; i++) if (penalized_buf[i] > penalized_buf[idx]) idx = i;
     return idx;
 }
+
+// ====== Causal mask & empty KV cache ======
 
 VARP Qwen3AsrEngine::createCausalMask(int S_new, int past_len) {
     int S_total = past_len + S_new;
@@ -97,99 +157,139 @@ std::vector<VARP> Qwen3AsrEngine::createEmptyCache() {
     return {k, v};
 }
 
-bool Qwen3AsrEngine::init(const std::string& model_dir, int num_threads) {
-    if (m_initialized) release();
+// ====== Model loading (on-demand, serialized to avoid dual-model memory peak) ======
 
-    m_model_dir = model_dir;
-    m_num_threads = num_threads;
+std::shared_ptr<Module> Qwen3AsrEngine::loadAudioEncoder() {
+    LOGI("Loading audio encoder (on-demand)...");
+    auto mod = std::shared_ptr<Module>(Module::load({}, {}, (m_model_dir + "/audio_encoder.mnn").c_str()));
+    if (!mod) {
+        LOGE("Failed to load audio encoder");
+    } else {
+        LOGI("Audio encoder loaded");
+    }
+    return mod;
+}
 
-    // Create executor with specified thread count
+bool Qwen3AsrEngine::ensureDecoderLoaded() {
+    if (m_decoder_loaded) {
+        LOGI("Decoder already loaded, reusing");
+        return true;
+    }
+
+    LOGI("Loading LLM decoder (first use)...");
     MNN::BackendConfig bc;
     bc.precision = MNN::BackendConfig::Precision_Normal;
-    auto executor = Executor::newExecutor(MNN_FORWARD_CPU, bc, num_threads);
-    ExecutorScope scope(executor);
+    bc.memory = MNN::BackendConfig::Memory_Low;  // Reduce internal memory pool
 
-    // Load audio encoder
-    LOGI("Loading audio encoder...");
-    m_audio_mod = Module::load({}, {}, (model_dir + "/audio_encoder.mnn").c_str());
-    if (!m_audio_mod) {
-        LOGE("Failed to load audio encoder");
-        return false;
-    }
-    LOGI("Audio encoder loaded");
-
-    // Load decoder with KV cache
-    LOGI("Loading LLM decoder (KV Cache)...");
     MNN::ScheduleConfig sched;
     sched.backendConfig = &bc;
     m_rt = std::shared_ptr<Executor::RuntimeManager>(
         Executor::RuntimeManager::createRuntimeManager(sched));
-    m_rt->setExternalFile(model_dir + "/llm_kv_8bit.mnn.weight");
+
+    // Memory optimization hints (same pattern as Llm::setRuntimeHint in llm.cpp)
+    m_rt->setHint(MNN::Interpreter::MEM_ALLOCATOR_TYPE, 0);       // Defer allocation → lower peak
+    m_rt->setHint(MNN::Interpreter::USE_CACHED_MMAP, 1);          // mmap weights, don't read all
+    m_rt->setHint(MNN::Interpreter::WINOGRAD_MEMORY_LEVEL, 0);    // Minimal winograd memory
+    m_rt->setHint(MNN::Interpreter::DYNAMIC_QUANT_OPTIONS, 1);    // Per-tensor dynamic quant
+
+    m_rt->setExternalFile(m_model_dir + "/llm_kv_8bit.mnn.weight");
+
     Module::Config mc;
     mc.shapeMutable = true;
     mc.rearrange = true;
-    m_llm_mod = Module::load({}, {}, (model_dir + "/llm_kv_8bit.mnn").c_str(), m_rt, &mc);
+    m_llm_mod = std::shared_ptr<Module>(Module::load(
+        {}, {}, (m_model_dir + "/llm_kv_8bit.mnn").c_str(), m_rt, &mc));
+
     if (!m_llm_mod) {
         LOGE("Failed to load LLM decoder");
         return false;
     }
+
+    m_decoder_loaded = true;
     LOGI("LLM decoder loaded");
-
-    // Load tokenizer
-    LOGI("Loading tokenizer...");
-    {
-        std::ifstream tok_file(model_dir + "/tokenizer.txt");
-        if (tok_file.is_open()) {
-            std::string line;
-            while (std::getline(tok_file, line)) {
-                // Remove trailing newline/carriage return
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                m_token_table.push_back(line);
-            }
-            LOGI("Tokenizer loaded: %zu tokens", m_token_table.size());
-        } else {
-            LOGW("tokenizer.txt not found, text decoding disabled");
-        }
-    }
-
-    // Load embeddings
-    LOGI("Loading embeddings...");
-    m_embed_tbl = loadEmbedding(model_dir + "/embeddings_bf16.bin");
-    if (m_embed_tbl.get() == nullptr) {
-        LOGE("Failed to load embeddings");
-        return false;
-    }
-    LOGI("Embeddings loaded");
-
-    m_initialized = true;
-    LOGI("Qwen3-ASR Engine initialized successfully");
     return true;
 }
 
-void Qwen3AsrEngine::reset() {
-    m_audio_buffer.clear();
-    m_token_ids.clear();
-    m_prefill_token_count = 0;
-    m_decoder_ran = false;
-    m_k_cache = VARP();
-    m_v_cache = VARP();
+// ====== Init (lightweight — no model loading) ======
+
+void Qwen3AsrEngine::buildPromptTokens() {
+    auto* tok = static_cast<MNN::Transformer::Tokenizer*>(m_tokenizer);
+    if (!tok) {
+        // Fallback: hardcoded empty-system prompt (Chinese-only, no language guidance)
+        m_prefix_tokens = {151644, 8948, 198, 151645, 198,   // <|im_start|>system\n<|im_end|>\n
+                           151644, 872, 198};                 // <|im_start|>user\n
+        m_suffix_tokens = {151670,                            // <|audio_end|>
+                           151645, 198,                       // <|im_end|>\n
+                           151644, 77091, 198};               // <|im_start|>assistant\n
+        return;
+    }
+
+    // Build prefix: <|im_start|>system\n{system_msg}\n<|im_end|>\n<|im_start|>user\n
+    m_prefix_tokens = {151644, 8948, 198};  // <|im_start|>system\n
+
+    // Encode system message using the tokenizer
+    // A multilingual system prompt improves English/mixed-language recognition
+    auto sys_msg = tok->encode("You are a helpful assistant.");
+    m_prefix_tokens.insert(m_prefix_tokens.end(), sys_msg.begin(), sys_msg.end());
+    m_prefix_tokens.push_back(198);   // \n
+    m_prefix_tokens.push_back(151645); // <|im_end|>
+    m_prefix_tokens.push_back(198);   // \n
+    m_prefix_tokens.push_back(151644); // <|im_start|>
+    m_prefix_tokens.push_back(872);    // user
+    m_prefix_tokens.push_back(198);   // \n
+
+    // Build suffix: <|audio_end|><|im_end|>\n<|im_start|>assistant\n
+    m_suffix_tokens = {151670,          // <|audio_end|>
+                       151645, 198,     // <|im_end|>\n
+                       151644, 77091, 198}; // <|im_start|>assistant\n
+
+    LOGI("Prompt tokens built: prefix=%zu, suffix=%zu", m_prefix_tokens.size(), m_suffix_tokens.size());
 }
 
-void Qwen3AsrEngine::release() {
-    reset();
-    m_audio_mod.reset();
-    m_llm_mod.reset();
-    m_embed_tbl = VARP();
-    m_rt.reset();
-    m_initialized = false;
+bool Qwen3AsrEngine::init(const std::string& model_dir, const std::string& cache_dir, int num_threads) {
+    if (m_initialized) release();
+
+    m_model_dir = model_dir;
+    m_cache_dir = cache_dir;
+    m_num_threads = num_threads;
+
+    // Pre-allocate penalty buffer (607 KB)
+    m_penalty_buf.resize(VOCAB);
+
+    // Load tokenizer via MNN's Tokenizer class (handles SentencePiece/Tiktoken binary formats)
+    LOGI("Loading tokenizer...");
+    {
+        auto* tok = MNN::Transformer::Tokenizer::createTokenizer(model_dir + "/tokenizer.txt");
+        if (tok) {
+            m_tokenizer = tok;
+            LOGI("Tokenizer loaded successfully");
+        } else {
+            LOGW("tokenizer.txt not found or invalid format, text decoding disabled");
+        }
+    }
+
+    // Build prompt tokens using the tokenizer (encodes system message)
+    buildPromptTokens();
+
+    // mmap embedding file (virtually zero RSS)
+    LOGI("Memory-mapping embedding file...");
+    if (!openEmbeddingFile(model_dir + "/embeddings_bf16.bin")) {
+        LOGE("Failed to mmap embedding file");
+        return false;
+    }
+
+    m_initialized = true;
+    LOGI("Qwen3-ASR Engine initialized (models loaded on-demand, threads=%d)", m_num_threads);
+    return true;
 }
+
+// ====== Audio input ======
 
 bool Qwen3AsrEngine::pushAudio(const float* samples, int num_samples) {
     if (!m_initialized) {
         LOGE("Engine not initialized");
         return false;
     }
-    // Accumulate audio samples
     m_audio_buffer.insert(m_audio_buffer.end(), samples, samples + num_samples);
     return true;
 }
@@ -202,10 +302,9 @@ void Qwen3AsrEngine::endAudio() {
     runDecoder();
 }
 
+// ====== Result decoding ======
+
 std::string Qwen3AsrEngine::getResult() const {
-    // Decode token IDs to text using the embedding table
-    // Note: full BPE decoding requires the tokenizer, which is in Java
-    // Return space-separated token IDs for Java-side decoding
     if (m_token_ids.empty()) return "";
     std::string result;
     for (size_t i = 0; i < m_token_ids.size(); i++) {
@@ -216,49 +315,69 @@ std::string Qwen3AsrEngine::getResult() const {
 }
 
 std::string Qwen3AsrEngine::getResultText() const {
-    if (m_token_ids.empty() || m_token_table.empty()) return getResult();
-    std::string text;
-    for (int id : m_token_ids) {
-        if (id >= 0 && id < (int)m_token_table.size()) {
-            text += m_token_table[id];
-        } else {
-            text += "[UNK:" + std::to_string(id) + "]";
-        }
+    if (m_token_ids.empty()) return "";
+    auto* tok = static_cast<MNN::Transformer::Tokenizer*>(m_tokenizer);
+    if (tok) {
+        return tok->decode(m_token_ids);
     }
-    return text;
+    // Fallback: return space-separated token IDs
+    return getResult();
 }
+
+// ====== Reset (keep decoder loaded, clear transient state) ======
+
+void Qwen3AsrEngine::reset() {
+    m_audio_buffer.clear();
+    m_token_ids.clear();
+    m_prefill_token_count = 0;
+    m_decoder_ran = false;
+    m_k_cache = VARP();
+    m_v_cache = VARP();
+}
+
+void Qwen3AsrEngine::release() {
+    reset();
+    m_llm_mod.reset();
+    m_rt.reset();
+    m_decoder_loaded = false;
+    if (m_tokenizer) {
+        delete static_cast<MNN::Transformer::Tokenizer*>(m_tokenizer);
+        m_tokenizer = nullptr;
+    }
+    m_penalty_buf.clear();
+    m_penalty_buf.shrink_to_fit();
+    closeEmbeddingFile();
+    m_initialized = false;
+}
+
+// ====== Main decoder (models loaded on-demand) ======
 
 std::string Qwen3AsrEngine::runDecoder() {
     if (!m_initialized) return "";
-    LOGI("Starting decoder with %zu audio samples", m_audio_buffer.size());
+    LOGI("Starting decoder with %zu audio samples, threads=%d", m_audio_buffer.size(), m_num_threads);
 
-    // Recreate executor scope
+    // Create executor with memory-saving config
     MNN::BackendConfig bc;
     bc.precision = MNN::BackendConfig::Precision_Normal;
+    bc.memory = MNN::BackendConfig::Memory_Low;
     auto executor = Executor::newExecutor(MNN_FORWARD_CPU, bc, m_num_threads);
     ExecutorScope scope(executor);
     (void)scope;
 
-    // ====== Audio processing ======
 #ifdef LLM_SUPPORT_AUDIO
-    // Load waveform from buffer
     int nsamples = (int)m_audio_buffer.size();
-    // MNN AUDIO::load expects a file path - we need direct buffer processing
-    // For now, write to temp file and load
-    // TODO: use direct buffer API when available
-    std::string tmp_wav = m_model_dir + "/_tmp_asr_input.wav";
+
+    // ====== Phase 1: Audio Encoder (loaded on-demand, released immediately) ======
+    // Write temp WAV to app's cache dir (the only writable location for untrusted_app)
+    std::string tmp_wav = m_cache_dir + "/_asr_tmp.wav";
     {
-        // Write WAV header + PCM data
         std::ofstream wav_file(tmp_wav, std::ios::binary);
         if (!wav_file.is_open()) {
-            LOGE("Failed to write temp WAV");
+            LOGE("Failed to write temp WAV to %s (errno=%d)", tmp_wav.c_str(), errno);
             return "";
         }
-        // WAV header (44 bytes)
-        int16_t fmt = 1;  // PCM
-        int16_t channels = 1;
+        int16_t fmt = 1, channels = 1, bits_per_sample = 16;
         int sample_rate = 16000;
-        int16_t bits_per_sample = 16;
         int data_size = nsamples * 2;
         int16_t block_align = channels * bits_per_sample / 8;
         int byte_rate = sample_rate * block_align;
@@ -279,7 +398,6 @@ std::string Qwen3AsrEngine::runDecoder() {
         wav_file.write("data", 4);
         wav_file.write((char*)&data_size, 4);
 
-        // Convert float PCM to int16
         for (int i = 0; i < nsamples; i++) {
             int16_t val = (int16_t)(m_audio_buffer[i] * 32767.0f);
             if (val > 32767) val = 32767;
@@ -290,12 +408,11 @@ std::string Qwen3AsrEngine::runDecoder() {
 
     auto lr = MNN::AUDIO::load(tmp_wav, 16000);
     auto wf = lr.first;
+    std::remove(tmp_wav.c_str());
     if (wf.get() == nullptr) {
         LOGE("Failed to load audio for fbank");
-        std::remove(tmp_wav.c_str());
         return "";
     }
-    std::remove(tmp_wav.c_str());
 
     auto feat = MNN::AUDIO::whisper_fbank(wf);
     if (feat.get() == nullptr || feat->getInfo() == nullptr) {
@@ -312,48 +429,52 @@ std::string Qwen3AsrEngine::runDecoder() {
         feat = f;
     }
 
-    // Warmup encoder
-    m_audio_mod->onForward({feat});
-    m_audio_mod->onForward({feat});
+    // --- Load AE → warmup → infer → release ---
+    LOGI("=== Phase 1: Audio Encoder ===");
+    auto ae_mod = loadAudioEncoder();
+    if (!ae_mod) return "";
 
-    // Run audio encoder
-    auto aout = m_audio_mod->onForward({feat});
+    ae_mod->onForward({feat});
+    ae_mod->onForward({feat});  // warmup
+    auto aout = ae_mod->onForward({feat});
     if (aout.empty()) {
-        LOGE("Audio encoder failed");
+        LOGE("Audio encoder inference failed");
         return "";
     }
 
-    // Permute to [T', 1, HIDDEN]
     auto audio_emb = _Permute(aout[0], {1, 0, 2});
     int T = audio_emb->getInfo()->dim[0];
     LOGI("Audio frames: %d", T);
 
-    // ====== Build token sequence ======
-    std::vector<int> prefix_tokens = {151644, 8948, 198, 151645, 198,  // system
-                                      151644, 872, 198};               // user
-    std::vector<int> suffix_tokens = {151670,                          // audio_end
-                                      151645, 198,                     // im_end + newline
-                                      151644, 77091, 198};             // assistant
+    // RELEASE audio encoder NOW — peak memory drops by ~500 MB
+    ae_mod.reset();
+    LOGI("Audio encoder released (memory freed)");
+
+    // ====== Phase 2: Load LLM decoder (only model in memory now) ======
+    LOGI("=== Phase 2: LLM Decoder ===");
+    if (!ensureDecoderLoaded()) return "";
+
+    // ====== Build token sequence (uses tokenizer-encoded prompt from init) ======
     std::vector<int> tokens;
-    tokens.insert(tokens.end(), prefix_tokens.begin(), prefix_tokens.end());
+    tokens.insert(tokens.end(), m_prefix_tokens.begin(), m_prefix_tokens.end());
     tokens.push_back(AUDIO_START);
     tokens.insert(tokens.end(), T, AUDIO_PAD);
-    tokens.insert(tokens.end(), suffix_tokens.begin(), suffix_tokens.end());
+    tokens.insert(tokens.end(), m_suffix_tokens.begin(), m_suffix_tokens.end());
+
+    int S = (int)tokens.size();
 
     // Build merged embeddings
-    auto txt_emb = embedLookup(m_embed_tbl, tokens);
-    int S = (int)tokens.size();
     auto merged = _Input({1, S, HIDDEN}, NCHW, halide_type_of<float>());
     float* md = merged->writeMap<float>();
-    const float* td = txt_emb->readMap<float>();
+    embedLookup(tokens, md);
+
+    // Replace AUDIO_PAD with audio encoder output
     const float* ad = audio_emb->readMap<float>();
     int ai = 0;
     for (int i = 0; i < S; i++) {
         if (tokens[i] == AUDIO_PAD && ai < T) {
             memcpy(md + i * HIDDEN, ad + ai * HIDDEN, HIDDEN * sizeof(float));
             ai++;
-        } else {
-            memcpy(md + i * HIDDEN, td + i * HIDDEN, HIDDEN * sizeof(float));
         }
     }
 
@@ -377,20 +498,25 @@ std::string Qwen3AsrEngine::runDecoder() {
     m_k_cache = out[1];
     m_v_cache = out[2];
 
-    // First token
-    int current_token = argmaxPenalized(logits->readMap<float>() + (S - 1) * VOCAB, {}, 1.0f);
+    int current_token = argmaxPenalized(
+        logits->readMap<float>() + (S - 1) * VOCAB,
+        m_penalty_buf.data(), {}, 1.0f);
     m_token_ids.clear();
     m_token_ids.push_back(current_token);
     m_prefill_token_count = S;
     int gen_len = 1;
 
     // ====== Decode loop ======
+    std::vector<float> single_tok_emb(HIDDEN);
+
     while (gen_len < MAX_NEW_TOKENS && current_token != EOS_TOKEN && current_token != IM_END_TOKEN) {
-        // Embedding for current token
-        auto tok_emb = embedLookup(m_embed_tbl, {current_token});
+        embedLookup({current_token}, single_tok_emb.data());
 
         int cache_len = S;
         S = cache_len + 1;
+
+        auto tok_emb = _Input({1, 1, HIDDEN}, NCHW, halide_type_of<float>());
+        memcpy(tok_emb->writeMap<float>(), single_tok_emb.data(), HIDDEN * sizeof(float));
 
         auto pos_decode = _Input({1, 1}, NCHW, halide_type_of<int32_t>());
         auto ppd = pos_decode->writeMap<int32_t>();
@@ -405,7 +531,8 @@ std::string Qwen3AsrEngine::runDecoder() {
         m_k_cache = out[1];
         m_v_cache = out[2];
 
-        current_token = argmaxPenalized(logits->readMap<float>(), m_token_ids, REP_PENALTY);
+        current_token = argmaxPenalized(logits->readMap<float>(), m_penalty_buf.data(),
+                                        m_token_ids, REP_PENALTY);
         m_token_ids.push_back(current_token);
         gen_len++;
     }
@@ -413,6 +540,9 @@ std::string Qwen3AsrEngine::runDecoder() {
     LOGI("Generated %d tokens", gen_len);
     m_decoder_ran = true;
 
+#else
+    LOGE("LLM_SUPPORT_AUDIO not defined at compile time — decoder is a no-op! "
+         "Add LLM_SUPPORT_AUDIO to target_compile_definitions in CMakeLists.txt");
 #endif
     return getResult();
 }
