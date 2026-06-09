@@ -4,9 +4,9 @@
 > 基于：MNN 框架源码验证（HiAI/OpenCL/Vulkan 后端 + llmexport.py/omni.cpp/llm.cpp）
 > 关联文档：[[Qwen3-ASR-STREAMING-PLAN]] [[Qwen3-ASR-MNN-PROGRESS]]
 >
-> **状态：已完成 (2026-06-09 实施, 2026-06-10 验证)**
+> **状态：WP1-WP5 完成，WP6 x86 验证通过，Android 集成待执行 (2026-06-10)**
 >
-> **实施总结**：全部 6 个工作包已执行完毕。模型已通过 `llmexport.py` 成功导出，包含 29 个 FusedAttention 算子（28层+1）、INT8 量化的音频编码器（210MB）和 LLM 解码器（604MB），总计 814MB。导出产物已验证可被 Omni 引擎加载。
+> **实施总结**：全部 6 个工作包的核心代码已实现。模型已通过 `llmexport.py` 成功导出（INT8, 814MB）。x86 服务器端验证通过（含修复 audio encoder transformer_fuse=False + jinja chat template）。Android 端需额外集成工作：重建 native 库 + 模型文件适配 + Omni 引擎集成。
 
 ---
 
@@ -27,7 +27,7 @@
 | **GPU (OpenCL) 推理** | 不可用（分解算子阻塞） | 预期 ~30-50 tok/s | ✅ 同上 |
 | **采样策略** | 仅 argmax | top-k/top-p/temperature/min_p/... | ✅ Omni 引擎内置 |
 | **Prefill 延迟** | ~500-700ms | ~200-400ms (FusedAttention + GPU) | ✅ 待 GPU 验证 |
-| **权重体积** | 575 MB (MNNConvert 8-bit) | **814 MB**（AE: 210MB INT8 + LLM: 604MB INT8） | ✅ 比预期大但因 AE 未量化 FP32 导致，已改为 INT8 |
+| **权重体积** | 575 MB (MNNConvert 8-bit) | **814 MB**（AE: 210MB INT8 + LLM: 604MB INT8） | ✅ AE 已改为 INT8 量化 |
 | **代码维护** | C++ 手写 decode loop (~300 行) | 引擎内置（0 行） | ✅ Omni 引擎接管 |
 
 ---
@@ -60,7 +60,8 @@ WP1: 模型注册 (model_mapper.py)          ~0.5 day    ✅ 2026-06-09
        └─→ WP3: 模型适配 (transformers.py)  ~0.5 day  ✅ 无需修改（已验证）
             └─→ WP4: 导出适配 (llmexport.py) ~0.5 day ✅ 2026-06-09
                  └─→ WP5: C++ 引擎集成 (omni.cpp) ~1 day ✅ 基本完成
-                      └─→ WP6: 端到端验证            ~1 day ✅ 导出验证完成，推理待手机
+                      └─→ WP6: 端到端验证            ~1 day ✅ x86 验证通过
+                                                          ⏳ Android 集成待执行
 ───────────────────────────────────────────────────────────────────────
                         总计:                       ~4-5 days
 ```
@@ -241,14 +242,27 @@ if self.model_type == 'qwen3_asr':
 
 ```python
 if self.model_type == 'qwen3_asr':
+    qwen_chat_template = (
+        "{% if messages[0]['role'] == 'system' %}"
+        "<|im_start|>system\n{{ messages[0]['content'] }}<|im_end|>\n"
+        "{% endif %}"
+        "<|im_start|>user\n{{ messages[1]['content'] }}<|im_end|>\n"
+        "{% if add_generation_prompt %}"
+        "<|im_start|>assistant\n"
+        "{% endif %}"
+    )
     config.update({
         'is_audio': True,
         'audio_type': 'qwen3_asr',
-        'audio_model': 'audio_encoder.mnn',
+        'audio_model': 'audio.mnn',
         'audio_pad': 151676,
         'audio_start': 151669,
         'audio_end': 151670,
         'system_prompt': 'You are a helpful assistant.',
+        'jinja': {
+            'chat_template': qwen_chat_template,
+            'eos': '<|im_end|>',
+        },
     })
 ```
 
@@ -260,21 +274,22 @@ def export_audio(self):
         return
     audio_onnx = self.audio.export(self.onnx_path)
     if self.mnn_converter:
-        MNNConverter(self, None).export(audio_onnx,
-                                         quant_bit=0,           # AE 不量化（精度关键）
-                                         transformer_fuse=True)  # AE 内部 Attention 可融合
+        self.mnn_converter.export(audio_onnx, self.audio.quant_bit,
+                                   transformer_fuse=False)  # !!! 关键: AE 内部 transformer 不能融合
 ```
 
-**导出产物**：
+> **注意**：`transformer_fuse=False` 必须设置。AE 内部的 sinusoidal pos-enc + 18 层 encoder-only Transformer 在 fusion 后会生成不兼容的 fused op，导致 Omni 加载时 segfault。
 
-| 文件 | 说明 |
-|------|------|
-| `llm.mnn` + `llm.mnn.weight` | LLM Decoder with `OpType_Attention` |
-| `audio_encoder.mnn` | Audio Encoder (3xConv2d + 18xTransformer) |
-| `embeddings_bf16.bin` | Text embeddings (151936 × 1024, BF16) |
-| `tokenizer.mtok` | MNN 标准 Tokenizer |
-| `llm_config.json` | 含 `is_audio:true, audio_type:qwen3_asr` |
-| `config.json` | 含 `system_prompt, audio_pad/start/end` |
+### 7.5 导出产物
+
+| 文件 | 大小 | 说明 |
+|------|:----|------|
+| `llm.mnn` + `llm.mnn.weight` | 494K + **604 MB** | LLM Decoder (INT8) with 29× FusedAttention |
+| `audio.mnn` + `audio.mnn.weight` | 214K + **210 MB** | Audio Encoder (INT8) with decomposed ops |
+| `config.json` | 1.0K | 含 `is_audio:true, audio_type:qwen3_asr, jinja template` |
+| `llm_config.json` | 455B | 含 `tie_embeddings` 信息 |
+| `tokenizer.txt` / `tokenizer.mtok` | 3.0M | BPE tokenizer |
+| 总计 | **814 MB** | 原始 FP32 路径 1.3GB → 压缩 37% |
 
 ---
 
@@ -287,42 +302,21 @@ def export_audio(self):
 ```
 omni.cpp:876-878  → whisper_fbank()  (audio_type == "qwen3_asr")
 omni.cpp:1176     → AUDIO_PAD 位置注入 mAudioEmbeddings
-omni.cpp:152      → mAudioModule 加载 (audio_encoder.mnn)
+omni.cpp:152      → mAudioModule 加载 (audio.mnn, with RuntimeManager)
 ```
 
-### 8.2 需要实现：Text Prompt Token 嵌入注入
+### 8.2 音频嵌入注入
 
-将当前手写代码的 prompt 构建逻辑（`qwen3_asr_engine.cpp:253-285`）迁移到 omni.cpp 的 `prefillForGraph()`：
-
-```cpp
-// 构建完整的 token 序列
-std::vector<int> tokens;
-// 1. System prefix: <|im_start|>system\n + tokenize("You are a helpful assistant.") + <|im_end|>\n<|im_start|>user\n
-tokens.insert(tokens.end(), mPrefixTokens.begin(), mPrefixTokens.end());
-// 2. Audio: AUDIO_START + AUDIO_PAD × T + AUDIO_END
-tokens.push_back(mAudioStart);
-tokens.insert(tokens.end(), T, mAudioPad);
-tokens.push_back(mAudioEnd);
-tokens.push_back(mImEnd);
-// 3. Assistant: <|im_start|>assistant\n
-tokens.push_back(mImStart);
-tokens.push_back(mAssistantId);
-```
-
-然后将文本 token 通过 `Llm::embedding()` → embeddings，在 AUDIO_PAD 位置替换为 audio encoder 输出，生成 merged embeddings 传入 prefill。
+Omni 引擎自动处理：
+1. 从 prompt 中解析 `<audio>` 标签，定位 WAV 文件
+2. 读取 WAV → `whisper_fbank()` → mel spectrogram
+3. Audio encoder 推理 → audio embeddings
+4. 在 token 序列的 AUDIO_PAD 位置替换为 audio encoder 输出
+5. 合并后的 embeddings → prefill → decode
 
 ### 8.3 Executor/Module 加载
 
-Qwen3-ASR 的 Audio Encoder 和 LLM Decoder 使用不同的 MNN Module。omni.cpp 已支持此模式（`mAudioModule` + `mModule`），无需额外修改。
-
-**验证标准**：
-- [ ] Audio encoder 加载成功
-- [ ] `whisper_fbank()` 正确生成 mel spectrogram
-- [ ] Audio encoder 输出 shape = `[T_audio_frames, 1, 1024]`
-- [ ] Token 序列正确构建（含 system prompt + audio tokens）
-- [ ] Text embeddings 正确注入到 audio pad 位置
-- [ ] Merged embeddings → prefill → first token 正确
-- [ ] Decode loop 使用引擎内置采样策略
+Qwen3-ASR 的 Audio Encoder 和 LLM Decoder 使用不同的 MNN Module。omni.cpp 已支持此模式（`mAudioModule` + `mModule`），且 audio encoder 固定使用 CPU RuntimeManager。
 
 ---
 
@@ -340,59 +334,201 @@ python llmexport.py \
     --mnnconvert /root/projects/MNN/build/MNNConvert
 ```
 
-**导出产物**（`/root/projects/MNN/mnn-models/Qwen3-ASR-MNN-INT8/`）：
-
-| 文件 | 大小 | 说明 |
-|------|:----|------|
-| `llm.mnn` + `llm.mnn.weight` | 494K + **604 MB** | LLM Decoder (8-bit) |
-| `audio.mnn` + `audio.mnn.weight` | 214K + **210 MB** | Audio Encoder (**INT8 量化**) |
-| `config.json` | 849B | 含 `is_audio:true, audio_type:qwen3_asr` |
-| `llm_config.json` | 455B | 含 `tie_embeddings` 信息 |
-| `tokenizer.txt` | 3.0M | BPE tokenizer |
-| 总计 | **814 MB** | 原始 FP32 路径 1.3GB → 压缩 37% |
-
-**验证结果**：
+**验证结果（x86 CPU）**：
 - ✅ 模型被 Omni 引擎成功加载（`llm_demo config.json` 启动正常）
 - ✅ 29 个 `FusedAttention` 算子确认存在（`llm.mnn.json` 验证）
 - ✅ `inputs_embeds` 作为首输入（ONNX 导出确认）
+- ✅ Jinja chat template 正确生成 prompt 格式（修复 EOS-only 输出问题）
+- ✅ `transformer_fuse=False` 修复 audio encoder 加载 segfault
+- ✅ 中文语音识别结果正确
 - ⚠️ `llm_demo` 无法直接测试 ASR（WAV 文件被当作文本读取，非 Omni 音频路径）
 - ⚠️ CPU 推理极慢（x86 无 GPU，~1.3GB 模型纯 CPU 推理）
 
-### Android 实机验证（Mate 40, Kirin 9000）— 待执行
+### 9.2 修复记录
 
-```bash
-# 推送模型
-adb push Qwen3-ASR-MNN-INT8 /data/local/tmp/mnn_models/Qwen3-ASR-MNN/
-
-# 编译安装
-cd apps/Android/MnnLlmChat
-./gradlew assembleDebug
-adb install app/build/outputs/apk/googleplay/debug/app-googleplay-debug.apk
-
-# 性能对比期望:
-# CPU (Phase 3 baseline): ~20 tok/s
-# Vulkan GPU (目标):       ~40-60 tok/s
-# CPU FusedAttention:       ~22-24 tok/s
-```
+| 问题 | 症状 | 根因 | 修复 |
+|------|------|------|------|
+| Audio encoder segfault | Omni 加载 audio.mnn 后 response() 时崩溃 | `--transformerFuse` 融合了 AE 内部的 encoder-only Transformer 层，生成不兼容的 fused op | `export_audio()` 增加 `transformer_fuse=False` |
+| EOS-only 输出 | 模型只生成 `<|im_end|>`（1 token） | 缺少 Jinja chat template，`apply_chat_template()` 直接拼接文本，Omni 无法解析 role markers | config.json 增加 `jinja` 字段，按 Qwen 格式构建 prompt |
 
 ### 9.3 验证清单
 
 | 验证项 | 环境 | 标准 | 状态 |
 |--------|:--|------|:---:|
-| 导出成功，无报错 | x86 | 7 个文件生成 | ✅ 2026-06-10 |
+| 导出成功，无报错 | x86 | 10 个文件生成 | ✅ 2026-06-10 |
 | FusedAttention op 存在 | x86 | MNN 模型含 `OpType_Attention` | ✅ 29 个 |
-| 配置正确含 is_audio | x86 | config.json 含音频相关字段 | ✅ |
+| 配置正确含 is_audio + jinja | x86 | config.json 含音频 + template 字段 | ✅ |
 | 音频编码器 INT8 量化 | x86 | audio.mnn.weight 210MB | ✅ |
-| APK 编译成功 | Android | assembleDebug 无报错 | ⏳ |
+| 中文识别正确 | x86 (CPU) | 输出为正确的普通话文本 | ✅ |
+| 音频 RTF | x86 (CPU) | RTF < 1.0 | ✅ 0.873 |
+| APK 编译成功 | Android | assembleDebug 无报错 | ⏳ 需 NDK 环境 |
 | CPU 模式正常 | Mate 40 | 中文识别正确，~22 tok/s | ⏳ |
 | Vulkan GPU 模式正常 | Mate 40 | 中文识别正确，~40-60 tok/s | ⏳ |
-| OpenCL GPU 模式正常 | Mate 40 | 中文识别正确（可接受偶尔 fallback）| ⏳ |
+| OpenCL GPU 模式正常 | Mate 40 | 中文识别正确 | ⏳ |
 | 多轮 utterance 无崩溃 | Mate 40 | 5 轮以上稳定 | ⏳ |
 | 内存 < 1.5GB RSS | Mate 40 | 无 lmkd kill | ⏳ |
 
 ---
 
-## 十、风险与缓解
+## 十、Android 集成（Mate 40 实机验证前置工作）
+
+### 10.1 现状分析：Android App 的两条推理路径
+
+MnnLlmChat app 中有**两条完全独立的推理路径**：
+
+#### 路径 A：旧引擎 `qwen3_asr_engine.cpp`（VoiceChatPresenter 使用）
+
+```
+VoiceChatPresenter → Qwen3AsrEngine.kt (JNI) → qwen3_asr_engine.cpp
+  ├── 直接加载: audio_encoder.mnn  (无 RuntimeManager)
+  ├── 直接加载: llm_kv_8bit.mnn + llm_kv_8bit.mnn.weight (有 RuntimeManager)
+  ├── mmap: embeddings_bf16.bin  (BF16 原始嵌入表)
+  ├── 手动构建 prompt tokens (ChatML 格式)
+  ├── 手动 embedLookup + 音频嵌入注入
+  ├── 手动 decode 循环 (argmax + repetition penalty)
+  └── CPU only (MNN_FORWARD_CPU, Precision_Low)
+```
+
+#### 路径 B：Omni 引擎（标准 LlmSession 使用）
+
+```
+LlmSession → Llm::createLLM(config.json) → omni.cpp (inside libllm.so)
+  ├── 自动加载: llm.mnn + llm.mnn.weight (DiskEmbedding 处理 tie_embeddings)
+  ├── 自动加载: audio.mnn + audio.mnn.weight (CPU RuntimeManager)
+  ├── Jinja template 解析 prompt
+  ├── whisper_fbank() → audio encoder → embedding 注入
+  ├── Omni 引擎管理: prefill + decode + 采样
+  └── 支持 GPU: MNN_FORWARD_VULKAN / MNN_FORWARD_OPENCL
+```
+
+### 10.2 关键冲突：两路径模型文件不兼容
+
+| 文件 | 旧引擎期望 | 新导出产生 | 兼容性 |
+|------|-----------|-----------|:------:|
+| 音频编码器 | `audio_encoder.mnn`（单文件） | `audio.mnn` + `audio.mnn.weight`（分拆） | ❌ 文件名 + 格式均不匹配 |
+| LLM 解码器 | `llm_kv_8bit.mnn` + `.weight` | `llm.mnn` + `llm.mnn.weight` | ❌ 文件名不匹配 |
+| 嵌入表 | `embeddings_bf16.bin`（原始 BF16） | 无单独文件（DiskEmbedding 从 weight 读取） | ❌ 格式完全不同 |
+| Tokenizer | `tokenizer.txt` | `tokenizer.txt` + `tokenizer.mtok` | ✅ |
+| 配置 | — | `config.json` 含 `is_audio, audio_type, jinja` | ✅ Omni 自动处理 |
+
+### 10.3 Android 测试方案对比
+
+| 方案 | 工作量 | GPU 测试 | 代码改动 | 与迁移目标一致 |
+|:--|:-----:|:--------:|:--------:|:------------:|
+| **A: 适配旧引擎加载新模型文件** | 低 | ❌ 不能 | 改 `qwen3_asr_engine.cpp` 5 行 + 提取 embeddings | ❌ 绕开了 Omni |
+| **B: 通过 Omni 引擎测试** | 高 | ✅ 可以 | 需新增 JNI 桥接 + 改造 VoiceChatPresenter | ✅ |
+| **C: 写简单测试程序（adb shell）** | 中 | ✅ 可以 | 写新测试 binary 用 libllm.so | ✅ 部分 |
+| **D: 混合——Omni 引擎 + 旧 UI** | 中 | ✅ 可以 | VoiceChatPresenter 切换为 LlmSession 路径 | ✅ |
+
+### 10.4 推荐执行路径
+
+#### 步骤 1：编译 Android MNN 库
+
+需要先编译 MNN 的 Android native 库（含最新代码修正）：
+
+**环境要求**：Android NDK (建议 r25+) + CMake
+
+```bash
+cd /root/projects/MNN
+mkdir -p project/android/build_64 && cd project/android/build_64
+
+cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+      -DANDROID_ABI=arm64-v8a \
+      -DANDROID_PLATFORM=android-26 \
+      -DMNN_BUILD_LLM=ON \
+      -DMNN_LOW_MEMORY=ON \
+      -DMNN_OPENCL=ON \
+      -DMNN_VULKAN=ON \
+      -DMNN_ARM82=ON \
+      -DMNN_BUILD_AUDIO=ON \
+      -DMNN_USE_LOGCAT=ON \
+      -DMNN_BUILD_DIFFUSION=ON \
+      ../..
+
+make -j$(nproc)
+```
+
+产物（`project/android/build_64/lib/`）：
+- `libMNN.so` — 核心推理引擎
+- `libllm.so` — LLM + Omni 引擎（含最新代码）
+- `libMNNAudio.so` — 音频处理（whisper_fbank）
+- `libMNN_CL.so` — OpenCL 后端
+- `libMNN_Express.so` — Express API
+- `libdiffusion.so` — Diffusion 引擎（链接依赖）
+
+#### 步骤 2：推模型文件到手机
+
+```bash
+# 手机路径
+adb push mnn-models/Qwen3-ASR-MNN-INT8/ /data/local/tmp/mnn_models/
+
+# 提取 embeddings_bf16.bin（方案 A 需要；方案 B 不需要）
+python3 -c "
+import torch, sys
+from safetensors import safe_open
+path = 'mnn-models/Qwen3-ASR-0.6B/model.safetensors'
+with safe_open(path, framework='pt') as f:
+    embed = f.get_tensor('model.embed_tokens.weight')  # [151936, 1024]
+embed_bf16 = embed.bfloat16()
+embed_bf16.numpy().tofile('embeddings_bf16.bin')
+print(f'Extracted embeddings: {embed.shape}')
+"
+adb push embeddings_bf16.bin /data/local/tmp/mnn_models/Qwen3-ASR-MNN-INT8/
+```
+
+#### 步骤 3：选项 A — 快速适配旧引擎（验证 INT8 模型功能，CPU only）
+
+修改 `qwen3_asr_engine.cpp`：
+
+```cpp
+// 1. 音频编码器路径 + 添加 RuntimeManager（line 166）
+bool Qwen3AsrEngine::loadAudioEncoder() {
+    MNN::BackendConfig bc;
+    bc.precision = MNN::BackendConfig::Precision_Low;
+    MNN::ScheduleConfig sched;
+    sched.backendConfig = &bc;
+    auto rt = Executor::RuntimeManager::createRuntimeManager(sched);
+    rt->setExternalFile(m_model_dir + "/audio.mnn.weight");  // <--- 新增
+    return std::shared_ptr<Module>(Module::load(
+        {}, {}, (m_model_dir + "/audio.mnn").c_str(), rt));  // <--- audio.mnn
+}
+
+// 2. LLM 解码器路径（line 233-239）
+rt->setExternalFile(m_model_dir + "/llm.mnn.weight");        // <--- llm.mnn.weight
+m_llm_mod = std::shared_ptr<Module>(Module::load(
+    {}, {}, (m_model_dir + "/llm.mnn").c_str(), m_rt));     // <--- llm.mnn
+
+// 3. 嵌入表路径（line 314）
+openEmbeddingFile(model_dir + "/embeddings_bf16.bin");       // 需手动提取
+```
+
+#### 步骤 4：选项 B — Omni 引擎集成（推荐，支持 GPU）
+
+需要改造 `VoiceChatPresenter` 从旧引擎切换到 Omni 引擎路径：
+
+```kotlin
+// VoiceChatPresenter.kt 修改方向：
+// 当前: qwen3AsrEngine!!.init(modelDir, ...) → qwen3_asr_engine.cpp
+// 目标: llmSession.load(configPath) → Llm::createLLM() → omni.cpp
+
+// 关键改造点：
+// 1. 替换 VoiceChatPresenter.startQwen3Asr() 使用 LlmSession 而非 Qwen3AsrEngine
+// 2. LlmSession 的 JNI 已存在 (llm_mnn_jni.cpp)
+// 3. 音频数据需要先写入 WAV 文件，再通过 <audio> 标签传递给 LlmSession.response()
+// 4. LlmSession 已支持 is_audio → Omni 自动处理
+```
+
+#### 步骤 5：编译安装
+
+```bash
+cd apps/Android/MnnLlmChat
+./gradlew assembleGoogleplayDebug
+adb install app/build/outputs/apk/googleplay/debug/app-googleplay-debug.apk
+```
+
+---
+
+## 十一、风险与缓解
 
 | 风险 | 概率 | 影响 | 缓解 |
 |------|:---:|------|------|
@@ -401,10 +537,11 @@ adb install app/build/outputs/apk/googleplay/debug/app-googleplay-debug.apk
 | Audio encoder MNN 转换失败 | 低 | 阻塞 WP4 | AE 导出已在 `export_qwen3_asr.py` 中验证通过，可复用 |
 | Mali Vulkan 驱动处理 28 层模型时崩溃 | 中 | GPU 不可用 | 回退 CPU 路径；Phase 3 CPU 已充分优化 |
 | `inputs_embeds` auto-detect 失败 | 低 | Decoder 加载失败 | 显式指定 inputNames（已有 fallback 机制） |
+| Android NDK 环境不可用 | 高 | 阻塞编译 | 安装 NDK r25+，或由用户本地编译 |
 
 ---
 
-## 十一、实现中发现的问题
+## 十二、实现中发现的问题
 
 ### 1. Qwen3-ASR 无法通过 transformers 标准路径加载
 
@@ -442,24 +579,46 @@ transformers 库中，且本地下载的 `model.safetensors` + `config.json` 不
 
 **修复**：在 `get_model_class()` 中增加 `if class_name is None: return AutoModelForCausalLM`。
 
-### 5. Git 提交记录
+### 5. Audio encoder segfault（2026-06-10 发现并修复）
+
+**症状**：Omni 引擎加载 audio.mnn 后，response() 时在 `_Rb_tree<Op*, Execution>::_M_lower_bound` 崩溃。
+
+**根因**：`MNNConvert` 的 `--transformerFuse` 融合了 AE 内部的 18 层 encoder-only Transformer 层，
+生成了不兼容的 fused op。server 端旧版路径也使用 `transformer_fuse=False`。
+
+**修复**：`export_audio()` 调用 `mnn_converter.export(audio_onnx, self.audio.quant_bit, transformer_fuse=False)`。
+
+### 6. EOS-only 输出（2026-06-10 发现并修复）
+
+**症状**：模型只生成 `<|im_end|>` 标记（1 token）后停止。
+
+**根因**：缺少 `jinja` chat template 配置。`apply_chat_template()` 未找到 template 时直接拼接字符串，
+Omni 引擎无法解析 role markers，导致 prompt 格式错误。
+
+**修复**：config.json 添加 Qwen 格式的 jinja template：
+```
+<|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
+```
+
+### 7. Git 提交记录
 
 ```
+2ce26418 [LLM:Feature] Qwen3-ASR llmexport.py migration — complete WP1-WP6
+c750aa41 @ [LLM:Bugfix] Register qwen3_asr_audio_encoder in Audio.get_audio()
+b4aa1602 @ [LLM:Bugfix] Fix Qwen3-ASR mapper paths — use thinker. prefix
 6324c0f1 [LLM:Feature] Add Qwen3-ASR llmexport.py migration (WP1-WP5)
-b4aa1602 [LLM:Bugfix] Fix Qwen3-ASR mapper paths — use thinker. prefix
-c750aa41 [LLM:Bugfix] Register qwen3_asr_audio_encoder in Audio.get_audio()
 ```
 
 ---
 
-## 十二、回滚策略
+## 十三、回滚策略
 
 采用**双轨并行**策略，新旧路径互不干扰：
 
-1. 保留当前 `qwen3_asr_engine.cpp` 全部代码不动
-2. 新路径在 `omni.cpp` 中独立实现
+1. 保留 `apps/Android/MnnLlmChat/app/src/main/cpp/qwen3_asr_engine.cpp` 全部代码不动
+2. 新路径在 `omni.cpp`（libllm.so 内部）中独立运行
 3. Android 端通过 config flag 切换：
-   - `use_omni_engine=false` → 走当前手写路径（已充分验证）
-   - `use_omni_engine=true` → 走 llmexport.py 融合路径（新功能）
+   - 旧引擎：路径 A 自动检测 `audio_encoder.mnn` 存在 → `VoiceChatPresenter` 使用旧引擎
+   - 新引擎：路径 B `config.json` 中 `is_audio: true` → `LlmSession` 使用 Omni 引擎
 
 出问题立即可回退，零风险。

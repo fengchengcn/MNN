@@ -353,6 +353,17 @@ class LlmExporter(torch.nn.Module):
             if self.model_type == "gemma3":
                 config.update({'precision': "normal"})
             if self.model_type == "qwen3_asr":
+                # Qwen chat template — wraps messages in <|im_start|>role\n...<|im_end|> format.
+                # Omni::tokenizer_encode handles <audio> tag replacement separately.
+                qwen_chat_template = (
+                    "{% if messages[0]['role'] == 'system' %}"
+                    "<|im_start|>system\n{{ messages[0]['content'] }}<|im_end|>\n"
+                    "{% endif %}"
+                    "<|im_start|>user\n{{ messages[1]['content'] }}<|im_end|>\n"
+                    "{% if add_generation_prompt %}"
+                    "<|im_start|>assistant\n"
+                    "{% endif %}"
+                )
                 config.update({
                     'is_audio': True,
                     'audio_type': 'qwen3_asr',
@@ -361,6 +372,10 @@ class LlmExporter(torch.nn.Module):
                     'audio_start': 151669,
                     'audio_end': 151670,
                     'system_prompt': 'You are a helpful assistant.',
+                    'jinja': {
+                        'chat_template': qwen_chat_template,
+                        'eos': '<|im_end|>',
+                    },
                 })
             if (hasattr(self, 'visual') and self.visual is not None) or (hasattr(self, 'visual') and self.audio is not None):
                 config['mllm'] = {
@@ -631,7 +646,12 @@ class LlmExporter(torch.nn.Module):
         if self.audio is None:
             return
         audio_onnx = self.audio.export(self.onnx_path)
-        if self.mnn_converter: self.mnn_converter.export(audio_onnx, self.audio.quant_bit)
+        # Note: transformer_fuse=False prevents MNNConvert from fusing the audio
+        # encoder's internal transformer layers (sinusoidal pos-enc + 18-layer
+        # encoder-only Transformer), which would create incompatible fused ops.
+        # The old export path (export_qwen3_asr.py) also omits --transformerFuse.
+        if self.mnn_converter: self.mnn_converter.export(audio_onnx, self.audio.quant_bit,
+                                                          transformer_fuse=False)
 
     def export_talker(self):
         if self.talker is None:
