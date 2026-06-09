@@ -7,6 +7,39 @@ from dataclasses import dataclass, field, asdict
 
 # model config
 
+class ConfigObj:
+    """Dict-to-obj converter that also supports dict-style methods for compatibility."""
+    def __init__(self, d):
+        for k, v in d.items():
+            setattr(self, k, ConfigObj._convert(v))
+
+    @staticmethod
+    def _convert(data):
+        if isinstance(data, dict):
+            return ConfigObj(data)
+        elif isinstance(data, list):
+            return [ConfigObj._convert(item) for item in data]
+        return data
+
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+    def values(self):
+        return {k: getattr(self, k) for k in self.__dict__}.values()
+
+    def keys(self):
+        return self.__dict__.keys()
+
+    def items(self):
+        return self.__dict__.items()
+
+    def __contains__(self, key):
+        return key in self.__dict__
+
+
 class LlmConfig(PretrainedConfig):
     model_type = "llm_config"
 
@@ -46,6 +79,24 @@ class LlmConfig(PretrainedConfig):
                     f"Please clone it from GitHub and set PYTHONPATH accordingly."
                 )
 
+    @staticmethod
+    def _json_to_obj(data):
+        """Convert dict to ConfigObj for attribute-style access."""
+        return ConfigObj._convert(data)
+
+    @classmethod
+    def _load_from_json_fallback(cls, pretrained_model_name_or_path):
+        """Load config directly from config.json as a nested object.
+        Used for custom model types not registered in transformers."""
+        config_path = os.path.join(pretrained_model_name_or_path, 'config.json')
+        if not os.path.exists(config_path):
+            return None
+        with open(config_path, 'r') as f:
+            raw_config = json.load(f)
+        config = cls._json_to_obj(raw_config)
+        config.model_type = raw_config.get('model_type', 'unknown')
+        return config
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         config_path = os.path.join(pretrained_model_name_or_path, 'config.json')
@@ -54,6 +105,8 @@ class LlmConfig(PretrainedConfig):
                 raw_config = json.load(f)
             model_type = raw_config.get('model_type')
             cls._register_external_model(model_type)
+        else:
+            model_type = None
 
         # Handle models without top-level model_type (e.g., lfm2_audio)
         if model_type is None:
@@ -65,7 +118,14 @@ class LlmConfig(PretrainedConfig):
             else:
                 config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True, **kwargs)
         else:
-            config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True, **kwargs)
+            try:
+                config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True, **kwargs)
+            except (ValueError, KeyError):
+                # Fallback: custom model type not recognized by transformers
+                # e.g., qwen3_asr from ModelScope without custom code files
+                config = cls._load_from_json_fallback(pretrained_model_name_or_path)
+                if config is None:
+                    raise
 
         model_type, model_map = ModelMapper().get_map(config)
         llm_config_kwargs = {

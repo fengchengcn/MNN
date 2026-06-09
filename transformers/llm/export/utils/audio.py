@@ -446,14 +446,14 @@ class Qwen3AsrAudio(Audio):
     """
 
     def __init__(self, audio, base):
+        self.audio_pad_id = 151676  # <|audio_pad|> — set before super().__init__ calls load()
         super().__init__(audio, base)
         self.audio_embeds = None
-        self.audio_pad_id = 151676  # <|audio_pad|>
         self.sampling_rate = 16000
         self.feature_size = 128
         self.n_fft = 400
         self.hop_length = 160
-        self.quant_bit = 0  # Audio encoder: no quantization (precision-critical)
+        self.quant_bit = 8  # INT8 quantization for mobile deployment
 
     def load(self):
         self.encoder = self.audio.float()

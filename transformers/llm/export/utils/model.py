@@ -8,6 +8,7 @@ from utils.config import LlmConfig
 from utils.tokenizer import LlmTokenizer
 from utils.model_mapper import ModelMapper
 from utils.transformers import Embedding, Rotary, Decoder, Lm
+from utils.qwen3_asr_model import load_qwen3_asr
 
 class LlmModel(PreTrainedModel):
     config_class = LlmConfig
@@ -59,6 +60,9 @@ class LlmModel(PreTrainedModel):
         if model_type is None or model_type not in MODEL_CLASS_MAPPING:
             return AutoModelForCausalLM
         class_name = MODEL_CLASS_MAPPING[model_type]
+        if class_name is None:
+            # Sentinel value: custom loading via separate path
+            return AutoModelForCausalLM
         try:
             module = importlib.import_module('transformers')
             return getattr(module, class_name)
@@ -105,6 +109,10 @@ class LlmModel(PreTrainedModel):
             )
             # Force sdpa attention on CPU (flash_attention_2 requires GPU)
             original_model.lfm.set_attn_implementation('sdpa')
+        elif model_type == 'qwen3_asr':
+            # Qwen3-ASR is not in the standard transformers library.
+            # Load weights directly from safetensors into a custom PyTorch module.
+            original_model = load_qwen3_asr(pretrained_model_name_or_path)
         else:
             # Normal loading with weights
             try:
