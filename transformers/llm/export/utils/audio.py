@@ -30,6 +30,7 @@ class Audio(torch.nn.Module):
             'lfm2_audio': Lfm2Audio,
             'gemma4_audio': Gemma4Audio,
             'qwen3_asr': Qwen3AsrAudio,
+            'qwen3_asr_audio_encoder': Qwen3AsrAudio,  # config.json model_type for audio encoder
         }
         if model_type in audio_models:
             return audio_models[model_type]
