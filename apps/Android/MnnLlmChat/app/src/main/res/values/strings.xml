@@ -421,6 +421,7 @@
     <string name="voice_chat_stop">Stop</string>
     <string name="voice_chat_stopping">Stopping...</string>
     <string name="voice_chat_ready_greeting">What can I help you with?</string>
+    <string name="voice_chat_audio_input">🎤 Audio input</string>
     <string name="echo_cancellation_mode">Echo Cancellation</string>
     <string name="mic_mode_hardware">Hardware</string>
     <string name="mic_mode_auto_mute">Auto Mute</string>

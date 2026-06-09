@@ -24,16 +24,46 @@ object VoiceModelPathUtils {
     private const val LOCAL_MODELS_DIR = "/data/local/tmp/mnn_models"
 
     /**
+     * Check if a model directory is an Omni audio model (new llmexport.py path).
+     * Identified by audio.mnn + config.json with is_audio=true.
+     */
+    private fun isOmniAudioModel(dir: File): Boolean {
+        if (!File(dir, "audio.mnn").exists() || !File(dir, "config.json").exists()) {
+            return false
+        }
+        return try {
+            val config = JSONObject(File(dir, "config.json").readText())
+            val isAudio = config.optBoolean("is_audio", false)
+            if (isAudio) {
+                Log.d(TAG, "Detected Omni audio model at: ${dir.absolutePath}")
+            }
+            isAudio
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to parse config.json for Omni audio detection: ${e.message}")
+            false
+        }
+    }
+
+    /**
      * Scan /data/local/tmp/mnn_models/ for a Qwen3-ASR model directory.
-     * A Qwen3-ASR directory is identified by the presence of audio_encoder.mnn.
+     * Detects both:
+     * - Old path: audio_encoder.mnn presence
+     * - New Omni path: audio.mnn + config.json with is_audio=true
      * @return the first matching directory path, or null if none found.
      */
     private fun findQwen3AsrInLocalModels(): String? {
         val localDir = File(LOCAL_MODELS_DIR)
         if (!localDir.exists() || !localDir.isDirectory) return null
         localDir.listFiles()?.forEach { subdir ->
-            if (subdir.isDirectory && File(subdir, "audio_encoder.mnn").exists()) {
-                Log.i(TAG, "Found Qwen3-ASR model in local models: ${subdir.absolutePath}")
+            if (!subdir.isDirectory) return@forEach
+            // Old path: check for audio_encoder.mnn
+            if (File(subdir, "audio_encoder.mnn").exists()) {
+                Log.i(TAG, "Found Qwen3-ASR model (old) in local models: ${subdir.absolutePath}")
+                return subdir.absolutePath
+            }
+            // New Omni path: check for audio.mnn + config.json is_audio=true
+            if (isOmniAudioModel(subdir)) {
+                Log.i(TAG, "Found Qwen3-ASR model (Omni) in local models: ${subdir.absolutePath}")
                 return subdir.absolutePath
             }
         }

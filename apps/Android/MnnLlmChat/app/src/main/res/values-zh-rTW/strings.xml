@@ -406,6 +406,7 @@
     <string name="voice_chat_stop">停止</string>
     <string name="voice_chat_stopping">停止中…</string>
     <string name="voice_chat_ready_greeting">有什麼可以幫您的嗎？</string>
+    <string name="voice_chat_audio_input">🎤 語音輸入</string>
     <string name="echo_cancellation_mode">回聲消除</string>
     <string name="mic_mode_hardware">硬體</string>
     <string name="mic_mode_auto_mute">自動靜音</string>

@@ -18,7 +18,12 @@ import com.alibaba.mnnllm.android.chat.ChatPresenter
 import com.alibaba.mnnllm.android.chat.GenerateResultProcessor
 import com.alibaba.mnnllm.android.utils.VoiceModelPathUtils
 import com.taobao.meta.avatar.tts.TtsService
+import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -55,6 +60,18 @@ enum class VoiceChatState {
     ERROR
 }
 
+/**
+ * ASR engine mode:
+ * - SHERPA: Original Sherpa MNN ASR (separate ASR engine, text-only LLM)
+ * - QWEN3_OLD: Old Qwen3-ASR engine (qwen3_asr_engine.cpp, CPU only, manual decode loop)
+ * - QWEN3_OMNI: New Omni engine path (LlmSession via <audio> tag, supports GPU)
+ */
+private enum class AsrMode {
+    SHERPA,
+    QWEN3_OLD,
+    QWEN3_OMNI
+}
+
 class VoiceChatPresenter(
     private val activity: Activity,
     private val view: VoiceChatView,
@@ -75,7 +92,7 @@ class VoiceChatPresenter(
     private var qwen3Aec: AcousticEchoCanceler? = null
     private var qwen3Ns: NoiseSuppressor? = null
     private var qwen3RecordingThread: Thread? = null
-    private var isQwen3Mode = false
+    private var asrMode = AsrMode.SHERPA
     private val qwen3IsRecording = AtomicBoolean(false)
     // Silence-based endpoint detection for Qwen3-ASR
     private var silenceChunkCount = 0
@@ -84,6 +101,11 @@ class VoiceChatPresenter(
     private val speechRmsThreshold = 400.0f    // RMS on raw int16 PCM above this = speech (for interruption)
     private val maxSilenceChunks = 15           // ~1.5s silence triggers endpoint
     private val qwen3SampleRate = 16000
+    // Omni audio mode: collect PCM samples, write WAV, send <audio> tag
+    private val omniAudioBuffer = mutableListOf<Float>()
+    private val omniWavDir: String by lazy {
+        File(activity.cacheDir, "omni_audio").also { it.mkdirs() }.absolutePath
+    }
 
     private var ttsService: TtsClient? = null
     private var audioPlayer: AudioChunksPlayer? = null
@@ -217,7 +239,13 @@ class VoiceChatPresenter(
                 isThinking = false
                 currentStatus = VoiceChatPresenterState.GENERATING_TEXT
                 withContext(Dispatchers.Main) {
-                    view.addTranscript(Transcript(isUser = true, text = task.text))
+                    // For Omni mode, the "text" is an <audio> tag — show a friendly label
+                    val displayText = if (asrMode == AsrMode.QWEN3_OMNI) {
+                        activity.getString(com.alibaba.mnnllm.android.R.string.voice_chat_audio_input)
+                    } else {
+                        task.text
+                    }
+                    view.addTranscript(Transcript(isUser = true, text = displayText))
                     view.updateStatus(VoiceChatState.PROCESSING)
                 }
                 // Automatically mute microphone in Auto-Mute mode when AI starts processing/speaking
@@ -356,14 +384,32 @@ class VoiceChatPresenter(
     }
 
     /**
-     * Detect whether the model directory is a Qwen3-ASR model
-     * (by checking for the presence of audio_encoder.mnn).
+     * Detect which ASR engine mode to use for the given model directory.
+     * - QWEN3_OMNI: audio.mnn + config.json with is_audio=true (new llmexport.py path)
+     * - QWEN3_OLD: audio_encoder.mnn exists (legacy export path)
+     * - SHERPA: default
      */
-    private fun isQwen3AsrModel(modelDir: String): Boolean {
-        val markerFile = File(modelDir, "audio_encoder.mnn")
-        val result = markerFile.exists()
-        Log.d(TAG, "ASR model type check: $modelDir → isQwen3=$result")
-        return result
+    private fun detectAsrMode(modelDir: String): AsrMode {
+        val dir = File(modelDir)
+        // New Omni path: audio.mnn + config.json is_audio=true
+        if (File(dir, "audio.mnn").exists() && File(dir, "config.json").exists()) {
+            try {
+                val config = JSONObject(File(dir, "config.json").readText())
+                if (config.optBoolean("is_audio", false)) {
+                    Log.i(TAG, "Omni audio model detected: $modelDir")
+                    return AsrMode.QWEN3_OMNI
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to parse config.json: ${e.message}")
+            }
+        }
+        // Old path: audio_encoder.mnn
+        if (File(dir, "audio_encoder.mnn").exists()) {
+            Log.i(TAG, "Legacy Qwen3-ASR model detected: $modelDir")
+            return AsrMode.QWEN3_OLD
+        }
+        Log.d(TAG, "Sherpa ASR mode (no audio model files found): $modelDir")
+        return AsrMode.SHERPA
     }
 
     private fun startAsr() {
@@ -375,13 +421,13 @@ class VoiceChatPresenter(
                 val modelDir = VoiceModelPathUtils.getAsrModelPath(activity)
                 Log.i(TAG, "Using ASR model path: $modelDir")
 
-                // --- Detect model type ---
-                isQwen3Mode = isQwen3AsrModel(modelDir)
+                // --- Detect ASR engine mode ---
+                asrMode = detectAsrMode(modelDir)
 
-                if (isQwen3Mode) {
-                    startQwen3Asr(modelDir)
-                } else {
-                    startSherpaAsr(modelDir)
+                when (asrMode) {
+                    AsrMode.QWEN3_OMNI -> startQwen3AsrOmni(modelDir)
+                    AsrMode.QWEN3_OLD -> startQwen3Asr(modelDir)
+                    AsrMode.SHERPA -> startSherpaAsr(modelDir)
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "ASR initialization or start failed", e)
@@ -466,6 +512,43 @@ class VoiceChatPresenter(
         Log.i(TAG, "Qwen3-ASR started. Now listening.")
     }
 
+    // ==================== Omni Audio (new LlmSession path, supports GPU) ====================
+
+    /**
+     * Start Omni audio mode. No separate ASR engine loaded — audio is recorded,
+     * written as WAV, and sent to the Omni engine via <audio> tag through ChatPresenter.
+     * The Omni engine (LlmSession) handles: fbank → AE → embedding injection → inference.
+     */
+    private suspend fun startQwen3AsrOmni(modelDir: String) {
+        Log.i(TAG, "Starting Omni audio mode (no separate ASR engine)")
+        // No Qwen3AsrEngine loading — Omni engine is already loaded via LlmSession
+        // from ChatPresenter's session initialization.
+
+        // Clean up WAV files older than 1 hour to prevent accumulation
+        try {
+            val staleThreshold = System.currentTimeMillis() - 3600000L
+            File(omniWavDir).listFiles()?.forEach { f ->
+                if (f.name.startsWith("omni_") && f.lastModified() < staleThreshold) {
+                    f.delete()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Omni WAV cleanup failed: ${e.message}")
+        }
+
+        if (isStopped) return
+
+        isGenerationFinished = false
+        startQwen3Record()
+        currentStatus = VoiceChatPresenterState.LISTENING
+        if (!isStopped) withContext(Dispatchers.Main) {
+            view.updateStatus(VoiceChatState.LISTENING)
+            view.showGreetingMessage()
+            speakGreetingMessage()
+        }
+        Log.i(TAG, "Omni audio started. Now listening.")
+    }
+
     private fun startQwen3Record() {
         if (qwen3IsRecording.get()) return
 
@@ -510,7 +593,7 @@ class VoiceChatPresenter(
         val interval = 0.1  // 100ms chunks
         val chunkSize = (interval * qwen3SampleRate).toInt()
         val shortBuf = ShortArray(chunkSize)
-        val engine = qwen3AsrEngine ?: return
+        val engine = qwen3AsrEngine  // Non-null only in QWEN3_OLD mode — guarded by asrMode checks
 
         val maxChunks = 300  // 30s max recording to prevent infinite loop
         var totalChunks = 0
@@ -551,7 +634,14 @@ class VoiceChatPresenter(
             }
 
             // Push audio to engine (even during silence — engine needs full utterance)
-            engine.pushAudio(floatBuf)
+            if (asrMode == AsrMode.QWEN3_OMNI) {
+                // Omni mode: collect audio in buffer, will write WAV at endpoint
+                synchronized(omniAudioBuffer) {
+                    omniAudioBuffer.addAll(floatBuf.asList())
+                }
+            } else {
+                engine.pushAudio(floatBuf)
+            }
 
             // Endpoint: sustained silence after speech
             if (speechDetectedForQwen3 && silenceChunkCount >= maxSilenceChunks) {
@@ -572,55 +662,88 @@ class VoiceChatPresenter(
         qwen3AudioRecord = null
         isRecording = false
 
-        // Run streaming decode if we had speech (Phase 2: non-blocking incremental)
         if (speechDetectedForQwen3) {
-            Log.i(TAG, "Qwen3 starting streaming decode...")
-            lifecycleScope.launch {
-                withContext(Dispatchers.Main) {
-                    view.updateStatus(VoiceChatState.ASR_DECODING)
+            if (asrMode == AsrMode.QWEN3_OMNI) {
+                // ====== Omni mode: write WAV and send <audio> tag through LlmSession ======
+                // Bail early if presenter was stopped while recording (avoids empty WAV I/O)
+                if (isStopped) {
+                    omniAudioBuffer.clear()
+                    return
                 }
-            }
-
-            val ok = engine.startDecode()
-            Log.i(TAG, "Qwen3 startDecode: $ok, isDecoding=${engine.isDecoding()}")
-
-            if (ok) {
-                var lastPartial = ""
-                while (engine.isDecoding() && !isStopped) {
-                    engine.decodeStep()
-                    val partialText = engine.getPartialResult()
-                    if (partialText.isNotEmpty() && partialText != lastPartial) {
-                        lastPartial = partialText
-                        Log.d(TAG, "Qwen3 ASR partial: $partialText")
-                        lifecycleScope.launch {
-                            withContext(Dispatchers.Main) {
-                                view.updateAsrPartialText(partialText)
-                            }
-                        }
-                    }
+                if (omniAudioBuffer.isEmpty()) {
+                    Log.w(TAG, "Omni: no audio data collected, restarting")
+                    kotlinx.coroutines.delay(200)
+                    if (!isStopped) startQwen3Record()
+                    return
                 }
-                val text = engine.getResultText()
-                Log.i(TAG, "Qwen3 ASR final: $text, tokens=${engine.getResult()}")
-                engine.reset()
-
-                if (text.isNotEmpty() && !isStopped && !isSpeaking && !isProcessingLlm) {
-                    lifecycleScope.launch {
-                        taskChannel.send(SerialTask.HandleAsrResult(text))
+                lifecycleScope.launch {
+                    Log.i(TAG, "Omni: writing WAV from ${omniAudioBuffer.size} samples...")
+                    val wavFileName = "omni_${UUID.randomUUID()}.wav"
+                    val wavFile = File(omniWavDir, wavFileName)
+                    val ok = withContext(Dispatchers.IO) {
+                        writeWavFile(omniAudioBuffer.toFloatArray(), qwen3SampleRate, wavFile.absolutePath)
                     }
-                } else if (!isStopped) {
-                    // No text produced — restart listening
-                    lifecycleScope.launch {
+                    omniAudioBuffer.clear()
+                    if (ok && !isStopped && !isSpeaking && !isProcessingLlm) {
+                        val audioTag = "<audio>${wavFile.absolutePath}</audio>"
+                        Log.i(TAG, "Omni: sending audio prompt: $audioTag")
+                        taskChannel.send(SerialTask.HandleAsrResult(audioTag))
+                    } else if (!isStopped) {
+                        Log.w(TAG, "Omni: WAV write failed or busy, restarting")
                         kotlinx.coroutines.delay(200)
                         if (!isStopped) startQwen3Record()
                     }
                 }
             } else {
-                Log.w(TAG, "Qwen3 startDecode failed")
-                engine.reset()
-                // Restart listening on decode failure
+                // ====== Old Qwen3-ASR: run streaming decode ======
+                Log.i(TAG, "Qwen3 starting streaming decode...")
                 lifecycleScope.launch {
-                    kotlinx.coroutines.delay(500)
-                    if (!isStopped) startQwen3Record()
+                    withContext(Dispatchers.Main) {
+                        view.updateStatus(VoiceChatState.ASR_DECODING)
+                    }
+                }
+
+                val ok = engine.startDecode()
+                Log.i(TAG, "Qwen3 startDecode: $ok, isDecoding=${engine.isDecoding()}")
+
+                if (ok) {
+                    var lastPartial = ""
+                    while (engine.isDecoding() && !isStopped) {
+                        engine.decodeStep()
+                        val partialText = engine.getPartialResult()
+                        if (partialText.isNotEmpty() && partialText != lastPartial) {
+                            lastPartial = partialText
+                            Log.d(TAG, "Qwen3 ASR partial: $partialText")
+                            lifecycleScope.launch {
+                                withContext(Dispatchers.Main) {
+                                    view.updateAsrPartialText(partialText)
+                                }
+                            }
+                        }
+                    }
+                    val text = engine.getResultText()
+                    Log.i(TAG, "Qwen3 ASR final: $text, tokens=${engine.getResult()}")
+                    engine.reset()
+
+                    if (text.isNotEmpty() && !isStopped && !isSpeaking && !isProcessingLlm) {
+                        lifecycleScope.launch {
+                            taskChannel.send(SerialTask.HandleAsrResult(text))
+                        }
+                    } else if (!isStopped) {
+                        // No text produced — restart listening
+                        lifecycleScope.launch {
+                            kotlinx.coroutines.delay(200)
+                            if (!isStopped) startQwen3Record()
+                        }
+                    }
+                } else {
+                    Log.w(TAG, "Qwen3 startDecode failed")
+                    engine.reset()
+                    // Restart listening on decode failure
+                    lifecycleScope.launch {
+                        kotlinx.coroutines.delay(500)
+                        if (!isStopped) startQwen3Record()
+                    }
                 }
             }
         } else {
@@ -651,6 +774,49 @@ class VoiceChatPresenter(
         }
     }
 
+    /**
+     * Write PCM float samples to a WAV file (16-bit mono, 16kHz).
+     * Used by Omni audio mode to save recording for <audio> tag input.
+     */
+    private fun writeWavFile(samples: FloatArray, sampleRate: Int, filePath: String): Boolean {
+        return try {
+            val wavFile = File(filePath)
+            val dataSize = samples.size * 2  // 16-bit = 2 bytes per sample
+            val buffer = ByteBuffer.allocate(44 + dataSize)
+            buffer.order(ByteOrder.LITTLE_ENDIAN)
+
+            // RIFF header
+            buffer.put("RIFF".toByteArray(Charsets.US_ASCII))
+            buffer.putInt(36 + dataSize)       // File size - 8
+            buffer.put("WAVE".toByteArray(Charsets.US_ASCII))
+            // fmt chunk
+            buffer.put("fmt ".toByteArray(Charsets.US_ASCII))
+            buffer.putInt(16)                   // Subchunk1Size (PCM = 16)
+            buffer.putShort(1)                  // Audio format (1 = PCM)
+            buffer.putShort(1)                  // NumChannels (mono)
+            buffer.putInt(sampleRate)           // Sample rate
+            buffer.putInt(sampleRate * 2)       // Byte rate
+            buffer.putShort(2)                  // Block align
+            buffer.putShort(16)                 // Bits per sample
+            // data chunk
+            buffer.put("data".toByteArray(Charsets.US_ASCII))
+            buffer.putInt(dataSize)
+            // PCM float32 → int16
+            for (sample in samples) {
+                val clamped = (sample * 32767f).toInt().coerceIn(-32768, 32767)
+                buffer.putShort(clamped.toShort())
+            }
+
+            FileOutputStream(wavFile).use { it.write(buffer.array()) }
+            val durationSec = "%.1f".format(samples.size.toFloat() / sampleRate)
+            Log.i(TAG, "WAV written: ${wavFile.absolutePath} (${samples.size} samples, ${durationSec}s)")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to write WAV file: ${filePath}", e)
+            false
+        }
+    }
+
     private fun llmGenerate(text: String) {
         lifecycleScope.launch(Dispatchers.IO) {
             Log.d(TAG, "Starting LLM generation... isStopped: $isStopped")
@@ -668,7 +834,7 @@ class VoiceChatPresenter(
     }
 
     private fun stopRecord() {
-        if (isQwen3Mode) {
+        if (asrMode != AsrMode.SHERPA) {
             stopQwen3Record()
         } else {
             if (isRecording) {
@@ -681,7 +847,7 @@ class VoiceChatPresenter(
 
     private fun startRecord() {
         if (!isRecording && !isSpeaking && !isProcessingLlm) {
-            if (isQwen3Mode) {
+            if (asrMode != AsrMode.SHERPA) {
                 startQwen3Record()
             } else {
                 asrService?.startRecord()
@@ -829,10 +995,13 @@ class VoiceChatPresenter(
         
         if (isRecording) {
             try {
-                if (isQwen3Mode) {
+                if (asrMode == AsrMode.QWEN3_OLD) {
                     stopQwen3Record()
                     qwen3AsrEngine?.release()
                     qwen3AsrEngine = null
+                } else if (asrMode == AsrMode.QWEN3_OMNI) {
+                    stopQwen3Record()
+                    omniAudioBuffer.clear()
                 } else {
                     asrService?.stopRecord()
                     asrService = null
@@ -874,12 +1043,13 @@ class VoiceChatPresenter(
     private fun muteMicrophone(mute: Boolean) {
         if (isMuted != mute) {
             isMuted = mute
-            if (!isQwen3Mode) {
+            if (asrMode == AsrMode.SHERPA) {
                 asrService?.setMuted(isMuted)
             }
-            // For Qwen3, isMuted flag is checked directly in processQwen3Samples()
+            // For Qwen3 modes (OLD and OMNI), isMuted flag is checked directly in
+            // processQwen3Samples() — the shared recording loop handles muting via shortBuf.fill(0)
             view.updateMuteButtonState(isMuted)
-            Log.d(TAG, "Microphone mute state changed: $isMuted (qwen3Mode=$isQwen3Mode)")
+            Log.d(TAG, "Microphone mute state changed: $isMuted (asrMode=$asrMode)")
         }
     }
 
@@ -948,15 +1118,18 @@ class VoiceChatPresenter(
                 isGenerationFinished = false
                 
                 // Cleanup existing services
-                if (isQwen3Mode) {
+                if (asrMode == AsrMode.QWEN3_OLD) {
                     stopQwen3Record()
                     qwen3AsrEngine?.release()
                     qwen3AsrEngine = null
-                    isQwen3Mode = false
+                } else if (asrMode == AsrMode.QWEN3_OMNI) {
+                    stopQwen3Record()
+                    omniAudioBuffer.clear()
                 } else {
                     asrService?.stopRecord()
                     asrService = null
                 }
+                asrMode = AsrMode.SHERPA  // Will be re-detected in startAsr()
                 
                 ttsService?.destroy()
                 ttsService = null
