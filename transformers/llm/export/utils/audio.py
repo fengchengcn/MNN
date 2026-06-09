@@ -29,6 +29,7 @@ class Audio(torch.nn.Module):
             'funaudiochat_audio_encoder': FunAudioChatAudio,
             'lfm2_audio': Lfm2Audio,
             'gemma4_audio': Gemma4Audio,
+            'qwen3_asr': Qwen3AsrAudio,
         }
         if model_type in audio_models:
             return audio_models[model_type]
@@ -424,6 +425,109 @@ class Lfm2Audio(Audio):
         model.conformer.set_max_audio_length(5000)
 
         input_features = torch.randn((1, 128, 1000))
+        onnx_model = f'{onnx_path}/audio.onnx'
+        onnx_export(model, (input_features,),
+                    onnx_model,
+                    input_names=['input_features'],
+                    output_names=['audio_embeds'],
+                    dynamic_axes={"input_features": {
+                        2: "size"
+                    }})
+        return onnx_model
+
+
+class Qwen3AsrAudio(Audio):
+    """Audio encoder for Qwen3-ASR (Whisper-style: 3xConv2d + 18xTransformer + Projector).
+
+    HF model: audio_encoder sub-module loaded via trust_remote_code.
+    Input: mel spectrogram [1, 128, T] (whisper_fbank output)
+    Output: audio embeddings [T', 1, 1024]
+    """
+
+    def __init__(self, audio, base):
+        super().__init__(audio, base)
+        self.audio_embeds = None
+        self.audio_pad_id = 151676  # <|audio_pad|>
+        self.sampling_rate = 16000
+        self.feature_size = 128
+        self.n_fft = 400
+        self.hop_length = 160
+        self.quant_bit = 0  # Audio encoder: no quantization (precision-critical)
+
+    def load(self):
+        self.encoder = self.audio.float()
+        self.llm_config['is_audio'] = True
+        self.llm_config['audio_type'] = 'qwen3_asr'
+        self.llm_config['audio_pad'] = self.audio_pad_id
+
+    def forward(self, input_features):
+        return self.encoder(input_features)
+
+    def audio_process(self, audio_obj):
+        import numpy as np
+        waveform = torch.from_numpy(audio_obj).float().unsqueeze(0)
+        window = torch.hann_window(self.n_fft)
+        stft = torch.stft(waveform, self.n_fft, self.hop_length, window=window, return_complex=True)
+        magnitudes = stft[..., :-1].abs() ** 2
+        from transformers.audio_utils import mel_filter_bank
+        mel_filters = torch.from_numpy(
+            mel_filter_bank(
+                num_frequency_bins=1 + self.n_fft // 2,
+                num_mel_filters=self.feature_size,
+                min_frequency=0.0,
+                max_frequency=8000.0,
+                sampling_rate=self.sampling_rate,
+                norm="slaney",
+                mel_scale="slaney",
+            )
+        ).float()
+        mel_spec = mel_filters.T @ magnitudes
+        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+        log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+        log_spec = (log_spec + 4.0) / 4.0
+        audio_embeds = self.forward(log_spec)
+        self.audio_embeds = audio_embeds.permute([1, 0, 2])  # [T, 1, H]
+        return self.audio_embeds.shape[0]
+
+    def str_to_ids(self, prompt):
+        if '<audio>' not in prompt:
+            return self.tokenizer(prompt, return_tensors="pt")['input_ids']
+        import re
+        import librosa
+        pattern = r'(<audio>.*?</audio>)'
+        parts = re.split(pattern, prompt)
+        all_ids = []
+        for part in parts:
+            if re.match(pattern, part):
+                audio_path = re.search(r'<audio>(.*?)</audio>', part).group(1)
+                audio_obj = librosa.load(audio_path, sr=self.sampling_rate)[0]
+                num_tokens = self.audio_process(audio_obj)
+                all_ids.extend([self.audio_pad_id] * num_tokens)
+            else:
+                if part:
+                    ids = self.tokenizer.encode(part, add_special_tokens=False)
+                    all_ids.extend(ids)
+        return torch.tensor([all_ids])
+
+    def embed(self, input_ids, images=None, videos=None):
+        input_embeds = self.embed_(input_ids)
+        if self.audio_embeds is not None:
+            audio_mask = (input_ids == self.audio_pad_id).squeeze()
+            input_embeds[audio_mask] = self.audio_embeds.type(input_embeds.dtype)
+        return input_embeds
+
+    @spinner_run(f'export audio to ')
+    def export(self, onnx_path):
+        class AudioExport(torch.nn.Module):
+            def __init__(self, encoder):
+                super().__init__()
+                self.encoder = encoder
+
+            def forward(self, input_features):
+                return self.encoder(input_features)
+
+        model = AudioExport(self.encoder).float().eval()
+        input_features = torch.randn((1, self.feature_size, 200))
         onnx_model = f'{onnx_path}/audio.onnx'
         onnx_export(model, (input_features,),
                     onnx_model,

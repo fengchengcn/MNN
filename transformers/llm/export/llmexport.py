@@ -78,6 +78,14 @@ class LlmExporter(torch.nn.Module):
             "position_ids" : { 1: "seq_len" },
         }
 
+        # qwen3_asr uses inputs_embeds (audio features + text embeddings merged)
+        if self.model_type == 'qwen3_asr':
+            self.model_dynamic_axes = {
+                "inputs_embeds" : { 0: "seq_len" },
+                "attention_mask" : { 2: "seq_len", 3: "seq_len" },
+                "position_ids" : { 1: "seq_len" },
+            }
+
         self.llm_config = {
             'model_type': self.config.model_type,
             'hidden_size' : self.config.hidden_size,
@@ -344,6 +352,16 @@ class LlmExporter(torch.nn.Module):
                 config['dit_solver'] = 1
             if self.model_type == "gemma3":
                 config.update({'precision': "normal"})
+            if self.model_type == "qwen3_asr":
+                config.update({
+                    'is_audio': True,
+                    'audio_type': 'qwen3_asr',
+                    'audio_model': 'audio.mnn',
+                    'audio_pad': 151676,
+                    'audio_start': 151669,
+                    'audio_end': 151670,
+                    'system_prompt': 'You are a helpful assistant.',
+                })
             if (hasattr(self, 'visual') and self.visual is not None) or (hasattr(self, 'visual') and self.audio is not None):
                 config['mllm'] = {
                     'backend_type': "cpu",
@@ -522,11 +540,13 @@ class LlmExporter(torch.nn.Module):
             return onnx_model
 
         # export to onnx
+        # qwen3_asr uses inputs_embeds (audio features injected externally by C++ engine)
+        first_input_name = 'inputs_embeds' if self.model_type == 'qwen3_asr' else 'input_ids'
         onnx_export(
             model, (input_ids, attention_mask, position_ids, logits_index),
             onnx_model,
             input_names=[
-                'input_ids', 'attention_mask', 'position_ids', 'logits_index'
+                first_input_name, 'attention_mask', 'position_ids', 'logits_index'
             ],
             output_names=output_names,
             dynamic_axes=self.model_dynamic_axes)

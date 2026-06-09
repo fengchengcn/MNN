@@ -54,6 +54,7 @@ class LlmModel(PreTrainedModel):
             'glm_ocr': 'GlmOcrForConditionalGeneration',
             'lfm2_vl': 'Lfm2VlForConditionalGeneration',
             'gemma4': 'Gemma4ForConditionalGeneration',
+            'qwen3_asr': None,   # Sentinel: custom loading via trust_remote_code (AutoModelForCausalLM fallback)
         }
         if model_type is None or model_type not in MODEL_CLASS_MAPPING:
             return AutoModelForCausalLM

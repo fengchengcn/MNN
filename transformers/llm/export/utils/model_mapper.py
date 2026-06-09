@@ -988,6 +988,44 @@ class ModelMapper:
         }
         self.regist('lfm2_vl', lfm2_vl_map)
 
+    def regist_qwen3asr(self):
+        # Qwen3-ASR: audio_encoder + text_decoder in one model
+        # HF config: text_config + audio_config
+        # ModelScope path: Qwen/Qwen3-ASR-0.6B
+        qwen3asr_config = {
+            'hidden_size':    'text_config.hidden_size',
+            'head_dim':       'text_config.head_dim',
+            'num_attention_heads':   'text_config.num_attention_heads',
+            'num_hidden_layers':     'text_config.num_hidden_layers',
+            'num_key_value_heads':   'text_config.num_key_value_heads',
+            'rope_theta':     'text_config.rope_theta',
+            'rope_scaling':   'text_config.rope_scaling',
+            'max_position_embeddings': 'text_config.max_position_embeddings',
+            'attention_type': 'text_config.attention_type',
+        }
+        qwen3asr_model = {
+            'lm':     'lm_head',
+            'embed':  'model.embed_tokens',
+            'blocks': 'model.layers',
+            'final_layernorm': 'model.norm',
+            'audio':  'audio_encoder',
+        }
+        qwen3asr_attention = {
+            'q_proj': 'q_proj',
+            'k_proj': 'k_proj',
+            'v_proj': 'v_proj',
+            'o_proj': 'o_proj',
+            'q_norm': 'q_norm',
+            'k_norm': 'k_norm',
+        }
+        qwen3asr_map = {
+            'config':    qwen3asr_config,
+            'model':     qwen3asr_model,
+            'decoder':   self.default_decoder,
+            'attention': qwen3asr_attention,
+        }
+        self.regist('qwen3_asr', qwen3asr_map)
+
     def regist_lfm2_audio(self):
         # Config fields come directly from the nested 'lfm' config (no prefix needed,
         # because LlmConfig.from_pretrained extracts the nested config for lfm2_audio)
