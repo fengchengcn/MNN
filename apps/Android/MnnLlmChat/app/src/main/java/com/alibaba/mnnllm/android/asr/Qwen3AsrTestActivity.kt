@@ -65,6 +65,8 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     @Volatile private var currentMode = TestMode.BATCH
     private var engine: Qwen3AsrEngine? = null
     private var audioRecord: AudioRecord? = null
+    private var aec: AcousticEchoCanceler? = null
+    private var noiseSuppressor: NoiseSuppressor? = null
     private val isRecording = AtomicBoolean(false)
     private val stoppedByUser = AtomicBoolean(false)
     private var recordingThread: Thread? = null
@@ -580,17 +582,23 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         )
         try {
             if (AcousticEchoCanceler.isAvailable()) {
-                AcousticEchoCanceler.create(audioRecord!!.audioSessionId).enabled = true
+                aec = AcousticEchoCanceler.create(audioRecord!!.audioSessionId)
+                aec?.enabled = true
             }
         } catch (_: Exception) {}
         try {
             if (NoiseSuppressor.isAvailable()) {
-                NoiseSuppressor.create(audioRecord!!.audioSessionId).enabled = true
+                noiseSuppressor = NoiseSuppressor.create(audioRecord!!.audioSessionId)
+                noiseSuppressor?.enabled = true
             }
         } catch (_: Exception) {}
     }
 
     private fun stopAudioHardware() {
+        try { aec?.release() } catch (_: Exception) {}
+        aec = null
+        try { noiseSuppressor?.release() } catch (_: Exception) {}
+        noiseSuppressor = null
         try {
             audioRecord?.stop()
             audioRecord?.release()

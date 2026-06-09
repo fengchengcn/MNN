@@ -47,6 +47,8 @@ class AsrService(
     private val initComplete = CompletableDeferred<Boolean>()
     private var recognizer: OnlineRecognizer? = null
     private var audioRecord: AudioRecord? = null
+    private var aec: AcousticEchoCanceler? = null
+    private var noiseSuppressor: NoiseSuppressor? = null
     private var recordingThread: Thread? = null
     // Use VOICE_COMMUNICATION to enable hardware-level Acoustic Echo Cancellation (AEC)
     private val audioSource = MediaRecorder.AudioSource.VOICE_COMMUNICATION
@@ -117,8 +119,8 @@ class AsrService(
         
         // Initialize and enable Acoustic Echo Canceler (AEC) if supported by the device
         if (AcousticEchoCanceler.isAvailable()) {
-            val echoCanceler = AcousticEchoCanceler.create(audioRecord!!.audioSessionId)
-            echoCanceler.enabled = true
+            aec = AcousticEchoCanceler.create(audioRecord!!.audioSessionId)
+            aec?.enabled = true
             Log.i(TAG, "AcousticEchoCanceler enabled")
         } else {
             Log.w(TAG, "AcousticEchoCanceler not available")
@@ -126,8 +128,8 @@ class AsrService(
 
         // Initialize and enable Noise Suppressor (NS) to reduce background noise
         if (NoiseSuppressor.isAvailable()) {
-            val noiseSuppressor = NoiseSuppressor.create(audioRecord!!.audioSessionId)
-            noiseSuppressor.enabled = true
+            noiseSuppressor = NoiseSuppressor.create(audioRecord!!.audioSessionId)
+            noiseSuppressor?.enabled = true
             Log.i(TAG, "NoiseSuppressor enabled")
         } else {
              Log.w(TAG, "NoiseSuppressor not available")
@@ -235,6 +237,10 @@ class AsrService(
             return
         }
         isRecording.set(false)
+        try { aec?.release() } catch (_: Exception) {}
+        aec = null
+        try { noiseSuppressor?.release() } catch (_: Exception) {}
+        noiseSuppressor = null
         if (audioRecord != null) {
             audioRecord!!.stop()
             audioRecord!!.release()

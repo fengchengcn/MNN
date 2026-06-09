@@ -72,14 +72,16 @@ class VoiceChatPresenter(
     // --- Qwen3-ASR ---
     private var qwen3AsrEngine: Qwen3AsrEngine? = null
     private var qwen3AudioRecord: AudioRecord? = null
+    private var qwen3Aec: AcousticEchoCanceler? = null
+    private var qwen3Ns: NoiseSuppressor? = null
     private var qwen3RecordingThread: Thread? = null
     private var isQwen3Mode = false
     private val qwen3IsRecording = AtomicBoolean(false)
     // Silence-based endpoint detection for Qwen3-ASR
     private var silenceChunkCount = 0
     private var speechDetectedForQwen3 = false
-    private val silenceRmsThreshold = 100.0f   // RMS below this = silence
-    private val speechRmsThreshold = 400.0f    // RMS above this = speech (for interruption)
+    private val silenceRmsThreshold = 100.0f   // RMS on raw int16 PCM below this = silence
+    private val speechRmsThreshold = 400.0f    // RMS on raw int16 PCM above this = speech (for interruption)
     private val maxSilenceChunks = 15           // ~1.5s silence triggers endpoint
     private val qwen3SampleRate = 16000
 
@@ -480,15 +482,15 @@ class VoiceChatPresenter(
         // Try to enable AEC and NS (same as AsrService)
         try {
             if (AcousticEchoCanceler.isAvailable()) {
-                val aec = AcousticEchoCanceler.create(qwen3AudioRecord!!.audioSessionId)
-                aec.enabled = true
+                qwen3Aec = AcousticEchoCanceler.create(qwen3AudioRecord!!.audioSessionId)
+                qwen3Aec?.enabled = true
                 Log.i(TAG, "Qwen3: AEC enabled")
             }
         } catch (_: Exception) {}
         try {
             if (NoiseSuppressor.isAvailable()) {
-                val ns = NoiseSuppressor.create(qwen3AudioRecord!!.audioSessionId)
-                ns.enabled = true
+                qwen3Ns = NoiseSuppressor.create(qwen3AudioRecord!!.audioSessionId)
+                qwen3Ns?.enabled = true
                 Log.i(TAG, "Qwen3: NS enabled")
             }
         } catch (_: Exception) {}
@@ -525,12 +527,12 @@ class VoiceChatPresenter(
                 shortBuf.fill(0)
             }
 
-            // Convert int16 → float32 [-1, 1]
+            // Convert int16 → float32 [-1, 1] (for engine input)
             val floatBuf = FloatArray(ret) { i -> shortBuf[i] / 32768.0f }
 
-            // RMS energy for silence/speech detection
+            // RMS energy for silence/speech detection (on raw int16 PCM, same as Qwen3AsrTestActivity)
             var sumSq = 0.0f
-            for (s in floatBuf) sumSq += s * s
+            for (s in shortBuf) sumSq += (s.toFloat() * s.toFloat())
             val rms = kotlin.math.sqrt(sumSq / ret)
 
             if (rms > speechRmsThreshold) {
@@ -635,6 +637,10 @@ class VoiceChatPresenter(
         if (qwen3IsRecording.get()) {
             qwen3IsRecording.set(false)
             isRecording = false
+            try { qwen3Aec?.release() } catch (_: Exception) {}
+            qwen3Aec = null
+            try { qwen3Ns?.release() } catch (_: Exception) {}
+            qwen3Ns = null
             try {
                 qwen3AudioRecord?.stop()
                 qwen3AudioRecord?.release()

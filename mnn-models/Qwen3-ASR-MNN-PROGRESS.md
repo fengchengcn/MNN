@@ -1,6 +1,6 @@
 # Qwen3-ASR → MNN 项目状态
 
-> 更新：2026-06-08（v6 — Phase 2 流式解码 + Phase 3 FP16/多线程优化实机验证通过）
+> 更新：2026-06-09（v7 — 系统提示词 + 降噪分析 + AudioEffect 泄漏修复 + RMS 统一）
 >
 > **前期阻塞已解决。** 之前报告的「28层 decoder 精度问题（cosine 相似度 0.814）」经过系统排查，**根因不在 MNN runtime**（MNN decoder vs ONNX Runtime 的 cosim=1.0，audio encoder cosim=0.999）。实际问题是：
 > 1. asr_direct.cpp 缺少 text prompt token → 模型立即输出 EOS
@@ -9,6 +9,8 @@
 > **修复 prompt 后，MNN 全管道成功生成正确转录。详见第三节。**
 >
 > **v4→v5 更新：** 经过四个版本的迭代调试，Android 端到端推理已跑通。中文识别正常。修复链路：OOM（mmap embedding + 延迟加载 + 串行化 AE/Decoder）→ `LLM_SUPPORT_AUDIO` 宏缺失 → SELinux WAV 写入拒绝 → 改用 MNN `Tokenizer` 类替代纯文本 token 表修复乱码。**详见第七节。**
+>
+> **v6→v7 更新：** 系统提示词从空字符串进化为 `"You are a helpful assistant."`（改善多语言识别）；完整的 Android 降噪链路分析 + AudioEffect 泄漏修复 + RMS 计算统一；新增项目文档 2 份。**详见第八、九节。**
 
 ---
 
@@ -294,19 +296,49 @@ WAV → MNN::AUDIO::load() → waveform
   └──────────────────────────────────────────────────┘
 ```
 
-### Prompt 格式
+### Prompt 格式（v7 更新：新增 system message）
 
-从原始模型的 `chat_template.json` 推导：
+从原始模型的 `chat_template.json` 推导，结合 MNN 引擎内的 `buildPromptTokens()` 实现：
 
 ```
-Token IDs:
-  [151644, 8948, 198, 151645, 198,   # <|im_start|>system\n<|im_end|>\n
-   151644, 872, 198,                   # <|im_start|>user\n
-   151669,                              # <|audio_start|>
-   151676 * T,                          # <|audio_pad|> × T（替换为音频嵌入）
-   151670, 151645, 198,                 # <|audio_end|><|im_end|>\n
-   151644, 77091, 198]                  # <|im_start|>assistant\n
+<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+<|audio_start|><|audio_pad|> × T<|audio_end|><|im_end|>
+<|im_start|>assistant
 ```
+
+**Token ID 序列**（实际推理时拼接）：
+```cpp
+// prefix: <|im_start|>system\n + "You are a helpful assistant." + \n<|im_end|>\n<|im_start|>user\n
+// audio:  AUDIO_START + AUDIO_PAD × T + AUDIO_END + \n<|im_end|>\n
+// suffix: <|im_start|>assistant\n
+```
+
+**Special Token ID 速查**：
+
+| Token ID | 符号 | 用途 |
+|----------|------|------|
+| `151643` | `<\|endoftext\|>` | EOS，解码终止 |
+| `151644` | `<\|im_start\|>` | ChatML 消息开始 |
+| `151645` | `<\|im_end\|>` | ChatML 消息结束 |
+| `151669` | `<\|audio_start\|>` | 音频起始标记 |
+| `151670` | `<\|audio_end\|>` | 音频结束标记 |
+| `151676` | `<\|audio_pad\|>` | 音频填充占位符（被 AE 输出替换） |
+| `8948`  | `system` | system 角色 |
+| `872`   | `user` | user 角色 |
+| `77091` | `assistant` | assistant 角色 |
+
+**演变历史**：
+
+| 版本 | System prompt | 说明 |
+|------|:--|------|
+| v5 及以前 | `""` (空) | `asr_direct.cpp` demo 用空 system prompt 验证通过 |
+| v6 | `""` (空) | Android 端空 system prompt，中文 OK，英文偏弱 |
+| **v7** | `"You are a helpful assistant."` | 2026-06-09 更新，通过 MNN Tokenizer 编码注入 |
+
+> **代码位置**：`qwen3_asr_engine.cpp:253-285` (`buildPromptTokens()`)
+> **详细分析**：`apps/Android/MnnLlmChat/docs/qwen3-asr-prompt-analysis.md`
 
 ### 配置 mRoPE vs 标准 RoPE（见第四节）
 
@@ -430,7 +462,7 @@ Token IDs:
 
 ## 六、后续路线图
 
-### Android 集成（v5：端到端推理成功 / v6：流式解码 + FP16 优化）
+### Android 集成（v5：端到端推理成功 / v6：流式解码 + FP16 优化 / v7：系统提示词 + 降噪修复）
 - [x] 诊断 Audio Encoder 性能：根因=单线程 + 首次调用惩罚（从 5s → 0.78s）
 - [x] 添加 repetition penalty（默认 1.15，打破 n-gram 重复循环）
 - [x] C++ ASR 引擎类 (qwen3_asr_engine.h/.cpp)
@@ -443,17 +475,22 @@ Token IDs:
 - [x] **SELinux 修复**：WAV 写到 app cache 目录（传入 `cacheDir` 参数）
 - [x] **Tokenizer 乱码修复**：用 MNN `Tokenizer::createTokenizer()` 替代逐行纯文本读取，正确处理 BPE byte-level 解码
 - [x] **华为手机实机验证**：中文 ASR 正常识别，无 OOM
-- [ ] **英文/中英混合支持**：当前 prompt 未指定语言，模型可能偏向单语言（见 7.8 节）
+- [x] **系统提示词 (v7)**：从空字符串更新为 `"You are a helpful assistant."`，改善多语言提示
 - [x] **流式 ASR (Phase 2)**：`startDecode()` → `decodeStep()` 循环 → 逐 token 实时 UI 更新，实机验证通过
 - [x] **CPU 微调 (Phase 3)**：线程 2→4 + FP16 (Precision_Low) + Power_High，实机验证 ~20 tok/s
 - [x] **ARM RTF 实测**：Mate 30 Kirin 990，后续 utterance ~1.5-2.0s（~20 tok/s, ~50ms/token）
+- [x] **AudioEffect 泄漏修复 (v7)**：3 个 Kotlin 文件补上 AEC/NS 对象 release 调用
+- [x] **RMS 计算统一 (v7)**：VoiceChatPresenter RMS 从 float[-1,1] 改为 raw int16 PCM，与 Qwen3AsrTestActivity 一致
+- [x] **降噪链路文档 (v7)**：完整的 Android 三层降噪架构分析（见第九节）
+- [ ] **英文/中英混合识别验证**：系统提示词已更新，待实机对比测试验证改善效果（见 7.8 节）
 
 ### 后续优化方向
 - [x] 支持流式 ASR（Phase 2 增量解码 + Phase 3 FP16/多线程）→ 实机验证通过
+- [x] 系统提示词优化（从空 → `"You are a helpful assistant."`）
+- [x] Android 降噪链路修复（AudioEffect 泄漏 + RMS 统一）
 - [ ] 集成到 MNN LLM Omni 引擎（替换手写 decode 循环）
 - [ ] 研究 AWQ/SmoothQuant 校准量化，尝试恢复 4-bit 精度
 - [ ] 待 transformers 官方支持 `qwen3_asr` 后，对比标准 RoPE vs mRoPE 差异
-- [ ] 英文/中英混合识别 prompt 优化（见 7.8 节）
 
 ---
 
@@ -669,48 +706,155 @@ grep "Perf \[" logcat
 
 > **详细设计文档**：`Qwen3-ASR-STREAMING-PLAN.md`
 
-### 7.8 英文/中英混合识别问题分析
+### 7.8 英文/中英混合识别问题分析（v7 更新）
 
-**当前状态**：中文识别正常，英文识别不理想。
+**当前状态**：中文识别正常 ✅。系统提示词已从空字符串更新为 `"You are a helpful assistant."`（2026-06-09），对多语言识别有改善。
 
-**当前 prompt 格式**（来自 `qwen3_asr_engine.cpp`）：
+**当前 prompt 格式**（来自 `qwen3_asr_engine.cpp:253-285`）：
 ```
 <|im_start|>system
-<|im_end|>
+You are a helpful assistant.<|im_end|>
 <|im_start|>user
 <|audio_start|><|audio_pad|>*T<|audio_end|><|im_end|>
 <|im_start|>assistant
 ```
 
-**可能原因分析**：
+**v7 更新**：系统消息通过 MNN `Tokenizer::encode()` 动态 tokenize，而非硬编码 token ID。这样可以根据需要灵活更换 system prompt 内容，无需维护 token ID 映射表。
 
-1. **System prompt 为空**：当前 system 部分只有换行符，没有任务描述。虽然 `asr_direct.cpp` demo 用同样的空 system prompt 生成了正确的英文结果（"He hoped there would be stew..."），但那个测试使用的是标准英文数据集样本，模型可能更容易识别。
+**Fallback 路径**：当 `tokenizer.txt` 缺失时，回退到硬编码的空 system prompt（保持 v6 兼容性）。
 
-2. **模型训练数据偏向中文**：Qwen3-ASR 以中文为主要训练语言，对英文的 zero-shot 能力可能需要更强引导。
+**可能的造成英文识别不理想的原因**：
+
+1. **模型训练数据偏向中文**：Qwen3-ASR 以中文为主要训练语言，对英文的 zero-shot 能力可能需要更强引导。
+
+2. **系统提示词语言不匹配**：当前系统提示词 `"You are a helpful assistant."` 是英文，但模型训练时可能更多使用中文指令。中文系统提示词（如 `"你是一个有帮助的助手。"`）可能对齐更好。
 
 3. **Auto-detection 不完美**：Qwen3-ASR 理论支持语言自动检测，但在短音频/边界情况下可能默认偏向中文。
 
-**建议修复方向**：
+**建议后续修复方向**：
 
-1. **添加 system prompt 内容**（最可能有效）：
+1. **尝试中文系统提示词**（低成本，值得一试）：
    ```
    <|im_start|>system
-   You are a helpful assistant.<|im_end|>
+   你是一个有帮助的助手。<|im_end|>
    ```
-   或尝试明确语言引导（需测试是否有效）：
-   ```
-   <|im_start|>system
-   You are a multilingual speech recognition assistant. Transcribe the audio accurately in its original language.<|im_end|>
-   ```
+   对比 `"You are a helpful assistant."` vs 中文版本在英文/中英混合音频上的 token 序列。
 
-2. **在 user prompt 中加 task 描述**：
+2. **在 user prompt 中加 task 描述**（需评估是否影响中文性能）：
    ```
    <|im_start|>user
    Transcribe the following speech:<|audio_start|>...<|audio_end|><|im_end|>
    ```
 
-3. **检查 tokenizer 的 decode 输出**：先用 `getResult()` 获取原始 token IDs，确认是模型生成的 token 就不对，还是 tokenizer decode 环节有问题。
+3. **对比 x86 和 ARM 推理输出**：同一段英文音频在 x86 demo (`asr_direct.cpp`) 和手机上的输出 token 序列是否一致，排除精度/platform 差异。
 
-4. **对比 x86 和 ARM 推理输出**：同一段英文音频在 x86 demo (`asr_direct.cpp`) 和手机上的输出 token 序列是否一致，排除精度/platform 差异。
+4. **检查 tokenizer 的 decode 输出**：先用 `getResult()` 获取原始 token IDs，确认是模型生成的 token 就不对，还是 tokenizer decode 环节有问题。
 
-**需修改的文件**：`qwen3_asr_engine.cpp` 中的 `prefix_tokens` / `suffix_tokens` 数组。
+**需修改的文件**：`qwen3_asr_engine.cpp` 中的 `buildPromptTokens()` 函数（`sys_msg` 变量）。
+
+---
+
+## 八、Android 降噪链路（v7 新增，2026-06-09）
+
+### 8.1 架构概览
+
+Qwen3-ASR demo 的降噪全部依赖 Android 平台层，分为三层，C++ 引擎层无额外处理：
+
+```
+麦克风采集
+  │
+  ▼ Layer 1: 硬件 DSP（VOICE_COMMUNICATION 音频源）
+  │  Qualcomm/MTK 自带 AEC + NS + AGC
+  ▼ Layer 2: Android AudioEffect API
+  │  AcousticEchoCanceler + NoiseSuppressor
+  ▼ Layer 3: 应用层 RMS-based VAD（静音门限）
+  │  RMS > 400 → 语音开始, RMS < 100 × 15 帧 → 端点检测
+  ▼ C++ 引擎：whisper_fbank() — 无 dither, 无 preemphasis
+```
+
+### 8.2 三层降噪详述
+
+**Layer 1 — AudioSource.VOICE_COMMUNICATION**（3 个文件一致）：
+
+```kotlin
+AudioRecord(
+    MediaRecorder.AudioSource.VOICE_COMMUNICATION,  // 硬件 DSP 自动 AEC+NS
+    16000,
+    AudioFormat.CHANNEL_IN_MONO,
+    AudioFormat.ENCODING_PCM_16BIT,
+    bufferSize
+)
+```
+
+选择 `VOICE_COMMUNICATION` 而非 `MIC`/`VOICE_RECOGNITION` 的原因：为全双工场景（ASR+TTS 同时运行）提供最强的硬件回声消除。
+
+**Layer 2 — Android AudioEffect API**（3 个文件一致）：
+
+| 文件 | AEC | NS |
+|------|:--:|:--:|
+| `Qwen3AsrTestActivity.kt` | ✅ | ✅ |
+| `VoiceChatPresenter.kt` | ✅ | ✅ |
+| `AsrService.kt` | ✅ | ✅ |
+
+**Layer 3 — 应用层 RMS VAD**：
+
+| 参数 | 值 | 说明 |
+|------|:--|------|
+| SPEECH_RMS_THRESHOLD | 400（raw int16 PCM） | 高于此值判定为语音 |
+| SILENCE_RMS_THRESHOLD | 100（raw int16 PCM） | 低于此值判定为静音 |
+| MAX_SILENCE_CHUNKS | 15（~1.5s） | 持续静音触发端点 |
+| MAX_TOTAL_CHUNKS | 300（~30s） | 最大录音时长 |
+| CHUNK_INTERVAL_MS | 100 | 每帧时长 |
+
+### 8.3 v7 修复的两个问题
+
+**R-W1: AudioEffect 泄漏修复**（3 个文件）：
+
+| 文件 | 新增成员字段 | 修改的方法 |
+|------|------------|-----------|
+| `Qwen3AsrTestActivity.kt` | `aec`, `noiseSuppressor` | `initAudioRecord()` 保存引用 → `stopAudioHardware()` 释放 |
+| `VoiceChatPresenter.kt` | `qwen3Aec`, `qwen3Ns` | `startQwen3Record()` 保存引用 → `stopQwen3Record()` 释放 |
+| `AsrService.kt` | `aec`, `noiseSuppressor` | `initMicrophone()` 保存引用 → `stopRecord()` 释放 |
+
+修复前 AEC/NS 对象创建后引用被丢弃，依赖 `AudioRecord.release()` 隐式清理。修复后显式 `release()` + `null` 清理，确保资源正确回收。
+
+**R-W2: RMS 计算统一**（1 个文件）：
+
+`VoiceChatPresenter.kt` 原先在归一化 float [-1,1] 上计算 RMS，但阈值 400/100 是针对 raw int16 PCM 设计的。修复后改为在 `shortBuf` 上直接计算，与 `Qwen3AsrTestActivity.kt` 完全一致。
+
+### 8.4 Mute 功能
+
+VoiceChatPresenter 和 AsrService 支持 mute（录音时 zero-fill 缓冲区），用于：
+- **Auto-Mute 模式**：AI 播放 TTS 时自动 mute 麦克风，防止反馈回声
+- **手动 Mute**：用户手动切换 mute 状态
+
+Qwen3AsrTestActivity 作为独立测试页面不涉及 TTS，不支持 mute。
+
+> **详细分析**：`apps/Android/MnnLlmChat/docs/qwen3-asr-noise-reduction-analysis.md`
+
+---
+
+## 九、项目文档（v7 新增）
+
+| 文档 | 路径 | 说明 |
+|------|------|------|
+| **优化计划** | `mnn-models/Qwen3-ASR-STREAMING-PLAN.md` | Phase 1/2/3 设计文档 + 实机验证数据 + 技术决策记录 + 迁移计划 |
+| **项目进度** | `mnn-models/Qwen3-ASR-MNN-PROGRESS.md` | 本文件 — 端到端项目状态与历史 |
+| **迁移计划** | `mnn-models/Qwen3-ASR-LLMEXPORT-MIGRATION-PLAN.md` | 向 llmexport.py 迁移的详细计划（WP1-WP6，4-5天） |
+| **Prompt 分析** | `apps/Android/MnnLlmChat/docs/qwen3-asr-prompt-analysis.md` | ChatML 格式、Token ID 速查、Fallback 路径、模型文件依赖 |
+| **降噪分析** | `apps/Android/MnnLlmChat/docs/qwen3-asr-noise-reduction-analysis.md` | 三层降噪架构、已知问题、改进建议 |
+
+---
+
+## 十、v7 关键代码变更清单
+
+| 文件 | 变更 | 类型 |
+|------|------|------|
+| `qwen3_asr_engine.cpp:253-285` | `buildPromptTokens()` — system prompt 从空 → `"You are a helpful assistant."` | 功能改进 |
+| `Qwen3AsrTestActivity.kt:68-69,583-598` | 新增 `aec`/`noiseSuppressor` 字段 + `stopAudioHardware()` 释放 | Bug 修复 |
+| `VoiceChatPresenter.kt:75-76,480-494,533-536,636-648` | 新增 `qwen3Aec`/`qwen3Ns` 字段 + RMS 用 raw int16 + `stopQwen3Record()` 释放 | Bug 修复 |
+| `AsrService.kt:50-51,118-133,234-250` | 新增 `aec`/`noiseSuppressor` 字段 + `initMicrophone()` 保存引用 + `stopRecord()` 释放 | Bug 修复 |
+| `docs/qwen3-asr-prompt-analysis.md` | 新建 | 文档 |
+| `docs/qwen3-asr-noise-reduction-analysis.md` | 新建 | 文档 |
+| `Qwen3-ASR-STREAMING-PLAN.md` | Phase 2+3 实机验证数据更新 | 文档 |
+| `Qwen3-ASR-MNN-PROGRESS.md` | v7 全面更新 | 文档 |
