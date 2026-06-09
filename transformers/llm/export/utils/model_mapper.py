@@ -989,26 +989,27 @@ class ModelMapper:
         self.regist('lfm2_vl', lfm2_vl_map)
 
     def regist_qwen3asr(self):
-        # Qwen3-ASR: audio_encoder + text_decoder in one model
-        # HF config: text_config + audio_config
+        # Qwen3-ASR: audio_tower + text_decoder wrapped under 'thinker'
+        # HF config: thinker_config.text_config + thinker_config.audio_config
+        # State dict: thinker.model.embed_tokens, thinker.lm_head, thinker.audio_tower.*
         # ModelScope path: Qwen/Qwen3-ASR-0.6B
         qwen3asr_config = {
-            'hidden_size':    'text_config.hidden_size',
-            'head_dim':       'text_config.head_dim',
-            'num_attention_heads':   'text_config.num_attention_heads',
-            'num_hidden_layers':     'text_config.num_hidden_layers',
-            'num_key_value_heads':   'text_config.num_key_value_heads',
-            'rope_theta':     'text_config.rope_theta',
-            'rope_scaling':   'text_config.rope_scaling',
-            'max_position_embeddings': 'text_config.max_position_embeddings',
-            'attention_type': 'text_config.attention_type',
+            'hidden_size':    'thinker_config.text_config.hidden_size',
+            'head_dim':       'thinker_config.text_config.head_dim',
+            'num_attention_heads':   'thinker_config.text_config.num_attention_heads',
+            'num_hidden_layers':     'thinker_config.text_config.num_hidden_layers',
+            'num_key_value_heads':   'thinker_config.text_config.num_key_value_heads',
+            'rope_theta':     'thinker_config.text_config.rope_theta',
+            'rope_scaling':   'thinker_config.text_config.rope_scaling',
+            'max_position_embeddings': 'thinker_config.text_config.max_position_embeddings',
+            'attention_type': 'thinker_config.text_config.attention_type',
         }
         qwen3asr_model = {
-            'lm':     'lm_head',
-            'embed':  'model.embed_tokens',
-            'blocks': 'model.layers',
-            'final_layernorm': 'model.norm',
-            'audio':  'audio_encoder',
+            'lm':     'thinker.lm_head',
+            'embed':  'thinker.model.embed_tokens',
+            'blocks': 'thinker.model.layers',
+            'final_layernorm': 'thinker.model.norm',
+            'audio':  'thinker.audio_tower',
         }
         qwen3asr_attention = {
             'q_proj': 'q_proj',
