@@ -289,14 +289,18 @@ const MNN::Transformer::LlmContext * LlmSession::Response(const std::string &pro
     history_.emplace_back("user", getUserString(prompt.c_str(), false, is_r1_));
 #endif
     MNN_DEBUG("submitNative history count %zu", history_.size());
-    
+
     // Generate full prompt string using Prompt::applyTemplate
+    // Skip history_[0] (system prompt) — the engine's apply_chat_template() injects
+    // the system prompt from config. Including it here would duplicate the system
+    // prompt inside the user message, confusing multimodal ASR models.
+    prompt_string_for_debug.clear();
     std::string full_prompt_text;
-    for (auto & it : history_) {
-        full_prompt_text += it.second;
-        prompt_string_for_debug += it.second;
+    for (size_t i = 1; i < history_.size(); i++) {
+        full_prompt_text += history_[i].second;
+        prompt_string_for_debug += history_[i].second;
     }
-    
+
     MNN_DEBUG("submitNative prompt_string_for_debug count %s max_new_tokens_:%d", prompt_string_for_debug.c_str(), max_new_tokens_);
     
     // Check for multimodal content in the full prompt
