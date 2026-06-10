@@ -7,6 +7,7 @@
 #include <chrono>
 #include "nlohmann/json.hpp"
 #include "llm/llm.hpp"
+#include "MNN/expr/Expr.hpp"
 
 // Forward declarations for JNI types
 #ifdef __cplusplus
@@ -46,6 +47,15 @@ public:
     void updateConfig(const std::string& config_json);
 
     void enableAudioOutput(bool b);
+
+    /**
+     * Set pending audio waveform data for the next multimodal inference call.
+     * The waveform is consumed once in Response() / ResponseWithHistory() and then cleared.
+     * @param samples  Float PCM samples in [-1.0, 1.0]
+     * @param num_samples  Number of samples
+     * @param sample_rate  Sample rate in Hz (e.g., 16000)
+     */
+    void SetPendingAudio(const float* samples, int num_samples, int sample_rate);
 
     // 新增：API服务历史消息推理方法
     const MNN::Transformer::LlmContext *
@@ -155,6 +165,8 @@ private:
     json current_config_{};
     bool enable_audio_output_{false};
     std::string last_load_error_{};
+    MNN::Express::VARP pending_audio_{nullptr};
+    int pending_audio_sample_rate_{16000};
 };
 }
 

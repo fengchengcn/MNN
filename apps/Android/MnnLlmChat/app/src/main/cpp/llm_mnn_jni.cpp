@@ -477,6 +477,21 @@ Java_com_alibaba_mnnllm_android_llm_LlmSession_updateMaxNewTokensNative(JNIEnv *
     }
 
 }
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_alibaba_mnnllm_android_llm_LlmSession_setAudioDataNative(
+        JNIEnv *env, jobject thiz, jlong llmPtr, jfloatArray samples, jint sampleRate) {
+
+    auto *llm = reinterpret_cast<mls::LlmSession *>(llmPtr);
+    if (!llm || !samples) return;
+
+    jsize len = env->GetArrayLength(samples);
+    jfloat *data = env->GetFloatArrayElements(samples, nullptr);
+    llm->SetPendingAudio(data, len, sampleRate);
+    env->ReleaseFloatArrayElements(samples, data, JNI_ABORT);
+}
+
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_alibaba_mnnllm_android_llm_LlmSession_updateSystemPromptNative(JNIEnv *env, jobject thiz,

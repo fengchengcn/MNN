@@ -271,6 +271,16 @@ class LlmSession (
         }
     }
 
+    /**
+     * Set pending audio waveform data for the next inference call.
+     * Bypasses WAV file I/O by passing PCM float samples directly to the Omni engine.
+     * @param samples Float PCM samples in [-1.0, 1.0]
+     * @param sampleRate Sample rate in Hz (e.g., 16000)
+     */
+    fun setAudioData(samples: FloatArray, sampleRate: Int) {
+        setAudioDataNative(nativePtr, samples, sampleRate)
+    }
+
     fun updateMaxNewTokens(maxNewTokens: Int) {
         updateMaxNewTokensNative(nativePtr, maxNewTokens)
     }
@@ -295,6 +305,8 @@ class LlmSession (
 
     private external fun updateEnableAudioOutputNative(llmPtr: Long, enable: Boolean)
 
+
+    private external fun setAudioDataNative(llmPtr: Long, samples: FloatArray, sampleRate: Int)
 
     private external fun updateMaxNewTokensNative(llmPtr: Long, maxNewTokens: Int)
 

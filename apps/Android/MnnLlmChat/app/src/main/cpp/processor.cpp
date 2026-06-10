@@ -57,17 +57,19 @@ PromptProcessingResult PromptProcessor::Process(const std::string& prompt_text) 
     ProcessorState state;
     state.final_prompt = prompt_text;
 
-    if (prompt_text.find("<img>") == std::string::npos && prompt_text.find("<video>") == std::string::npos) {
+    if (prompt_text.find("<img>") == std::string::npos && prompt_text.find("<video>") == std::string::npos && prompt_text.find("<audio>") == std::string::npos) {
         return result;
     }
 
     bool has_images = false;
     bool has_videos = false;
+    bool has_audios = false;
 
     has_images = HandleImageTags(prompt_text, result, state);
     has_videos = HandleVideoTags(prompt_text, result, state);
+    has_audios = HandleAudioTags(prompt_text, result, state);
 
-    result.has_multimodal = (has_images || has_videos) && (state.successful_loads > 0);
+    result.has_multimodal = (has_images || has_videos || has_audios) && (state.successful_loads > 0);
     result.multimodal_prompt.prompt_template = state.final_prompt;
 
     if (result.has_multimodal) {
@@ -193,6 +195,37 @@ bool PromptProcessor::HandleVideoTags(const std::string& prompt_text,
     }
 
     return has_videos;
+}
+
+bool PromptProcessor::HandleAudioTags(const std::string& prompt_text,
+                                       PromptProcessingResult& result,
+                                       ProcessorState& state) const {
+    bool has_audios = false;
+
+    std::regex audio_regex("<audio>([^<]*)</audio>");
+    std::smatch match;
+    auto search_start = prompt_text.cbegin();
+
+    while (std::regex_search(search_start, prompt_text.cend(), match, audio_regex)) {
+        std::string audio_path = match[1].str();
+        if (!audio_path.empty()) {
+            MNN_DEBUG("Found audio tag with path: %s", audio_path.c_str());
+
+            // Use the tag content itself as the key (e.g., file path or "stream")
+            // so Omni engine's audios.find(content) matches correctly.
+            std::string audio_key = audio_path;
+            MNN::Transformer::PromptAudioPart audio_part;
+            audio_part.file_path = audio_path;
+            result.multimodal_prompt.audios[audio_key] = audio_part;
+            has_audios = true;
+            state.image_index++;
+            state.successful_loads++;
+            MNN_DEBUG("Registered audio: %s as %s", audio_path.c_str(), audio_key.c_str());
+        }
+        search_start = match.suffix().first;
+    }
+
+    return has_audios;
 }
 
 } // namespace mls

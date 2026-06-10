@@ -301,6 +301,14 @@ const MNN::Transformer::LlmContext * LlmSession::Response(const std::string &pro
     
     // Check for multimodal content in the full prompt
     auto multimodal_result = processMultimodalPrompt(full_prompt_text);
+    // Inject pending audio waveform into multimodal audios, bypassing file I/O
+    if (multimodal_result.has_multimodal && pending_audio_.get() != nullptr) {
+        for (auto& [key, part] : multimodal_result.multimodal_prompt.audios) {
+            part.waveform = pending_audio_;
+            MNN_DEBUG("Response: Injected pending_audio_ into audios[%s]", key.c_str());
+        }
+        pending_audio_ = nullptr;  // single-use consumption
+    }
     restoreAndroidSteppingStatusIfNeeded(llm_);
     if (multimodal_result.has_multimodal) {
         MNN_DEBUG("Detected multimodal content, using multimodal API prompt %s with %zu images",
@@ -446,6 +454,13 @@ void LlmSession::enableAudioOutput(bool enable) {
     enable_audio_output_ = enable;
 }
 
+void LlmSession::SetPendingAudio(const float* samples, int num_samples, int sample_rate) {
+    pending_audio_ = MNN::Express::_Input({1, num_samples}, MNN::Express::NCHW, halide_type_of<float>());
+    ::memcpy(pending_audio_->writeMap<float>(), samples, num_samples * sizeof(float));
+    pending_audio_sample_rate_ = sample_rate;
+    MNN_DEBUG("SetPendingAudio: %d samples, %d Hz", num_samples, sample_rate);
+}
+
 const MNN::Transformer::LlmContext * LlmSession::ResponseWithHistory(
         const std::vector<PromptItem>& full_history,
         const std::function<bool(const std::string&, bool is_eop)>& on_progress) {
@@ -505,6 +520,14 @@ const MNN::Transformer::LlmContext * LlmSession::ResponseWithHistory(
     
     // Check for multimodal content in the full prompt
     auto multimodal_result = processMultimodalPrompt(full_prompt_text);
+    // Inject pending audio waveform into multimodal audios, bypassing file I/O
+    if (multimodal_result.has_multimodal && pending_audio_.get() != nullptr) {
+        for (auto& [key, part] : multimodal_result.multimodal_prompt.audios) {
+            part.waveform = pending_audio_;
+            MNN_DEBUG("ResponseWithHistory: Injected pending_audio_ into audios[%s]", key.c_str());
+        }
+        pending_audio_ = nullptr;  // single-use consumption
+    }
     restoreAndroidSteppingStatusIfNeeded(llm_);
     if (multimodal_result.has_multimodal) {
         MNN_DEBUG("ResponseWithHistory: Detected multimodal content, using multimodal API");

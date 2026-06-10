@@ -24,16 +24,25 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.alibaba.mnnllm.android.R
 import androidx.lifecycle.lifecycleScope
+import com.alibaba.mnnllm.android.llm.ChatService
+import com.alibaba.mnnllm.android.llm.GenerateProgressListener
+import com.alibaba.mnnllm.android.llm.LlmSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.File
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.sqrt
 
-enum class TestMode { BATCH, STREAMING }
+enum class TestMode { BATCH, STREAMING, OMNI }
 
 class Qwen3AsrTestActivity : AppCompatActivity() {
 
@@ -53,6 +62,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     // ── UI ──
     private lateinit var chipBatch: TextView
     private lateinit var chipStreaming: TextView
+    private lateinit var chipOmni: TextView
     private lateinit var btnRecord: TextView
     private lateinit var tvStatus: TextView
     private lateinit var tvEmptyResults: TextView
@@ -64,6 +74,8 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     // ── State ──
     @Volatile private var currentMode = TestMode.BATCH
     private var engine: Qwen3AsrEngine? = null
+    private var llmSession: LlmSession? = null          // Omni path
+    private var omniModelDir: String? = null             // Omni model config directory
     private var audioRecord: AudioRecord? = null
     private var aec: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
@@ -73,10 +85,11 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     private var resultCardCount = 0
     private val timeFormatter = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
-    // ── Streaming state (accessed from recording thread + main thread) ──
+    // ── Streaming / Omni state ──
     @Volatile private var silenceChunkCount = 0
     @Volatile private var speechDetected = false
     @Volatile private var currentRms = 0f
+    private val omniAudioBuffer = mutableListOf<Float>()  // Omni: accumulate PCM float samples
 
     // ── Blink animation ──
     private var blinkAnimation: AlphaAnimation? = null
@@ -88,6 +101,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         // Bind views
         chipBatch = findViewById(R.id.chipBatch)
         chipStreaming = findViewById(R.id.chipStreaming)
+        chipOmni = findViewById(R.id.chipOmni)
         btnRecord = findViewById(R.id.btnRecord)
         tvStatus = findViewById(R.id.tvStatus)
         tvEmptyResults = findViewById(R.id.tvEmptyResults)
@@ -129,6 +143,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         // Listeners
         chipBatch.setOnClickListener { switchMode(TestMode.BATCH) }
         chipStreaming.setOnClickListener { switchMode(TestMode.STREAMING) }
+        chipOmni.setOnClickListener { switchMode(TestMode.OMNI) }
         btnRecord.setOnClickListener {
             if (isRecording.get()) {
                 stopRecording()
@@ -143,38 +158,83 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     //  Engine Init
     // ══════════════════════════════════════════════
 
+    /**
+     * Scan /data/local/tmp/mnn_models/ for Omni-compatible audio models.
+     * Returns the config directory path if found.
+     */
+    private fun findOmniModel(): String? {
+        val localDir = File("/data/local/tmp/mnn_models")
+        if (!localDir.exists() || !localDir.isDirectory) return null
+        localDir.listFiles()?.forEach { subdir ->
+            if (!subdir.isDirectory) return@forEach
+            val audioMnn = File(subdir, "audio.mnn")
+            val configJson = File(subdir, "config.json")
+            if (audioMnn.exists() && configJson.exists()) {
+                try {
+                    val config = JSONObject(configJson.readText())
+                    if (config.optBoolean("is_audio", false)) {
+                        Log.i(TAG, "Found Omni model: ${subdir.absolutePath}")
+                        return subdir.absolutePath
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+        return null
+    }
+
     private suspend fun initEngine() {
         try {
-            val paths = listOf(
-                "/data/local/tmp/mnn_models/Qwen3-ASR-0.6B",
-                "/data/local/tmp/asr_models"
-            )
-            var modelDir: String? = null
-            for (p in paths) {
-                if (java.io.File(p, "audio_encoder.mnn").exists()) {
-                    modelDir = p
-                    break
-                }
-            }
-            if (modelDir == null) {
+            // ── Omni model detection + loading ──
+            val omniDir = findOmniModel()
+            var omniReady = false
+            if (omniDir != null) {
+                Log.i(TAG, "Omni model dir: $omniDir")
                 withContext(Dispatchers.Main) {
-                    setStatus("ERROR: No model found")
-                    appendSystemMessage("Place model at /data/local/tmp/mnn_models/Qwen3-ASR-0.6B/")
+                    setStatus("Omni model found — loading...")
                 }
-                return
+
+                try {
+                    val configPath = "$omniDir/config.json"
+                    llmSession = ChatService.provide().createLlmSession(
+                        "omni_test",
+                        configPath,
+                        "omni_test_${System.currentTimeMillis()}",
+                        null,          // no history
+                        true,          // supportOmni = true
+                        "cpu"          // backendType
+                    ) as? LlmSession
+                    llmSession?.load()
+                    Log.i(TAG, "Omni LlmSession loaded OK")
+                    omniModelDir = omniDir
+                    omniReady = true
+                    withContext(Dispatchers.Main) {
+                        appendSystemMessage("Omni loaded: $omniDir")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Omni LlmSession load failed", e)
+                    llmSession = null
+                    withContext(Dispatchers.Main) {
+                        appendSystemMessage("Omni load FAILED: ${e.message}")
+                    }
+                }
             }
-            Log.i(TAG, "Using model dir: $modelDir")
-            withContext(Dispatchers.Main) { setStatus("Loading model...") }
 
-            engine = Qwen3AsrEngine()
-            val ok = engine!!.init(modelDir, cacheDir.absolutePath, numThreads = 4)
-
+            // ── Determine final state ──
             withContext(Dispatchers.Main) {
-                if (ok) {
-                    setStatus("Ready — tap REC to start")
+                if (omniReady) {
+                    setStatus("Omni ready — tap REC to test")
+                    chipBatch.visibility = View.GONE
+                    chipStreaming.visibility = View.GONE
+                    chipOmni.visibility = View.VISIBLE
+                    chipOmni.performClick()  // auto-select Omni mode
                     btnRecord.isEnabled = true
                 } else {
-                    setStatus("ERROR: Engine init failed")
+                    setStatus("ERROR: Omni not available")
+                    chipBatch.visibility = View.GONE
+                    chipStreaming.visibility = View.GONE
+                    chipOmni.visibility = View.GONE
+                    appendSystemMessage("Place model at /data/local/tmp/mnn_models/Qwen3-ASR-MNN-INT8/")
+                    appendSystemMessage("Ensure audio.mnn + config.json (is_audio=true) exist")
                     btnRecord.isEnabled = false
                 }
             }
@@ -184,6 +244,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         }
     }
 
+
     // ══════════════════════════════════════════════
     //  Mode Switching
     // ══════════════════════════════════════════════
@@ -191,26 +252,35 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     private fun switchMode(mode: TestMode) {
         if (isRecording.get()) return
         currentMode = mode
+
+        // Reset all chips
+        val dimColor = Color.parseColor("#888899")
+        chipBatch.setBackgroundResource(R.drawable.bg_mode_chip_normal)
+        chipBatch.setTextColor(dimColor)
+        chipStreaming.setBackgroundResource(R.drawable.bg_mode_chip_normal)
+        chipStreaming.setTextColor(dimColor)
+        chipOmni.setBackgroundResource(R.drawable.bg_mode_chip_normal)
+        chipOmni.setTextColor(dimColor)
+
+        btnRecord.text = "REC"
+        btnRecord.setBackgroundResource(R.drawable.bg_rec_button_idle)
+        audioLevelContainer.visibility = View.GONE
+
         when (mode) {
             TestMode.BATCH -> {
                 chipBatch.setBackgroundResource(R.drawable.bg_mode_chip_selected)
                 chipBatch.setTextColor(Color.WHITE)
-                chipStreaming.setBackgroundResource(R.drawable.bg_mode_chip_normal)
-                chipStreaming.setTextColor(Color.parseColor("#888899"))
-                btnRecord.text = "REC"
-                btnRecord.setBackgroundResource(R.drawable.bg_rec_button_idle)
-                audioLevelContainer.visibility = View.GONE
                 setStatus("Batch mode — tap REC to start")
             }
             TestMode.STREAMING -> {
                 chipStreaming.setBackgroundResource(R.drawable.bg_mode_chip_selected)
                 chipStreaming.setTextColor(Color.WHITE)
-                chipBatch.setBackgroundResource(R.drawable.bg_mode_chip_normal)
-                chipBatch.setTextColor(Color.parseColor("#888899"))
-                btnRecord.text = "REC"
-                btnRecord.setBackgroundResource(R.drawable.bg_rec_button_idle)
-                audioLevelContainer.visibility = View.GONE
                 setStatus("Streaming mode — auto endpoint detection")
+            }
+            TestMode.OMNI -> {
+                chipOmni.setBackgroundResource(R.drawable.bg_mode_chip_selected)
+                chipOmni.setTextColor(Color.WHITE)
+                setStatus("Omni mode — LLM-powered ASR (WAV → Omni engine)")
             }
         }
     }
@@ -223,6 +293,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         if (isRecording.get()) return
 
         engine?.reset()
+        omniAudioBuffer.clear()
         isRecording.set(true)
         stoppedByUser.set(false)
         silenceChunkCount = 0
@@ -232,11 +303,13 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         btnRecord.text = "STOP"
         btnRecord.setBackgroundResource(R.drawable.bg_rec_button_active)
 
-        if (currentMode == TestMode.BATCH) {
-            setStatus("● Recording... tap STOP when done")
-        } else {
-            setStatus("● Listening...")
-            tvStatus.startAnimation(blinkAnimation)
+        when (currentMode) {
+            TestMode.BATCH -> setStatus("● Recording... tap STOP when done")
+            TestMode.STREAMING -> {
+                setStatus("● Listening...")
+                tvStatus.startAnimation(blinkAnimation)
+            }
+            TestMode.OMNI -> setStatus("● Recording (Omni)... tap STOP when done")
         }
 
         // Init audio
@@ -266,6 +339,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         val shortBuf = ShortArray(chunkSize)
         var totalChunks = 0
         val isStreaming = (currentMode == TestMode.STREAMING)
+        val isOmni = (currentMode == TestMode.OMNI)
 
         // Read loop
         while (isRecording.get() && audioRecord != null && totalChunks < MAX_TOTAL_CHUNKS) {
@@ -274,7 +348,15 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             if (ret <= 0) continue
 
             val floatBuf = FloatArray(ret) { i -> shortBuf[i] / 32768.0f }
-            engine?.pushAudio(floatBuf)
+
+            if (isOmni) {
+                // Omni mode: collect audio samples for WAV writing
+                synchronized(omniAudioBuffer) {
+                    omniAudioBuffer.addAll(floatBuf.asList())
+                }
+            } else {
+                engine?.pushAudio(floatBuf)
+            }
 
             // RMS on raw int16 values (thresholds are in raw PCM scale)
             var sumSq = 0f
@@ -320,7 +402,22 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         stopAudioHardware()
         isRecording.set(false)
 
-        if (isStreaming) {
+        if (isOmni) {
+            // ── Omni mode: write WAV, send to LlmSession ──
+            val samples = synchronized(omniAudioBuffer) { omniAudioBuffer.toList() }
+            omniAudioBuffer.clear()
+            if (samples.isEmpty()) {
+                runOnUiThread { returnToIdle() }
+                return
+            }
+            runOnUiThread {
+                btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
+                btnRecord.text = "..."
+                btnRecord.isEnabled = false
+                setStatus("Omni: writing WAV + LLM inference...")
+            }
+            processOmniAudio(samples.toFloatArray())
+        } else if (isStreaming) {
             // Decide what to do based on speech and user intent
             if (speechDetected) {
                 runOnUiThread {
@@ -351,6 +448,119 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             engine?.endAudio()
             val text = engine?.getResultText() ?: ""
             runOnUiThread { onBatchResult(text) }
+        }
+    }
+
+    // ══════════════════════════════════════════════
+    // ══════════════════════════════════════════════
+    //  Omni: Write WAV and Send to LlmSession
+    // ══════════════════════════════════════════════
+
+    /** Write 16-bit little-endian short to RandomAccessFile */
+    private fun RandomAccessFile.writeShortLE(value: Int) {
+        val v = value and 0xFFFF
+        write(v and 0xFF)           // low byte first
+        write((v ushr 8) and 0xFF)  // high byte
+    }
+
+    private fun writeWavFile(samples: FloatArray, sampleRate: Int, filePath: String): Boolean {
+        return try {
+            val numChannels = 1
+            val bitsPerSample = 16
+            val byteRate = sampleRate * numChannels * bitsPerSample / 8
+            val blockAlign = numChannels * bitsPerSample / 8
+            val dataSize = samples.size * blockAlign
+            val fileSize = 36 + dataSize
+
+            val file = RandomAccessFile(filePath, "rw")
+            file.setLength(0)
+
+            // RIFF header
+            file.writeBytes("RIFF")
+            file.writeInt(Integer.reverseBytes(fileSize))
+            file.writeBytes("WAVE")
+
+            // fmt subchunk
+            file.writeBytes("fmt ")
+            file.writeInt(Integer.reverseBytes(16))  // subchunk1 size (32-bit)
+            file.writeShortLE(1)   // PCM format (16-bit LE)
+            file.writeShortLE(numChannels)
+            file.writeInt(Integer.reverseBytes(sampleRate))
+            file.writeInt(Integer.reverseBytes(byteRate))
+            file.writeShortLE(blockAlign)
+            file.writeShortLE(bitsPerSample)
+
+            // data subchunk
+            file.writeBytes("data")
+            file.writeInt(Integer.reverseBytes(dataSize))
+
+            // PCM samples (float → int16)
+            val byteBuf = ByteBuffer.allocate(samples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+            for (s in samples) {
+                val intSample = (s * 32767f).toInt().coerceIn(-32768, 32767)
+                byteBuf.putShort(intSample.toShort())
+            }
+            file.write(byteBuf.array())
+            file.close()
+            Log.i(TAG, "WAV written: $filePath (${dataSize} bytes, ${samples.size} samples)")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Error writing WAV: $filePath", e)
+            false
+        }
+    }
+
+    private fun processOmniAudio(samples: FloatArray) {
+        if (llmSession == null) {
+            runOnUiThread {
+                appendSystemMessage("OMNI ERROR: LlmSession not loaded")
+                returnToIdle()
+            }
+            return
+        }
+
+        // Phase 1: Direct PCM path — bypass WAV file I/O
+        llmSession?.setAudioData(samples, SAMPLE_RATE)
+
+        // Use "stream" as the audio tag content — matches the key in processor.cpp
+        val audioTag = "<audio>stream</audio>"
+        Log.i(TAG, "Omni prompt (direct PCM): $audioTag, ${samples.size} samples")
+
+        // Run generate on background thread (it blocks)
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                var fullText = ""
+                val result = llmSession?.generate(audioTag, mapOf(), object : GenerateProgressListener {
+                    override fun onProgress(progress: String?): Boolean {
+                        if (progress != null) {
+                            fullText += progress
+                            Log.d(TAG, "Omni progress: $progress")
+                        }
+                        return false  // don't cancel
+                    }
+                }) ?: emptyMap()
+
+                val response = fullText
+                Log.i(TAG, "Omni result: $response (decode_len=${result["decode_len"]})")
+
+                withContext(Dispatchers.Main) {
+                    if (response.isNotBlank()) {
+                        addResultCard(response)
+                        appendSystemMessage("Omni OK — decode_len=${result["decode_len"]}, " +
+                            "audio_time=${result["audio_time"]}ms, " +
+                            "decode_time=${result["decode_time"]}ms")
+                    } else {
+                        appendSystemMessage("Omni: empty response (check logs)")
+                    }
+                    returnToIdle()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Omni generate error", e)
+                withContext(Dispatchers.Main) {
+                    appendSystemMessage("OMNI ERROR: ${e.message}")
+                    returnToIdle()
+                }
+            }
         }
     }
 
@@ -447,10 +657,10 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         audioLevelContainer.visibility = View.GONE
         tvStatus.clearAnimation()
 
-        if (currentMode == TestMode.BATCH) {
-            setStatus("Ready — tap REC to try again")
-        } else {
-            setStatus("Streaming stopped — tap REC to restart")
+        when (currentMode) {
+            TestMode.BATCH -> setStatus("Ready — tap REC to try again")
+            TestMode.STREAMING -> setStatus("Streaming stopped — tap REC to restart")
+            TestMode.OMNI -> setStatus("Omni ready — tap REC to test")
         }
     }
 
@@ -629,5 +839,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         stopAudioHardware()
         engine?.release()
         engine = null
+        try { llmSession?.release() } catch (_: Exception) {}
+        llmSession = null
     }
 }
