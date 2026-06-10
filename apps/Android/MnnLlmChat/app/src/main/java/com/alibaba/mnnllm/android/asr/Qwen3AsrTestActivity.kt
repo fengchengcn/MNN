@@ -214,6 +214,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                         "cpu"          // backendType
                     ) as? LlmSession
                     llmSession?.load()
+                    llmSession?.setKeepHistory(false)  // ASR: each call independent, no history accumulation
                     Log.i(TAG, "Omni LlmSession loaded OK")
                     omniModelDir = omniDir
                     omniReady = true
