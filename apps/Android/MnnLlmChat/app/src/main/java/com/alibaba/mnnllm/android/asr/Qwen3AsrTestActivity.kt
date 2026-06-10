@@ -592,9 +592,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                     override fun onProgress(progress: String?): Boolean {
                         if (progress != null) {
                             fullText += progress
-                            withContext(Dispatchers.Main) {
-                                updateStreamingResult(fullText)
-                            }
+                            runOnUiThread { updateStreamingResult(fullText) }
                         }
                         return false  // don't cancel
                     }
