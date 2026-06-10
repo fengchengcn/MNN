@@ -79,6 +79,9 @@ set_target_properties(MNN PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libMNN.so")
 add_library(MNN_CL SHARED IMPORTED)
 set_target_properties(MNN_CL PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libMNN_CL.so")
 
+add_library(MNN_Vulkan SHARED IMPORTED)
+set_target_properties(MNN_Vulkan PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libMNN_Vulkan.so")
+
 add_library(MNN_LLM SHARED IMPORTED)
 set_target_properties(MNN_LLM PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libllm.so")
 
@@ -100,6 +103,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
         log
         MNN
         MNN_CL
+        MNN_Vulkan
         MNN_LLM
         MNN_Diffusion  # 加上这个，Diffusion::load() 报错就会消失
         MNN_Express
