@@ -455,8 +455,7 @@ void LlmSession::enableAudioOutput(bool enable) {
 }
 
 void LlmSession::SetPendingAudio(const float* samples, int num_samples, int sample_rate) {
-    pending_audio_ = MNN::Express::_Input({1, num_samples}, MNN::Express::NCHW, halide_type_of<float>());
-    ::memcpy(pending_audio_->writeMap<float>(), samples, num_samples * sizeof(float));
+    pending_audio_ = MNN::Express::_Const(samples, {1, num_samples}, MNN::Express::NCHW, halide_type_of<float>());
     pending_audio_sample_rate_ = sample_rate;
     MNN_DEBUG("SetPendingAudio: %d samples, %d Hz", num_samples, sample_rate);
 }
