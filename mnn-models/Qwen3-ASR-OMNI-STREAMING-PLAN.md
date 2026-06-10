@@ -1,9 +1,10 @@
 # Qwen3-ASR Omni 模式流式实现方案
 
 > 创建：2026-06-10
-> 最后更新：2026-06-10
+> 最后更新：2026-06-11
 > 关联文档：[[Qwen3-ASR-OMNI-PARAMETERS]] [[Qwen3-ASR-MEMORY-ANALYSIS]] [[Qwen3-ASR-STREAMING-PLAN]]（旧引擎方案）
-> 状态：Phase 1 已完成 ✅ | Phase 2 已完成 ✅ | Phase 2.5 (VAD) 已完成 ✅ → 简化为纯 VAD 分段 | Phase 3 已分析（整体成功率 30-40%）
+> 状态：Phase 1 ✅ | Phase 2 ✅ | Phase 2.5 纯VAD分段 ❌→Phase 2.6 VAD引导扩展窗口 ✅ | Phase 3 已分析（30-40%）
+> **关键修正**：Phase 2.5 「纯 VAD 分段」被实机验证推翻。VAD + 扩展窗口是对的正确组合。详见第四章。
 
 ---
 
@@ -417,13 +418,15 @@ You are a helpful assistant.<audio>stream</audio>  ← 仅 1 次，独立推理
 
 ---
 
-## 四-B、Phase 2.5：VAD 优化（工程改进）✅ 已完成 → 简化
+## 四-B、Phase 2.5：VAD 优化 → 误入歧途 ❌
 
 > 实施日期：2026-06-10
 > 目标：无需改动 C++ 引擎，在 Kotlin 层加入 VAD + 分段推理，解决 Phase 2 的核心缺陷
-> 最终方案：**纯 VAD 分段 + 单次推理**（去掉了增量推理，避免设计冲突）
+> 首次方案：纯 VAD 分段 + 单次推理（去掉了增量推理）
+> **实机验证推翻**：纯分段导致上下文断裂，罕见/技术术语识别准确率大幅下降。正确方案是 Phase 2.6 的 VAD 引导扩展窗口。
+> 状态：已被 Phase 2.6 取代 ❌
 
-### 4B.1 Phase 2 缺陷回顾与 VAD 解决方案
+### 4B.1 Phase 2 缺陷回顾与 VAD 初始设想
 
 ```
 Phase 2 缺陷                      VAD 解决方案              效果
@@ -493,7 +496,9 @@ Phase 2 缺陷                      VAD 解决方案              效果
       → 不自动重启
 ```
 
-### 4B.5 实际实施过程与设计冲突发现
+### 4B.5 实施过程（此方案已被推翻，仅供历史参考）⚠️
+
+> **2026-06-11 修正**：下面记录的「纯 VAD 分段」方案在实机测试中暴露出严重精度问题。见新增章节四-C 的正确方案。
 
 **第一阶段：VAD + 增量推理（杂交方案）**
 
@@ -520,7 +525,24 @@ Phase 2（无 VAD）：不知道什么时候说完 → 每 2s 盲推增量 → �
 Phase 2.5（有 VAD）：精确检测"一句话结束" → 一次性扔给 ASR → 增量推理多余且有害
 ```
 
-**第二阶段：简化为纯 VAD 分段 + 单次推理**
+> ⚠️ **2026-06-11 修正**：上面的「根因分析」结论被实机数据推翻。见下方。
+>
+> **被推翻的结论**：
+>> Phase 2（无 VAD）：不知道什么时候说完 → 每 2s 盲推增量 → 滑动窗口是唯一选择
+>> Phase 2.5（有 VAD）：精确检测"一句话结束" → 一次性扔给 ASR → 增量推理多余且有害
+>
+> **为什么错了**：增量推理（扩展窗口）除了解决「何时结束」外，还有一个独立且关键的价值——给 Audio Encoder 提供累积的完整音频上下文。Qwen3-ASR 的 AE 使用 Full Bidirectional Attention，18 层 Transformer 中每一帧 attend 到所有帧。分段独立推理导致段间声学上下文断裂，对罕见/技术术语的识别准确率崩溃。
+>
+> **实机证据**（Kirin 9000 / TAS-AL00，FP16 模型，greedy sampling）：
+> - 朗读：`有 VAD 精确检测"一句话结束" 一次性扔给 ASR 增量推理多余且有害`
+> - 分段 #1 FINAL: `U V D，精确检测，一句话结束`（VAD→UVD 勉强可辨认，其他词基本正确）
+> - 分段 #2 FINAL: `有威力，精确检测，一句话结束，一次性扔个点`（前半句幻觉）
+> - 分段 #3 FINAL: `增量记忆多于现有`（增量推理→增量记忆，多余且有害→多于现有）
+> - **累计准确率 ~30%，远低于 Phase 2 FINAL 的 ~95%**（针对领域术语场景）
+>
+> **正确方案**：Phase 2.6 VAD 引导扩展窗口（见新增章节四-C）。
+
+**第二阶段：简化为纯 VAD 分段 + 单次推理**（已废弃 ❌）
 
 删除所有 Phase 2 增量推理代码（-217 行），只保留 VAD 状态机 + `processSegment()` 单次推理：
 
@@ -627,6 +649,142 @@ VARP audioProcessIncremental(VARP new_waveform, FbankCache& cache) {
 |------|:------|:------|
 | fbank 累计 | ~0.8s (18s 录音) | **~0.5s** |
 | 实现复杂度 | - | ⭐⭐ (1-2 天, C++) |
+
+---
+
+## 四-C、Phase 2.6：VAD 引导扩展窗口 ✅ 当前方案
+
+> 实施日期：2026-06-11
+> 目标：纠正 Phase 2.5 的错误简化，恢复扩展窗口的累积上下文优势，同时保留 VAD 的生命周期控制
+> 状态：✅ 已实施并实机验证
+
+### 4C.1 核心设计思想
+
+**VAD 控制录音生命周期（替代盲推 timer + 手动 STOP），扩展窗口保证推理质量。**
+
+Phase 2 的扩展窗口本质上不是「不知道何时结束的 workaround」——它是一个独立且不可替代的精度保障机制。每次推理将 `[0..current]` 的全部累积音频发送给模型，AE 的 Full Bidirectional Attention 获得完整声学上下文。
+
+Phase 2.5 的错误在于：VAD 解决了「何时结束」，但错误地扔掉了扩展窗口。正确的做法是用 VAD 替换盲推 timer，保留扩展窗口。
+
+### 4C.2 数据流
+
+```
+┌─ VAD 引导的扩展窗口 ──────────────────────────────────────────┐
+│                                                                  │
+│  VAD = SILENCE (等待语音):                                        │
+│    → 环形缓冲保留 1s 上下文                                       │
+│    → 检测到语音 (500ms) → enterSpeakingState()                   │
+│                                                                  │
+│  VAD = SPEAKING (收集中):                                         │
+│    → 从环形缓冲 + 新 chunk 开始累积到 omniAudioBuffer              │
+│    → 1.5s 后首次增量：取全量快照 → 发送到 Channel                  │
+│    → 每 3s 后续增量：取全量快照 → 发送到 Channel                   │
+│      ↑ 扩展窗口：每次发送 [0..current] 的全部音频                  │
+│    → 检查 max_speech_duration (8s 安全网)                         │
+│                                                                  │
+│  VAD 检测到段结束 (600ms 静音) 或 max duration:                    │
+│    → 取消增量 timer                                               │
+│    → 全量快照 → FINAL 推理 → 永久结果卡片 ✅                       │
+│    → 清空 buffer，VAD = SILENCE，准备下一段                        │
+│                                                                  │
+│  [STOP] 按钮:                                                     │
+│    → 取消增量 timer                                               │
+│    → 当前段 FINAL 推理 → returnToIdle                             │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 4C.3 VAD 参数
+
+| 参数 | 值 | 说明 |
+|------|:------|------|
+| `OMNI_SPEECH_RMS` | 0.005 | 语音检测阈值（float PCM） |
+| `OMNI_SILENCE_RMS` | 0.003 | 静音判定阈值 |
+| `OMNI_MIN_SPEECH_FRAMES` | 5 (500ms) | 最短语音长度 |
+| `OMNI_MAX_SILENCE_FRAMES` | **6 (600ms)** | 停顿阈值（Phase 2.5 为 8→800ms） |
+| `OMNI_INCREMENTAL_FIRST_MS` | **1500ms** | 首次增量延迟（语音开始后） |
+| `OMNI_INCREMENTAL_INTERVAL_MS` | **3000ms** | 后续增量间隔 |
+| `OMNI_MAX_SPEECH_DURATION_MS` | **8000ms** | 最大语音时长安全网 |
+
+### 4C.4 并发模型：Channel 串行化
+
+增量和 FINAL 推理共享同一个 `Channel<SegmentTask>`，单 consumer 协程串行处理：
+
+```
+segmentChannel ──────────────────────────────────────────
+  │                    │                    │
+  │  SegmentTask(snap1,│  SegmentTask(snap2,│  SegmentTask(snap3,
+  │    isFinal=false)  │    isFinal=false)  │    isFinal=true)
+  │                    │                    │
+  └─ consumer 串行处理 ──────────────────────────────
+       processSegmentSync(task)
+         → 增量: updateStreamingResult (LIVE 卡片)
+         → FINAL: finalizeStreamingResult (永久卡片)
+```
+
+**并发安全保障**：
+- `scheduleNextIncremental()` / `triggerIncrementalInference()` 在 timer 线程
+- `endCurrentSegment()` 在 recording 线程，取消 timer 后发送 FINAL
+- consumer 在 IO 协程，**所有 `setAudioData()` + `generate()` 调用严格串行**
+- `endCurrentSegment()` guard 改为 `omniVadState != VadState.SPEAKING`，防止同一帧内静音+max-duration 双重触发
+
+### 4C.5 config.json 采样参数修正
+
+Phase 2 发现 INT8 模型对技术术语/罕见词识别极差。根因是采样参数引入随机性：
+
+| 参数 | 修正前 | 修正后 | 理由 |
+|------|:--|:--|:--|
+| `sampler_type` | `"mixed"` | **`"greedy"`** | ASR 是确定性任务，非对话生成 |
+| `temperature` | 0.1 | **0.0** | 罕见 token 置信度仅 ~30-70%，任何非零 temperature 引入的噪声足以偏离正确路径 |
+| `top_k` | 40 | **1** | 关闭 top-k 过滤 |
+| `top_p` | 0.9 | **1.0** | 关闭 nucleus sampling |
+| `min_p` | 0.05 | **0.0** | 关闭最小概率过滤 |
+| `n_gram` | 8 | **0** | 关闭 n-gram 去重（可能误伤低频术语） |
+| `repetition_penalty` | 1.05 | **1.0** | ASR 不需要重复惩罚 |
+
+**效果**：greedy argmax 确保同段音频每次输出一致，消除随机性对低频 token 的伤害。
+
+### 4C.6 FP16 模型支持
+
+`findOmniModel()` 增强为评分制：FP16 > INT8 > 其他。
+
+```kotlin
+val score = when {
+    name.contains("FP16") -> 2
+    name.contains("INT8") -> 1
+    else -> 0
+}
+```
+
+FP16 模型 (`Qwen3-ASR-MNN-FP16`) 特征：
+- `tokenizer_file: "tokenizer.txt"`（非 `.mtok`）
+- `quant_bit: 16`（tie_embeddings）
+- llm.mnn.weight ~1.1GB（INT8 ~600MB）
+- 低频 token embedding 精度损失小
+
+### 4C.7 与 Phase 2 / Phase 2.5 的对比
+
+| 维度 | Phase 2 (盲推) | Phase 2.5 (纯VAD) | Phase 2.6 (VAD+扩展窗口) |
+|------|:---|:---|:---|
+| 语音检测 | 无（盲推 timer） | RMS VAD ✅ | RMS VAD ✅ |
+| 端点检测 | 手动 STOP | VAD 静音 ✅ | VAD 静音 600ms ✅ |
+| 推理窗口 | 扩展窗口 ✅ | 分段独立 ❌ | 扩展窗口 ✅ |
+| 静音时推理 | 浪费 3 次 | 无浪费 ✅ | 无浪费 ✅ |
+| 首次有效结果 | ~6-8s | 段结束即出 | **1.5s**（首次增量） |
+| 中间幻觉 | 严重（短音频） | 无增量 | 早期增量可能有（LIVE 卡片显示，FINAL 修正） |
+| 最终准确率 | 高（FINAL 全量） | 低（上下文断裂）❌ | **高（FINAL 全量）✅** |
+| 罕见/术语识别 | 好（全量上下文） | 差（分段断裂）❌ | **好（全量上下文）✅** |
+| 并发安全 | 增量+FINAL 竞态 | 单次推理 ✅ | Channel 串行 ✅ |
+| 内存占用 | 全量音频快照 | 小段快照 | 全量音频快照（每段 ≤8s） |
+| AE 计算量 | O(N²) 累计 | 低 | 中等（2-3 次增量+FINAL） |
+
+### 4C.8 已知限制
+
+1. **仍为 Full-Attention AE 全量重算**：每次增量重跑全量 fbank+AE，音频越长开销越大。<= 8s 段内可接受（Kirin 9000: ~400-800ms AE + ~1-2s decoder）
+2. **RMS VAD 噪音鲁棒性有限**：安静环境表现好，嘈杂环境可能出现误触发/漏检。可升级为 Silero VAD
+3. **无跨段上下文**：段间独立推理，上一段内容不影响下一段。与 Phase 2.5 相同
+4. **FloatArray 快照拷贝**：8s 录音 ~512KB/次，3-5 次增量+FINAL 总计 ~2MB。测试 App 可接受
+5. **Timer 每次重建**：`scheduleNextIncremental()` 每次 cancel→new Timer。生产环境建议 `ScheduledExecutorService`
 
 ---
 
@@ -1052,40 +1210,44 @@ Phase 3c — 真正的 Causal AE [概率 ~20%，不在当前工程范围]
 
 ---
 
-## 六、性能对比（实机数据：Kirin 9000）
+## 六、性能对比（实机数据：Kirin 9000 / TAS-AL00）
 
-| 指标 | Phase 1 (直传 PCM) | Phase 2 (+伪流式) | Phase 2.5 纯VAD (最终) |
-|------|:-------------------|:------------------|:----------------------|
-| 文件 I/O | **0ms** | **0ms** | **0ms** |
-| VARP 创建 | ~5ms (_Const + memcpy) | ~5ms | ~5ms |
-| fbank+AE (3s 段) | ~500ms | ~170ms (fbank) + ~220ms (AE) | ~400ms（全量，一次性） |
-| fbank+AE (18s 录音) | — | ~2.2s（累计 8 次增量） | **~1.3s**（累计 3-4 段） |
-| 推理次数（18s） | 1 | 8（7 增量 + 1 FINAL） | **3-4**（仅段结束） |
-| 首段结果延迟 | — | ~2s (timer) | **段结束即出**（~600ms 停顿后） |
-| Decode 速度 | — | 30-35 t/s（稳定） | 30-35 t/s（稳定） |
-| 并发风险 | 无 | 增量+FINAL 竞态 | 低（段间可能有竞态，见 4B.7） |
-| 中间结果 | — | 差（短音频→幻觉） | **无中间结果**（只有最终） |
-| 识别准确率（18s 中文） | — | FINAL 几乎完美 | **几乎完美** |
-| 代码量 | 6 文件，~90 行 | 1 文件，+179/-29 行 | **1 文件，1024 行**（-217 vs Phase 2+2.5 杂交） |
+| 指标 | Phase 1 (直传 PCM) | Phase 2 (盲推扩展窗口) | Phase 2.5 纯VAD ❌ | Phase 2.6 VAD+扩展窗口 ✅ |
+|------|:-------------------|:------------------|:----------------------|:-------------------------|
+| 文件 I/O | **0ms** | **0ms** | **0ms** | **0ms** |
+| VARP 创建 | ~5ms (_Const + memcpy) | ~5ms | ~5ms | ~5ms |
+| fbank+AE (3s 段) | ~500ms | ~170ms (fbank) + ~220ms (AE) | ~400ms | ~400ms |
+| fbank+AE (8s 段) | — | ~800ms | — | ~800ms（max duration 触发） |
+| 推理次数（18s 多句） | 1 | 8（7 增量 + 1 FINAL） | 3-4（仅段结束） | **6-8**（每段 1-2 增量 + 1 FINAL） |
+| 首次结果可见 | — | ~6-8s（须跳过前 6s 静音） | 段结束即出 | **~1.5s**（语音开始后首次增量） |
+| Decode 速度 (FP16) | — | 30-35 t/s | 34-37 t/s | **18-22 t/s**（FP16 权重大） |
+| 并发风险 | 无 | 增量+FINAL 竞态 | 低 | **无**（Channel 串行） |
+| 中间结果 | — | 差（短音频幻觉） | 无 | **LIVE 卡片**（增量逐步改善） |
+| 最终准确率（常见口语） | — | 几乎完美 | 好 | **几乎完美** |
+| 最终准确率（罕见/术语） | — | 好（全量上下文） | **差**❌ | **好（全量上下文）✅** |
+| 静音时推理浪费 | — | 有（前 6s 3 次空跑） | 无 | **无** |
+| 代码量 | 6 文件，~90 行 | 1 文件，+179/-29 行 | 1 文件，1024 行 | **1 文件，~1370 行** |
 
 ---
 
 ## 七、风险与缓解
 
-### Phase 1 & 2 & 2.5 风险（已解决或已确认）
+### Phase 1 & 2 & 2.6 风险（已解决或已确认）
 
 | 风险 | 概率 | 缓解措施 |
 |------|:---:|------|
 | ~~`_Input` VARP 跨 RuntimeManager 失效~~ | ~~低~~ | 改用 `_Const` 完全规避 |
 | ~~`_Input`/`_Const` shape 格式不匹配导致 crash~~ | ~~高→已命中~~ | 改为与 `AUDIO::load()` 完全一致的 `{N} NHWC` 格式 |
 | ~~`keepHistory=true` 导致 prompt 污染~~ | ~~高→已命中~~ | `setKeepHistory(false)`，ASR 每次推理独立 |
-| ~~增量+FINAL 并发导致 prompt 污染复活~~ | ~~高→Phase 2.5 首次测试命中~~ | 删除增量推理，纯 VAD 分段单次推理 |
-| `pending_audio_` 生命周期异常 | 低 | `= nullptr` 确保单次消费 |
-| Omni 全量 AE 重跑性能差 | 低→已确认可接受 | 典型段 3-5s，AE 耗时 ~400ms；18s 录音累计 ~1.3s |
-| ~~`audios` key 改为 path 后的兼容性~~ | ~~低~~ | Omni 引擎使用 `find(content)` 自然匹配 |
-| 跨段并发推理（segment N+1 开始时 segment N 推理未完成） | 中 | 需添加 `segmentInferenceInProgress` 防护（Code Review 发现，待提交） |
+| ~~增量+FINAL 并发导致 prompt 污染~~ | ~~高→Phase 2.5 命中~~ | Channel 串行化彻底解决（Phase 2.6） |
+| ~~`endCurrentSegment()` 同一帧双重触发~~ | ~~中→Code Review 发现~~ | Guard 改为 `omniVadState != VadState.SPEAKING` |
+| ~~FINAL 空响应 LIVE 卡片残留~~ | ~~低→Code Review 发现~~ | 空响应时移除 LIVE 卡片 |
+| ~~纯 VAD 分段上下文断裂导致准确率崩溃~~ | ~~高→Phase 2.5 命中~~ | Phase 2.6 恢复扩展窗口 |
+| `pending_audio_` 生命周期异常 | 低 | `= nullptr` 确保单次消费 + Channel 串行 |
+| Omni 全量 AE 重跑（扩展窗口） | 已确认可接受 | 每段 ≤8s，AE ≤800ms；含 2-3 次增量累计 ~2.5s |
+| Timer 每次重建产生 GC 压力 | 低（测试 App） | 生产环境改用 `ScheduledExecutorService` |
 | RMS 能量 VAD 在噪音环境下准确率不足 | 中 | 可升级为 Silero VAD（sherpa-onnx） |
-| 无中间结果反馈（纯分段模式） | 低→已接受 | 段结束即出结果，停顿 600ms 后首段可见；对比 Phase 2 的 2s timer 延迟，用户体验相当或更好 |
+| Qwen3-ASR 0.6B 对技术术语/英文缩写的识别能力 | **高（模型能力边界）** | 非管线问题。FP16 优于 INT8，但本质是 0.6B 小模型的词汇覆盖限制。可行缓解：hot-word boosting（logit_bias）、更大模型 |
 
 ### Phase 3 风险（详见第五章分析）
 
@@ -1115,8 +1277,9 @@ Phase 2（已完成 ✅）:
   → UI 增量更新（onProgress → LIVE 卡片）
   → keepHistory 修复（关键精度提升）
   → 编译 → 实机测试 → 准确率验证通过
+  → **关键发现**：扩展窗口的 FINAL 推理准确率几乎完美（全量音频上下文）
 
-Phase 2.5 VAD（实施 → 发现问题 → 简化 ✅）:
+Phase 2.5 VAD（实施 → 误入歧途 → 废弃 ❌）:
   第一阶段 — VAD + 增量推理（杂交）:
     → Qwen3AsrTestActivity.kt: VAD 状态机 + Timer + 增量 + FINAL (+120/-40 行)
     → 实机测试发现：增量+FINAL 并发导致 prompt 污染和 pending_audio_ 覆盖
@@ -1127,13 +1290,34 @@ Phase 2.5 VAD（实施 → 发现问题 → 简化 ✅）:
     → processSegment(samples) 单一推理入口
     → 无 Timer、无 LIVE 卡片、无并发风险
     → 代码从 1241 行简化到 1024 行
-    → Code Review 发现：跨段并发需要 segmentInferenceInProgress 防护（待提交）
 
-  关键认知：
-    VAD 精确知道"一句话什么时候结束" → 不需要盲推的滑动窗口增量推理。
-    Phase 2 的滑动窗口是"不知道什么时候结束"时的 workaround，
-    Phase 2.5 的 VAD 解决了这个问题后，增量推理就从"必要之恶"变成了"纯危害"。
-    设计冲突的根本：Phase 2 和 Phase 2.5 是为不同约束条件设计的方案，直接混合会产生问题。
+  **⚠️ 此方案被 Phase 2.6 实机验证推翻**：
+    纯分段导致段间声学上下文断裂，罕见/技术术语识别准确率崩溃(~30%)。
+    错误认知："VAD 精确知道一句话什么时候结束 → 不需要滑动窗口"。
+    实际上滑动窗口不仅是「何时结束」的 workaround，更是 AE Full Bidirectional Attention
+    获取完整声学上下文的唯一途径。
+
+Phase 2.6 VAD 引导扩展窗口（当前方案 ✅）:
+  核心改动 — Qwen3AsrTestActivity.kt:
+    → 恢复扩展窗口：增量 1.5s/3s + FINAL，全部走 segmentChannel 串行
+    → VAD 作为生命周期控制器：600ms 静音/8s max 自动触发 FINAL
+    → Channel<SegmentTask> 替代 Channel<FloatArray>，单 consumer 避免并发
+    → LIVE 卡片 UI 恢复：ensureStreamingCard / updateStreamingResult / finalizeStreamingResult
+    → Code Review 修复：endCurrentSegment 双重触发 guard、FINAL 空响应卡片移除
+  
+  config.json 修正:
+    → sampler_type: "greedy", temperature: 0.0, top_k: 1, n_gram: 0
+    → ASR 确定性输出，消除随机性对低频 token 的伤害
+
+  FP16 模型支持:
+    → findOmniModel() 评分制：FP16(2) > INT8(1) > 其他(0)
+    → config.json: tokenizer_file → "tokenizer.txt"（FP16 使用 .txt 非 .mtok）
+  
+  实机验证（Kirin 9000 / TAS-AL00，FP16 + greedy）:
+    → 常见口语：几乎完美 ✅
+    → 技术术语：FP16 优于 INT8，但 0.6B 模型词汇覆盖是根本瓶颈
+    → VAD 分段准确，扩展窗口正常运作
+    → Channel 串行无并发问题
 
 Phase 3a（推荐优先实施，概率 ~75%）:
   → audio.cpp: whisper_fbank_streaming()（overlap buffer + 增量 STFT）
@@ -1159,8 +1343,10 @@ Phase 3c（不在当前工程范围，概率 ~20%）:
 ### Commits 总览
 
 ```
-<待提交>   [LLM:Refact] Remove Phase 2 incremental inference: pure VAD-segmented one-shot ASR (-217 lines)
-<待提交>   [LLM:Bugfix] Defer FINAL inference when incremental is in progress (历史记录，已被后续重构替换)
+<待提交>   [LLM:Refact] Phase 2.6: VAD-guided expanding window — restore cumulative context (+250/-50 lines)
+<待提交>   [LLM:Config] Switch to FP16 model with greedy sampling for deterministic ASR
+<待提交>   [LLM:Bugfix] endCurrentSegment double-trigger guard + empty FINAL LIVE card removal
+<待提交>   [LLM:Doc] Update OMNI streaming plan: document Phase 2.5 failure and Phase 2.6 correction
 d4740636 [LLM:Bugfix] Disable keepHistory in Omni ASR mode to prevent prompt contamination
 11d11b14 [LLM:Bugfix] Fix Phase 2 build: use runOnUiThread instead of withContext in onProgress callback
 438b072f [LLM:Feature] Qwen3-ASR Phase 2: Sliding-window pseudo-streaming for Omni mode
