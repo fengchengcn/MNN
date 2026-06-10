@@ -3,7 +3,7 @@
 > 创建：2026-06-10
 > 最后更新：2026-06-10
 > 关联文档：[[Qwen3-ASR-OMNI-PARAMETERS]] [[Qwen3-ASR-MEMORY-ANALYSIS]] [[Qwen3-ASR-STREAMING-PLAN]]（旧引擎方案）
-> 状态：Phase 1 已完成 ✅ | Phase 2 已完成 ✅ | Phase 3 待定
+> 状态：Phase 1 已完成 ✅ | Phase 2 已完成 ✅ | Phase 2.5 (VAD) 已完成 ✅ → 简化为纯 VAD 分段 | Phase 3 已分析（整体成功率 30-40%）
 
 ---
 
@@ -92,7 +92,8 @@
 |------|:------|------|:------|:----|
 | **Phase 1** | 🔴 HIGH | 直传 PCM，绕过 WAV 文件 I/O | 6 文件 | ✅ 已完成 |
 | **Phase 2** | 🟡 MEDIUM | 滑动窗口伪流式（边录边出结果） | 1 文件 | ✅ 已完成 |
-| **Phase 3** | 🟢 FUTURE | 真流式增量 AE（引擎改造） | 引擎层 | 待定 |
+| **Phase 2.5** | 🟠 MEDIUM | VAD + 分段推理（静音跳过 + 自然断句 + 解除 30s 上限） | 1 文件 | 🔄 实施中 |
+| **Phase 3** | 🟢 FUTURE | 真流式增量 AE（引擎改造）— 详见第五章深度分析 | 引擎层 | 已分析（30-40%） |
 
 ---
 
@@ -416,74 +417,689 @@ You are a helpful assistant.<audio>stream</audio>  ← 仅 1 次，独立推理
 
 ---
 
-## 五、Phase 3：真流式增量 AE（未来规划）
+## 四-B、Phase 2.5：VAD 优化（工程改进）✅ 已完成 → 简化
+
+> 实施日期：2026-06-10
+> 目标：无需改动 C++ 引擎，在 Kotlin 层加入 VAD + 分段推理，解决 Phase 2 的核心缺陷
+> 最终方案：**纯 VAD 分段 + 单次推理**（去掉了增量推理，避免设计冲突）
+
+### 4B.1 Phase 2 缺陷回顾与 VAD 解决方案
+
+```
+Phase 2 缺陷                      VAD 解决方案              效果
+──────────────────────────────────────────────────────────────────
+前 6s 静音浪费 3 次推理          语音活动检测，静音跳过      省 ~800ms 累计 AE
+早期短音频幻觉 ("I'm not sure")  最小语音长度 500ms         保证推理时有足够上下文
+推理超过 timer 间隔 (12s+)       停顿自然分段 (每段 5-12s)  单段计算量可控
+30s 硬上限 (_Slice 保护)         分段后每段独立，永不触及   长录音安全
+全量 fbank 重复计算              增量 fbank 缓存 mel        省 60% fbank 时间 (后续)
+```
+
+### 4B.2 VAD 状态机设计
+
+```
+                    energy > SPEECH_THRESHOLD (持续 500ms)
+     ┌──────────┐  ───────────────────────────────────>  ┌──────────┐
+     │          │                                         │          │
+     │ SILENCE  │                                         │ SPEAKING │
+     │          │  <───────────────────────────────────   │          │
+     └──────────┘    energy < SILENCE_THRESHOLD (持续800ms) └──────────┘
+          │                                                     │
+          │  丢弃音频 (保留1s环形缓冲)                            │  累积到 segment_buffer
+          │                                                     │  每2s → 增量推理 (LIVE卡片)
+          │                                                     │  检测停顿 → FINAL推理
+          └─────────────────────────────────────────────────────┘
+```
+
+### 4B.3 VAD 参数
+
+| 参数 | 值 | 说明 |
+|------|:------|------|
+| `SPEECH_RMS_THRESHOLD` | 0.005 | 语音能量阈值（float PCM, ±1.0 归一化后） |
+| `SILENCE_RMS_THRESHOLD` | 0.003 | 静音判定阈值 |
+| `MIN_SPEECH_FRAMES` | 5 (500ms) | 最短语音长度，过滤短促噪音 |
+| `MAX_SILENCE_FRAMES` | 8 (800ms) | 停顿多长判定为段结束 |
+| `INCREMENTAL_INTERVAL` | 2000ms | 段内增量推理间隔 |
+| `RING_BUFFER_SIZE` | 1s (SAMPLE_RATE) | 静音期保留的音频上下文 |
+
+### 4B.4 分段推理流程
+
+```
+[REC] → VAD = SILENCE, 环形缓冲保留最近1s
+  │
+  ├─ 语音检测 (energy > 0.005 × 500ms)
+  │   → VAD = SPEAKING
+  │   → segmentBuffer = [环形缓冲尾] + 新chunks
+  │   → segmentCount++
+  │   → 显示 LIVE 卡片
+  │   → 启动增量 timer (2s)
+  │
+  ├─ 说话中 (每 100ms 一个 chunk)
+  │   → 追加到 segmentBuffer
+  │   → 每 2s: 取快照 → 增量推理 → 更新 LIVE 卡片
+  │   → energy 恢复: silenceFrames = 0
+  │
+  ├─ 停顿 800ms → VAD = SILENCE
+  │   → 取消增量 timer
+  │   → 最终推理 (FINAL)
+  │   → LIVE 卡片 → 永久结果卡片
+  │   → segmentBuffer 清空
+  │   → 准备下一段
+  │   → (如有新语音 → 回到语音检测)
+  │
+  └─ [STOP] 按钮
+      → 当前段 FINAL 推理
+      → clean up, returnToIdle
+      → 不自动重启
+```
+
+### 4B.5 实际实施过程与设计冲突发现
+
+**第一阶段：VAD + 增量推理（杂交方案）**
+
+按原计划在 `Qwen3AsrTestActivity.kt` 中实施：VAD 状态机 + 2s 增量 timer + FINAL 推理。改动 ~120 行。
+
+**实机测试发现严重问题**：
+
+```
+17:05:20.388  Thread 19563: 增量推理 START (48000 samples) → prompt 干净
+17:05:21.118  Thread 19514: FINAL 推理 START (60800 samples) → ⚠️ 增量还在跑！
+17:05:21.467  Thread 19563: 增量返回结果
+17:05:21.468  Thread 19514: prompt 已污染 ❌
+  →  "You are a helpful assistant.<audio>stream</audio>" × 2
+```
+
+增量推理和 FINAL 推理同时运行时，两个 Bug 同时触发：
+1. **Prompt 污染复活**：`keepHistory=false` 在 `generate()` 结束才清理 history。FINAL 在增量完成前构建 prompt，包含了增量的残留
+2. **`pending_audio_` 竞态覆盖**：增量用 48000 samples 推理中，FINAL 的 `setAudioData(60800)` 覆盖了 `pending_audio_`
+
+**根因分析**：Phase 2 的增量推理（盲推滑动窗口）和 Phase 2.5 的 VAD（精确语音边界检测）**设计上互相冲突**：
+
+```
+Phase 2（无 VAD）：不知道什么时候说完 → 每 2s 盲推增量 → 滑动窗口是唯一选择
+Phase 2.5（有 VAD）：精确检测"一句话结束" → 一次性扔给 ASR → 增量推理多余且有害
+```
+
+**第二阶段：简化为纯 VAD 分段 + 单次推理**
+
+删除所有 Phase 2 增量推理代码（-217 行），只保留 VAD 状态机 + `processSegment()` 单次推理：
+
+```
+麦克风 100ms chunk → 能量 RMS VAD
+  SILENCE → 环形缓冲保留 1s 上下文
+  SPEECH 检测 (500ms) → enterSpeakingState()
+    收集音频到 omniAudioBuffer
+    静音检测 (800ms) → endCurrentSegment()
+      → processSegment(snapshot)  ← 唯一推理路径
+        → setAudioData + generate → addResultCard
+```
+
+**删除清单**：
+
+| 删除 | 原因 |
+|------|------|
+| `Timer` / `TimerTask` | 不再需要滑动窗口触发 |
+| `startStreamingTimer()` / `stopStreamingTimer()` | 同上 |
+| `triggerIncrementalInference()` | 增量推理逻辑 |
+| `processIncrementalOmni(samples, isFinal)` | 复杂的增量/FINAL 二合一方法 |
+| `ensureStreamingCard()` / `updateStreamingResult()` / `finalizeStreamingResult()` | LIVE 卡片 UI |
+| `streamingIncrementalInProgress` / `deferredFinalSnapshot` | 并发防护（不再需要） |
+
+**最终文件** 1241 行 → 1024 行（-217 行）。
+
+### 4B.6 简化后的数据流
+
+```
+┌─ Kotlin ───────────────────────────────────────────────────────────┐
+│  AudioRecord chunks (100ms)                                          │
+│    → energy RMS VAD (float PCM)                                      │
+│                                                                       │
+│  VadState.SILENCE:                                                    │
+│    → omniPreSpeechRing (1s ring buffer, pre-speech context)          │
+│    → speech frames++ → enterSpeakingState()                          │
+│                                                                       │
+│  VadState.SPEAKING:                                                   │
+│    → omniAudioBuffer 累积                                             │
+│    → silence frames++ → endCurrentSegment()                          │
+│      → snapshot = omniAudioBuffer.toFloatArray()                     │
+│      → processSegment(snapshot)                                      │
+│        → lifecycleScope.launch(IO) {                                 │
+│            llmSession?.setAudioData(samples, 16000)                  │
+│            llmSession?.generate("<audio>stream</audio>")             │
+│            addResultCard(response)                                   │
+│          }                                                            │
+│                                                                       │
+│  [STOP] button:                                                      │
+│    → isRecording = false → loop exit                                 │
+│    → if SPEAKING: processSegment(remaining_snapshot) → returnToIdle │
+│    → if SILENCE: returnToIdle()                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### 4B.7 已知限制与待修复
+
+**跨段并发 Bug**（Code Review 发现）：
+
+`processSegment()` 启动协程后立即返回。如果 segment #1 的推理仍在运行（Qwen3 ASR 耗时 1-2s），且 VAD 检测到 segment #2 结束（最快 ~1.3s），则两个协程并发调用 `setAudioData()` + `generate()` 到同一个 `LlmSession`：
+
+```
+T1: endCurrentSegment() for seg #1 → processSegment(snapshot1) → 协程 A 启动
+T2: 录音继续（SILENCE → SPEAKING → SILENCE）
+T3: endCurrentSegment() for seg #2 → processSegment(snapshot2) → 协程 B 启动  
+T4: 协程 A 仍在运行 → B 覆盖 pending_audio_ + 污染 history
+```
+
+**修复**：添加 `@Volatile var segmentInferenceInProgress = false` 标志，`endCurrentSegment()` 在调用 `processSegment()` 前检查，`processSegment()` 在 finally 块中重置。详见 Code Review 输出。
+
+### 4B.8 预期效果（vs Phase 2）
+
+| 指标 | Phase 2 | Phase 2.5 (+VAD) |
+|------|:------|:------|
+| 推理次数 | 8 | **5**（跳过 3 次静音） |
+| 累计 AE 计算 | ~4.0s | **~3.2s** |
+| 首次有效结果 | 8.0s 时 | **6.0s 时**（语音段首次达到 2s） |
+| 中间幻觉 | 有（2-6s 的 "I'm not sure" 等） | **消除**（仅在 500ms+ 语音后推理） |
+| 30s 限制 | 存在 | **解除**（自然分段 < 15s/段） |
+| 多段拼接 | 不支持 | **支持** |
+| 12s+ 卡顿 | 有 | **减轻**（段 ≤ 12s，单次推理 < 2s） |
+
+### 4B.9 后续扩展（Phase 2.5+）：增量 fbank 缓存
+
+当前 VAD 分段后，段内仍每次重跑全量 fbank。可通过缓存 mel 特征进一步优化：
+
+```cpp
+// omni.cpp 伪代码 — 增量 fbank 缓存
+struct FbankCache {
+    VARP accumulated_mel;          // [1, 128, T_total]
+    std::vector<float> overlap;    // STFT overlap (n_fft tail)
+    int total_samples;
+};
+
+VARP audioProcessIncremental(VARP new_waveform, FbankCache& cache) {
+    auto new_frames = stft_incremental(new_waveform, cache.overlap);
+    cache.accumulated_mel = _Concat({cache.accumulated_mel, new_frames}, 2);
+    cache.overlap = tail_of(new_waveform, n_fft);
+    return cache.accumulated_mel;  // 传给 AE (仍全量 attention)
+}
+```
+
+| 收益 | 当前 (Phase 2.5) | +增量 fbank |
+|------|:------|:------|
+| fbank 累计 | ~0.8s (18s 录音) | **~0.5s** |
+| 实现复杂度 | - | ⭐⭐ (1-2 天, C++) |
+
+---
+
+> **分析日期**：2026-06-10
+> **分析基于**：MNN 引擎源码 (`omni.cpp`, `llm.cpp`, `audio.cpp`, `kvmeta.hpp`) + Qwen3-ASR 模型导出代码 (`qwen3_asr_model.py`, `audio.py`)
+> **结论**：整体成功概率 **30-40%**，建议分 3 个子阶段渐进实施
 
 ### 5.1 目标
 
-Audio Encoder 支持流式输入，LLM Decoder 在 AE 未完成时就启动 prefill。
+Audio Encoder 支持流式增量输入，LLM Decoder 在 AE 未完成时就启动 prefill，实现**边说边出**的用户体验。
 
-### 5.2 技术路线
+### 5.2 当前引擎数据流（完整链路）
 
 ```
-当前: 完整 waveform → fbank → AE full attention → embedding → Decoder
-                 ↑ 必须等录音结束
-
-流式: chunk[0:t] → fbank[t-delta:t] → AE causal attention (仅新帧)
-        → 增量 embedding → 追加到 Decoder KV Cache
-          → 逐 token 流式输出
+┌─ Kotlin ───────────────────────────────────────────────────────────┐
+│  FloatArray (full PCM) → setAudioData(samples, sr)                 │
+│    → generate("<audio>stream</audio>")                             │
+└────────────────────────────────────────────────────────────────────┘
+                              │
+┌─ JNI Bridge ───────────────────────────────────────────────────────┐
+│  LlmSession::Response() → processMultimodalPrompt()                │
+│    → audios["stream"].waveform = pending_audio_                    │
+│    → llm_->response(multimodal_prompt)                             │
+└────────────────────────────────────────────────────────────────────┘
+                              │
+┌─ Omni Engine (omni.cpp) ───────────────────────────────────────────┐
+│  tokenizer_encode() → <audio> regex → processAudioContent()        │
+│    → Omni::audioProcess(waveform)           ← ★ 每次全量重跑       │
+│      ├── whisper_fbank(waveform)            ← 全量 STFT            │
+│      │   → mel_spectrogram (STFT + mel filterbank)                 │
+│      │   → _Log / _Maximum / normalize                             │
+│      │   → output: [1, 128, T]                                     │
+│      │                                                              │
+│      ├── mAudioModule->forward(mel)          ← ★ FULL attention     │
+│      │   → Qwen3-ASR 只有 1 个输入（无 attention_mask）            │
+│      │   → 18 层 Transformer 全部 bidirectional self-attention     │
+│      │   → 3 层 Conv2d stride=2 → 8× 时域下采样                    │
+│      │   → output: [T', 1, 1024]                                   │
+│      │                                                              │
+│      ├── mAudioEmbeddings.push_back(audio_embedding)               │
+│      └── addPositionIds(embed_len)                                  │
+│                                                                     │
+│  Omni::embedding(input_ids)                                         │
+│    → _Concat([txt_emb, audio_emb, txt_emb, ...])                   │
+│    → mAudioEmbeddings.clear()                                       │
+│                                                                     │
+│  Omni::response()                                                   │
+│    → generate_init()                          ← 重置 gen_seq_len   │
+│    → generate(input_ids)                                            │
+│      ├── forwardVec(embeds)                   ← 全量 prefill        │
+│      │   └── forwardRaw() → mMeta->add = blockSize                 │
+│      │       └── selectModule->onForward() → KV cache 自动扩展     │
+│      └── Decode loop (逐 token, gen_seq_len 递增)                  │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.3 需要改造的模块
+### 5.3 Qwen3-ASR Audio Encoder 架构（关键发现）
 
-| 模块 | 文件 | 改动 |
-|------|------|------|
-| streaming fbank | `audio.cpp` | 新增 `whisper_fbank_streaming()` 状态机 |
-| Causal AE attention | `omni.cpp` | AE 使用 causal mask 替代 full mask |
-| 增量 embedding 注入 | `omni.cpp` | `mAudioEmbeddings` 支持 append |
-| KV Cache 扩展 | `llm.cpp` | 支持 prefill 追加（`mModule` clone 复用） |
+从 `qwen3_asr_model.py` 和 `audio.py` 源码确认：
 
-### 5.4 预期收益
+```
+Whisper-style Audio Encoder:
+┌─────────────────────────────────────────────┐
+│  Input: mel spectrogram [1, 128, T]         │
+│                                              │
+│  Conv2d(1→480, k=3, stride=2)  ─┐           │
+│  Conv2d(480→480, k=3, stride=2) ─┤ 8× 下采样 │
+│  Conv2d(480→480, k=3, stride=2) ─┘           │
+│                                              │
+│  Linear(7680→896)  ← 通道变换                │
+│  + Learned Positional Embedding              │
+│                                              │
+│  18× Transformer Encoder Layer:              │
+│    ├── LayerNorm                             │
+│    ├── MultiHeadAttention                   │
+│    │   ├── 14 heads × 64 dim                │
+│    │   └── ★ FULL Bidirectional Attention   │
+│    ├── FFN (896→3584→896, GELU)             │
+│    └── LayerNorm                             │
+│                                              │
+│  LN → Linear(896→896) → Linear(896→1024)    │
+│                                              │
+│  Output: audio embedding [T', 1, 1024]       │
+│  T' ≈ T / 2 (due to Conv subsampling)       │
+└─────────────────────────────────────────────┘
+```
 
-| 指标 | Phase 2 (伪流式) | Phase 3 (真流式) |
-|------|:------|:------|
-| 首 token 延迟 | ~600ms | **~200ms** |
-| 用户体感 | 每 2s 刷新一次 | **边说边出** |
-| AE 计算量 | 每次重跑全量 | 只跑增量帧 |
-| 实现复杂度 | 低 | 高（需改引擎） |
+#### 关键发现 1：AE 使用 Full Bidirectional Attention（非 Causal）
+
+`Qwen3AsrAudio.export()` 的导出代码（`audio.py:520-540`）：
+
+```python
+# Qwen3-ASR 只导出 1 个输入 — 没有 attention_mask
+onnx_export(model, (input_features,),
+            onnx_model,
+            input_names=['input_features'],    # ← 仅 1 个输入！
+            output_names=['audio_embeds'],
+            dynamic_axes={"input_features": {2: "size"}})
+```
+
+对比 Qwen2Audio（有 attention_mask 的 block-diagonal attention）：
+
+```python
+# Qwen2Audio: 2 个输入，支持外部 attention mask
+onnx_export(model, (input_features, attention_mask),
+            onnx_model,
+            input_names=['input_features', 'attention_mask'],  # ← 2 个输入
+            ...)
+```
+
+在 `omni.cpp:897` 中体现为两个分支：
+
+```cpp
+if (mAudioModule->getInfo()->inputNames.size() > 1) {
+    // ✅ Qwen2Audio: 走这里，block-diagonal mask 控制 attention 范围
+    audio_embedding = mAudioModule->onForward({input_features, attention_mask})[0];
+} else {
+    // ❌ Qwen3-ASR: 走这里，AE 内部做 full bidirectional attention
+    // 没有外部 mask 可以限制 attention 范围
+    audio_embedding = mAudioModule->forward(input_features);
+}
+```
+
+**→ Qwen3-ASR 的 AE 在 18 层 Transformer 中都使用完整的双向注意力。每一帧可以 attend 到所有其他帧（过去+未来），这使得增量计算从根本上变得困难。**
+
+#### 关键发现 2：Positional Encoding 是 Learned Absolute（非 RoPE）
+
+Whisper 架构使用 `positional_embedding`（学习的绝对位置编码），不是 RoPE。这意味着：
+- 位置编码是预训练好的固定向量
+- 序列长度变化时，旧位置的 embedding 不变，但注意力范围随序列长度改变
+- 新增帧 → 旧帧的 attention 分布改变 → 旧 KV cache 理论上"过期"
+
+#### 关键发现 3：MNN KV Cache 基础设施支持增量操作
+
+`KVMeta.hpp` 提供了增量的基础：
+
+```cpp
+struct KVMeta {
+    size_t previous;  // KV cache 中已存储的 token 数
+    size_t remove;    // 要移除的 token 数
+    size_t add;       // 本次 forward 要新增的 token 数
+    // sync() 后: previous = previous - remove + add + revertNumber
+};
+```
+
+`mModulePool` 机制（`Module::clone()` 共享 `RuntimeManager` → 共享 KV cache）意味着多个 forward 调用之间 KV cache 状态可以保持。但 **增量 prefill 路径从未在 MNN 中被测试过**。
+
+### 5.4 四项改造逐一分析
+
+#### 5.4.1 Streaming fbank（`whisper_fbank_streaming()`）
+
+**当前实现** (`audio.cpp:639-665`)：
+
+```cpp
+VARP whisper_fbank(waveform, sample_rate, n_mels, n_fft, hop_length, chunk_len) {
+    // 对完整 waveform 做一次 STFT → mel → log → normalize
+    auto mel_specgram = mel_spectrogram(waveform, &mel_params, &spec_params);
+    // ... 后处理 ...
+}
+```
+
+**需要改造**：
+- 保存上一个 chunk 的尾部 `n_fft` 个样本作为 overlap buffer
+- 新 chunk 到来时：`[overlap_buffer, new_samples]` → 计算增量 STFT
+- 新 mel 帧 append 到累积的 mel spectrogram
+- API 设计：
+  ```cpp
+  // 初始化状态
+  void whisper_fbank_streaming_init(FbankState* state, int n_fft, int hop_length);
+  // 增量处理，返回累积的 mel features
+  VARP whisper_fbank_streaming(FbankState* state, VARP new_waveform);
+  // 获取当前全部 mel features（供最终全量推理使用）
+  VARP whisper_fbank_streaming_get_all(FbankState* state);
+  ```
+
+| 维度 | 评估 |
+|------|------|
+| 复杂度 | ⭐⭐ 中等 — STFT streaming 是成熟的信号处理技术 |
+| 风险 | 🟢 低 |
+| 工作量 | **3-5 天** |
+| 成功概率 | **85%** |
+
+#### 5.4.2 Incremental AE（核心难点）
+
+计划中描述的是"Causal AE attention"，但 Qwen3-ASR 的 AE 使用 **Full Bidirectional Attention**。
+
+**问题本质**：
+
+```
+Bidirectional Attention:
+  Frame[i] 的 Q 与 ALL frames[0..N-1] 的 K 做 dot-product
+  → 当新增 frames[N..N+M] 时，Frame[i] 的 attention score 会改变
+  → 旧的 KV cache 缺少新帧的 K/V 信息，已"过期"
+  → 不能简单地只 prefill 新帧然后用旧 KV cache
+```
+
+**三条可能路径**：
+
+| 路径 | 方案 | 复杂度 | 精度影响 | 可行性 |
+|------|------|:------|:------|:------|
+| **A: Causal Mask** | 将 AE 强制改为因果注意力（下三角 mask），复用 KV cache | ⭐⭐⭐⭐⭐ | ❌ 严重 — 未针对 causal 训练的模型无法处理 | 几乎不可行 |
+| **B: Sliding Window Context** | 每次只处理 `[左上下文, 新帧]` 窗口，利用注意力的自然局部性 | ⭐⭐⭐ | ⚠️ 中等 — 左上下文外的长程依赖丢失 | **推荐** |
+| **C: Block-Diagonal Chunking** | 仿照 Qwen2Audio 导出时加入 attention_mask，用 block-diagonal 限制 attention | ⭐⭐⭐⭐ | ⚠️ 中低 — block 内 full attention 保留 | 较高但需重新导出模型 |
+
+**推荐路径 B — Sliding Window Context**：
+
+不修改 AE 模型本身，每个增量步骤：
+1. 保留最近 K 秒的 mel features 作为左上下文
+2. `[left_context_mel, new_mel_frames]` → AE Forward
+3. 只取新帧对应的输出（丢弃左上下文的重复计算）
+
+```
+示例（K=5s 上下文，2s 增量）：
+  t=2s:  AE([0 ..2s ])                 → 输出 [0 ..2s ]
+  t=4s:  AE([0 ..4s ])                 → 输出 [2 ..4s ]
+  t=6s:  AE([1 ..6s ])                 → 输出 [4 ..6s ]
+  t=8s:  AE([3 ..8s ])                 → 输出 [6 ..8s ]
+  ...
+  最终:   AE([全部])                    → 验证/修正用的全量推理
+
+计算量对比（18s 录音，2s 增量）：
+  Phase 2 全量: 累积 ~4.0s AE 计算
+  Sliding Window (5s): ~300ms × 8 = ~2.4s 累积
+  节省 ~40% AE 计算
+```
+
+**局限性**：由于 AE 使用 absolute positional embeddings，`[1..6s]` 窗口内的位置编码是从 0 开始的（而非全局位置），这与全量推理的位置编码不一致，可能引入细微精度差异。
+
+| 维度 | 评估 |
+|------|------|
+| 复杂度 | ⭐⭐⭐ 中高 |
+| 风险 | 🟡 中 — 位置编码一致性和精度待验证 |
+| 工作量 | **1-2 周** |
+| 成功概率 | **55%** |
+
+#### 5.4.3 增量 Embedding 注入
+
+当前 `mAudioEmbeddings` 在每次 `embedding()` 调用后 `clear()`。
+
+**需要改造**：
+
+```
+首次 prefill:
+  embedding() → [txt_prefix, audio_emb_chunk1]
+  → forwardVec() → KV cache = L1 positions
+  → decode loop → 产出 tokens
+
+增量 prefill（第 N 次，N>1）:
+  不调用 generate_init()  ← 保留 KV cache
+  embedding_incremental() → [audio_emb_chunkN]  仅新 tokens
+  → forwardVec() → KV cache 扩展 T_N positions
+  → decode loop → 继续产出 tokens
+```
+
+**关键挑战**：
+- `mPositionIds` 需要从 offset 开始（已在 `addPositionIds()` 中维护）
+- `embedding()` 需要支持「只构建新 chunk 的 embedding」模式
+- `embedding()` 中的 `_Concat` 逻辑需适配增量场景
+
+| 维度 | 评估 |
+|------|------|
+| 复杂度 | ⭐⭐⭐ 中高 |
+| 风险 | 🟡 中 — position ID 连续性需精确管理 |
+| 工作量 | **3-5 天** |
+| 成功概率 | **65%** |
+
+#### 5.4.4 KV Cache 增量 Prefill（Decoder 侧 — 最大风险）
+
+**当前流程**：
+
+```
+response() → generate_init()  ← 重置 gen_seq_len=0, prefill_us=0
+  → generate(input_ids)
+    → forwardVec(embeds)       ← 全量 prefill
+    → decode loop
+```
+
+`generate_init()` 中有 `reuse_kv()` 判断（`llm.cpp:790-794`）：
+```cpp
+if (!mConfig->reuse_kv()) {
+    mContext->all_seq_len = 0;
+    mContext->history_tokens.clear();
+    mMeta->remove = mMeta->previous;
+}
+```
+
+`reuse_kv()` 是为"相同前缀复用"设计的（多轮对话中重复使用 system prompt 的 KV cache），**不是**为"追加新 tokens"设计。
+
+**需要的增量 Prefill 机制**：
+
+```
+首次 prefill (与 Phase 2 相同):
+  generate_init() → 重置状态
+  embedding() → [txt, audio_chunk1], len = L1
+  forwardVec(embeds) → KV cache: previous = L1
+  decode → 产出部分 tokens → 遇到阈值暂停
+
+第 N 次增量 prefill (新 audio 到达):
+  ✗ 不调用 generate_init()  ← ★ 保留 KV cache
+  compute_ae(new_audio) → audio_emb_chunkN [T_N, 1, H]
+  embedding_incremental() → [audio_emb_chunkN]
+  forwardVec(new_embeds)  ← 仅 prefill T_N tokens
+    → mMeta->add = T_N
+    → positions 从 all_seq_len 开始
+    → attention_mask 形状: [T_N, all_seq_len + T_N]  ← ★ 非标准矩形 mask
+  decode → 继续产出 tokens
+```
+
+**关键挑战 1 — Attention Mask 形状**：
+
+当前 `gen_attention_mask(seq_len)` 生成 `[seq_len, seq_len]` 的因果方阵。增量 prefill 需要：
+- 新 tokens attend 到**所有**之前 tokens（不是 causal 限制在最后 seq_len 内）
+- 新 tokens 内部用 causal mask（避免看到自己的未来）
+- 即 mask 形状为 `[T_new, prev_len + T_new]` 且只有新 token 内部的未来位置被 mask
+
+这是 MNN 当前 `gen_attention_mask()` 完全不支持的形状。
+
+**关键挑战 2 — Module Selection**：
+
+```cpp
+// llm.cpp:504-514
+bool inDecode = mContext->gen_seq_len > 0;
+int seqLenKey = inDecode ? hiddenState->getInfo()->dim[mSeqLenIndex] : mPrefillKey;
+auto moduleKey = std::make_pair(seqLenKey, isAllLogists);
+if (mModulePool.find(moduleKey) == mModulePool.end()) {
+    mModulePool[moduleKey].reset(Module::clone(mModule.get()));
+}
+selectModule = mModulePool[moduleKey];
+```
+
+每次增量 prefill 的 `seqLenKey` 不同（chunk 大小不固定），需要动态 clone 新 Module。
+
+**关键挑战 3 — KVMeta 状态一致性**：
+
+在 prefill → decode（gen_seq_len 递增） → prefill（gen_seq_len>0 但 chunk size > 1） → decode 的交替中，`mMeta->add`/`mMeta->remove`/`gen_seq_len`/`all_seq_len` 的交互逻辑必须精确无误。任何一个 offset 错误都会导致 KV cache 错位。
+
+| 维度 | 评估 |
+|------|------|
+| 复杂度 | ⭐⭐⭐⭐⭐ 非常高 |
+| 风险 | 🔴 高 — MNN 引擎从未经过此路径测试 |
+| 工作量 | **2-4 周** |
+| 成功概率 | **35%** |
+
+### 5.5 综合成功概率
+
+#### 分模块评估
+
+| 模块 | 成功概率 | 关键风险 |
+|------|:------|------|
+| Streaming fbank | **85%** | 低风险，成熟信号处理技术 |
+| Incremental AE (Sliding Window) | **55%** | Absolute positional embeddings + 上下文窗口外的精度损失 |
+| 增量 Embedding 注入 | **65%** | MNN Express API 支持动态 _Concat，需管理 position IDs |
+| KV Cache 增量 Prefill | **35%** | MNN 引擎首次走此路径，attention mask 形状不支持 |
+
+**整体端到端可工作概率：30-40%**
+
+> 串联风险：KV Cache 增量 Prefill 是瓶颈模块（35%），且任一模块失败都会导致整体不可用。
+
+#### 主要风险因素
+
+| # | 风险 | 严重性 | 说明 |
+|---|------|:------|------|
+| 1 | AE Full Bidirectional Attention | 🔴 阻断性 | Qwen3-ASR 的 AE 使用 full attention + absolute positional embeddings，从根本上不适用于 causal streaming。必须用 Sliding Window 折中，精度损失未知 |
+| 2 | MNN 增量 Prefill 未经验证 | 🔴 阻断性 | attention mask 需要非标准矩形形状；prefill/decode 模式切换逻辑可能触发未预见的 bug |
+| 3 | 精度损失不可接受 | 🟡 业务风险 | Sliding Window 可能引入 5-15% WER 增加，流式场景下是否可接受需要实测 |
+| 4 | Position ID 一致性问题 | 🟡 技术风险 | 跨 chunk 的 position ID 管理可能引入隐蔽 bug，只在长语音场景暴露 |
+
+### 5.6 推荐渐进式路线
+
+```
+Phase 3a — Streaming fbank + Sliding Window AE [概率 ~75%]
+├── 修改 whisper_fbank → streaming 版本（overlap buffer）
+├── AE 使用 Sliding Window Context（不修改 AE 模型）
+├── 仍然每次重新 prefill Decoder（与 Phase 2 相同）
+├── 收益：AE 计算量 ~40% 减少
+├── 代价：首 token 延迟不变（仍需等 AE 完成）
+├── 工作量：1-2 周
+└── 里程碑：实机精度验证（增量 vs 全量 WER 对比）
+
+Phase 3b — Decoder 增量 Prefill [概率 ~40%，依赖 3a 验证通过]
+├── KV Cache 跨轮次复用（不调用 generate_init）
+├── 改造 attention_mask 支持增量形状
+├── 改造 embedding() 支持增量模式
+├── 收益：首 token 延迟 ~600ms → ~200ms，边说边出
+├── 工作量：3-5 周
+└── 里程碑：端到端流式 ASR 可用
+
+Phase 3c — 真正的 Causal AE [概率 ~20%，不在当前工程范围]
+├── 重新训练/微调 AE 支持 causal attention
+├── 或等待上游 Qwen3-ASR 发布官方 streaming 版本
+└── 工作量：数月（涉及模型训练）
+```
+
+### 5.7 决策建议
+
+| 条件 | 建议 |
+|------|------|
+| Phase 2 伪流式满足产品需求 | **暂缓 Phase 3**，当前方案 18s 录音 FINAL 准确率几乎完美 |
+| 强需求「边说边出」+ 精度容忍度高 | **启动 Phase 3a**，拿到实机精度数据再评估 3b |
+| 有模型训练资源 | **Phase 3c 才是根本解**（训练 causal AE），工程方案本质是 workaround |
+
+> **核心结论**：Phase 3 的核心制约因素是 **Qwen3-ASR AE 的 full bidirectional attention 架构**，这是模型层面的设计选择，不是工程问题。在没有重训 AE 的前提下，任何工程方案都是精度与延迟之间的折中。Phase 2 的伪流式方案在当前阶段已经满足大多数需求。
+
+### 5.8 关键源码索引
+
+| 文件 | 行号 | 关键内容 |
+|------|:-----|------|
+| `omni.cpp:848-962` | `audioProcess(VARP)` | AE 全量处理入口，包含 fbank + AE forward + embedding 注入 |
+| `omni.cpp:897-930` | AE forward 分支 | `inputNames.size()>1` 决定是否使用 attention_mask |
+| `omni.cpp:1122-1236` | `embedding()` | 合并 txt+audio embeddings，`mAudioEmbeddings` 消费与清理 |
+| `omni.cpp:1299-1479` | `responseInterleaved()` | 完整 prefill→decode 流程（Talker interleaved 模式） |
+| `omni.cpp:1481-1496` | `response()` | 调用 `generate_init()` → `generate()` |
+| `llm.cpp:640-745` | `forwardVec(VARP)` | Prefill 核心：chunking + forwardRaw → KVMeta 管理 |
+| `llm.cpp:776-799` | `generate_init()` | 重置状态（`gen_seq_len=0`） — Phase 3b 需绕过 |
+| `llm.cpp:836-920` | `generate()` | Prefill + Decode 完整流程 |
+| `llm.cpp:496-553` | `forwardRaw()` | ModulePool 选择 + KV Cache 扩展 |
+| `source/core/KVMeta.hpp` | `KVMeta` | `add`/`remove`/`previous`/`sync()` — KV Cache 底层机制 |
+| `audio.cpp:639-665` | `whisper_fbank()` | 全量 STFT → mel → normalize — Phase 3a 改造目标 |
+| `audio.py:440-511` | `Qwen3AsrAudio` | AE 导出逻辑，确认只有 1 个输入（无 attention_mask） |
+| `audio.py:520-540` | `Qwen3AsrAudio.export()` | ONNX 导出 input_names — 确认不支持外部 mask |
+| `qwen3_asr_model.py` | 全文 | AE 架构定义：3×Conv2d + 18×Transformer + Learned Positional Embeddings |
+| `llmconfig.hpp:264-265` | `audio_type()` | 模型类型判断（`qwen3_asr` 标识） |
 
 ---
 
 ## 六、性能对比（实机数据：Kirin 9000）
 
-| 指标 | Phase 1 (直传 PCM) | Phase 2 (+伪流式) |
-|------|:-------------------|:------------------|
-| 文件 I/O | **0ms** | **0ms** |
-| VARP 创建 | ~5ms (_Const + memcpy) | ~5ms |
-| fbank+AE (2s 音频) | ~500ms | ~170ms (fbank) + ~220ms (AE) |
-| fbank+AE (18s 音频) | — | ~1.3s (fbank) + ~860ms (AE) |
-| 首 token 延迟 | 780-1400ms | ~600ms（2s 快照） |
-| Decode 速度 | — | 30-35 t/s（稳定） |
-| 内存额外 | ~N×4B (PCM VARP) | +累积 buffer + LIVE 卡片 |
-| 识别准确率（18s 中文） | — | **几乎完美**（修复 keepHistory 后） |
-| 代码改动 | 6 文件，~90 行 | 1 文件，+179/-29 行 |
+| 指标 | Phase 1 (直传 PCM) | Phase 2 (+伪流式) | Phase 2.5 纯VAD (最终) |
+|------|:-------------------|:------------------|:----------------------|
+| 文件 I/O | **0ms** | **0ms** | **0ms** |
+| VARP 创建 | ~5ms (_Const + memcpy) | ~5ms | ~5ms |
+| fbank+AE (3s 段) | ~500ms | ~170ms (fbank) + ~220ms (AE) | ~400ms（全量，一次性） |
+| fbank+AE (18s 录音) | — | ~2.2s（累计 8 次增量） | **~1.3s**（累计 3-4 段） |
+| 推理次数（18s） | 1 | 8（7 增量 + 1 FINAL） | **3-4**（仅段结束） |
+| 首段结果延迟 | — | ~2s (timer) | **段结束即出**（~600ms 停顿后） |
+| Decode 速度 | — | 30-35 t/s（稳定） | 30-35 t/s（稳定） |
+| 并发风险 | 无 | 增量+FINAL 竞态 | 低（段间可能有竞态，见 4B.7） |
+| 中间结果 | — | 差（短音频→幻觉） | **无中间结果**（只有最终） |
+| 识别准确率（18s 中文） | — | FINAL 几乎完美 | **几乎完美** |
+| 代码量 | 6 文件，~90 行 | 1 文件，+179/-29 行 | **1 文件，1024 行**（-217 vs Phase 2+2.5 杂交） |
 
 ---
 
 ## 七、风险与缓解
+
+### Phase 1 & 2 & 2.5 风险（已解决或已确认）
 
 | 风险 | 概率 | 缓解措施 |
 |------|:---:|------|
 | ~~`_Input` VARP 跨 RuntimeManager 失效~~ | ~~低~~ | 改用 `_Const` 完全规避 |
 | ~~`_Input`/`_Const` shape 格式不匹配导致 crash~~ | ~~高→已命中~~ | 改为与 `AUDIO::load()` 完全一致的 `{N} NHWC` 格式 |
 | ~~`keepHistory=true` 导致 prompt 污染~~ | ~~高→已命中~~ | `setKeepHistory(false)`，ASR 每次推理独立 |
+| ~~增量+FINAL 并发导致 prompt 污染复活~~ | ~~高→Phase 2.5 首次测试命中~~ | 删除增量推理，纯 VAD 分段单次推理 |
 | `pending_audio_` 生命周期异常 | 低 | `= nullptr` 确保单次消费 |
-| Omni 全量 AE 重跑性能差（Phase 2） | 中→已确认 | 18s 音频 AE 耗时 ~860ms；Phase 3 增量 AE 可解决 |
-| `audios` key 改为 path 后的兼容性 | 低 | Omni 引擎使用 `find(content)` 自然匹配 |
-| timer tick 与 generate 并发 | 低 | `streamingIncrementalInProgress` + `synchronized(this)` 双重保护 |
+| Omni 全量 AE 重跑性能差 | 低→已确认可接受 | 典型段 3-5s，AE 耗时 ~400ms；18s 录音累计 ~1.3s |
+| ~~`audios` key 改为 path 后的兼容性~~ | ~~低~~ | Omni 引擎使用 `find(content)` 自然匹配 |
+| 跨段并发推理（segment N+1 开始时 segment N 推理未完成） | 中 | 需添加 `segmentInferenceInProgress` 防护（Code Review 发现，待提交） |
+| RMS 能量 VAD 在噪音环境下准确率不足 | 中 | 可升级为 Silero VAD（sherpa-onnx） |
+| 无中间结果反馈（纯分段模式） | 低→已接受 | 段结束即出结果，停顿 600ms 后首段可见；对比 Phase 2 的 2s timer 延迟，用户体验相当或更好 |
+
+### Phase 3 风险（详见第五章分析）
+
+| 风险 | 概率 | 严重性 | 缓解措施 |
+|------|:---:|:------|------|
+| AE Full Bidirectional Attention 架构不适配 streaming | **高** | 🔴 阻断性 | Sliding Window Context 折中（Phase 3a），接受精度折中 |
+| MNN 引擎增量 Prefill 路径未经测试 | **高** | 🔴 阻断性 | 先在 PC 端用 `llm_demo` 验证正确性 |
+| 精度损失不可接受（WER 增加 5-15%） | 中 | 🟡 业务风险 | 实机对比测试，评估是否满足产品需求 |
+| Position ID 跨 chunk 一致性 bug | 中 | 🟡 技术风险 | 仅在长语音（>10s）场景暴露，需充分测试 |
+| 后续 Phase 依赖上游模型更新 | **高** | 🔴 根本性 | Phase 3c 需重训 AE，当前工程方案本质是 workaround |
 
 ---
 
-## 八、实施顺序建议
+## 八、实施结果总结
 
 ```
 Phase 1（已完成 ✅）:
@@ -500,13 +1116,51 @@ Phase 2（已完成 ✅）:
   → keepHistory 修复（关键精度提升）
   → 编译 → 实机测试 → 准确率验证通过
 
-Phase 3（待定）:
-  → 引擎层 streaming fbank + causal AE
+Phase 2.5 VAD（实施 → 发现问题 → 简化 ✅）:
+  第一阶段 — VAD + 增量推理（杂交）:
+    → Qwen3AsrTestActivity.kt: VAD 状态机 + Timer + 增量 + FINAL (+120/-40 行)
+    → 实机测试发现：增量+FINAL 并发导致 prompt 污染和 pending_audio_ 覆盖
+    → 尝试 deferred FINAL 修复（仍不够好）
+  
+  第二阶段 — 纯 VAD 分段（最终方案）:
+    → 删除全部增量推理代码（-217 行）
+    → processSegment(samples) 单一推理入口
+    → 无 Timer、无 LIVE 卡片、无并发风险
+    → 代码从 1241 行简化到 1024 行
+    → Code Review 发现：跨段并发需要 segmentInferenceInProgress 防护（待提交）
+
+  关键认知：
+    VAD 精确知道"一句话什么时候结束" → 不需要盲推的滑动窗口增量推理。
+    Phase 2 的滑动窗口是"不知道什么时候结束"时的 workaround，
+    Phase 2.5 的 VAD 解决了这个问题后，增量推理就从"必要之恶"变成了"纯危害"。
+    设计冲突的根本：Phase 2 和 Phase 2.5 是为不同约束条件设计的方案，直接混合会产生问题。
+
+Phase 3a（推荐优先实施，概率 ~75%）:
+  → audio.cpp: whisper_fbank_streaming()（overlap buffer + 增量 STFT）
+  → omni.cpp: Sliding Window Context AE（左上下文 + 新帧 → 增量输出）
+  → 仍然每次重新 prefill Decoder（与当前单次推理相同）
+  → 收益验证：AE 计算量减少 ~40%
+  → 精度验证：实机 WER 对比（增量 vs 全量）
+  → 工作量：1-2 周 → 决策门：是否继续 3b
+
+Phase 3b（依赖 3a 验证通过，概率 ~40%）:
+  → llm.cpp: 改造 attention_mask 支持增量形状 [T_new, prev+T_new]
+  → llm.cpp: generate_init() 变体（保留 KV cache 状态）
+  → omni.cpp: embedding() 增量模式（仅构建新 chunk embedding）
+  → omni.cpp: responseStreaming() 新入口
+  → 首 token 延迟 ~600ms → ~200ms
+  → 工作量：3-5 周
+
+Phase 3c（不在当前工程范围，概率 ~20%）:
+  → 重新训练/微调 AE 以支持 causal attention
+  → 或等待上游 Qwen3-ASR 发布 streaming 版本
 ```
 
 ### Commits 总览
 
 ```
+<待提交>   [LLM:Refact] Remove Phase 2 incremental inference: pure VAD-segmented one-shot ASR (-217 lines)
+<待提交>   [LLM:Bugfix] Defer FINAL inference when incremental is in progress (历史记录，已被后续重构替换)
 d4740636 [LLM:Bugfix] Disable keepHistory in Omni ASR mode to prevent prompt contamination
 11d11b14 [LLM:Bugfix] Fix Phase 2 build: use runOnUiThread instead of withContext in onProgress callback
 438b072f [LLM:Feature] Qwen3-ASR Phase 2: Sliding-window pseudo-streaming for Omni mode
