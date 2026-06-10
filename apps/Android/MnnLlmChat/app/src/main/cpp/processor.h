@@ -42,6 +42,9 @@ private:
     bool HandleVideoTags(const std::string& prompt_text,
                          PromptProcessingResult& result,
                          ProcessorState& state) const;
+    bool HandleAudioTags(const std::string& prompt_text,
+                         PromptProcessingResult& result,
+                         ProcessorState& state) const;
 
     PromptProcessorConfig config_;
 };

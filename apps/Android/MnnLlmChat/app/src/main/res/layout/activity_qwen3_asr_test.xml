@@ -38,6 +38,7 @@
 
         <!-- Mode Toggle -->
         <LinearLayout
+            android:id="@+id/modeSelector"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
@@ -71,6 +72,20 @@
                 android:clickable="true"
                 android:focusable="true"
                 android:foreground="?attr/selectableItemBackgroundBorderless" />
+
+            <TextView
+                android:id="@+id/chipOmni"
+                android:layout_width="100dp"
+                android:layout_height="40dp"
+                android:text="Omni"
+                android:gravity="center"
+                android:textColor="#888899"
+                android:textSize="14sp"
+                android:background="@drawable/bg_mode_chip_normal"
+                android:clickable="true"
+                android:focusable="true"
+                android:foreground="?attr/selectableItemBackgroundBorderless"
+                android:visibility="gone" />
         </LinearLayout>
 
         <!-- Recording Section -->

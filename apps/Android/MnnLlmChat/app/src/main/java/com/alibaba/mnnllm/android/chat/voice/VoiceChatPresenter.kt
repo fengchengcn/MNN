@@ -640,7 +640,7 @@ class VoiceChatPresenter(
                     omniAudioBuffer.addAll(floatBuf.asList())
                 }
             } else {
-                engine.pushAudio(floatBuf)
+                engine!!.pushAudio(floatBuf)
             }
 
             // Endpoint: sustained silence after speech
@@ -672,8 +672,10 @@ class VoiceChatPresenter(
                 }
                 if (omniAudioBuffer.isEmpty()) {
                     Log.w(TAG, "Omni: no audio data collected, restarting")
-                    kotlinx.coroutines.delay(200)
-                    if (!isStopped) startQwen3Record()
+                    lifecycleScope.launch {
+                        kotlinx.coroutines.delay(200)
+                        if (!isStopped) startQwen3Record()
+                    }
                     return
                 }
                 lifecycleScope.launch {
@@ -703,7 +705,7 @@ class VoiceChatPresenter(
                     }
                 }
 
-                val ok = engine.startDecode()
+                val ok = engine!!.startDecode()
                 Log.i(TAG, "Qwen3 startDecode: $ok, isDecoding=${engine.isDecoding()}")
 
                 if (ok) {
@@ -721,7 +723,7 @@ class VoiceChatPresenter(
                             }
                         }
                     }
-                    val text = engine.getResultText()
+                    val text = engine!!.getResultText()
                     Log.i(TAG, "Qwen3 ASR final: $text, tokens=${engine.getResult()}")
                     engine.reset()
 
@@ -738,7 +740,7 @@ class VoiceChatPresenter(
                     }
                 } else {
                     Log.w(TAG, "Qwen3 startDecode failed")
-                    engine.reset()
+                    engine!!.reset()
                     // Restart listening on decode failure
                     lifecycleScope.launch {
                         kotlinx.coroutines.delay(500)
