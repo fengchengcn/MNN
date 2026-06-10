@@ -265,8 +265,10 @@ void Qwen3AsrEngine::buildPromptTokens() {
     // Build prefix: <|im_start|>system\n{system_msg}\n<|im_end|>\n<|im_start|>user\n
     m_prefix_tokens = {151644, 8948, 198};  // <|im_start|>system\n
 
-    // Encode system message using the tokenizer
-    // A multilingual system prompt improves English/mixed-language recognition
+    // NOTE: Changing system_prompt requires re-testing. Empty prompt caused ASR
+    // failure in Omni engine; Chinese prompt echoed back as output. English
+    // "Transcribe speech to text." tested OK. If modifying, verify in both
+    // Omni (config.json) and QWEN3_OLD (here) paths. See mnn-models/ANALYSIS.md.
     auto sys_msg = tok->encode("You are a helpful assistant.");
     m_prefix_tokens.insert(m_prefix_tokens.end(), sys_msg.begin(), sys_msg.end());
     m_prefix_tokens.push_back(198);   // \n
