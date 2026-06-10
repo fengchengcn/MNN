@@ -38,6 +38,8 @@ import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.Timer
+import java.util.TimerTask
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.sqrt
@@ -90,6 +92,14 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     @Volatile private var speechDetected = false
     @Volatile private var currentRms = 0f
     private val omniAudioBuffer = mutableListOf<Float>()  // Omni: accumulate PCM float samples
+
+    // ── Phase 2: Sliding-window pseudo-streaming state ──
+    private var streamingTimer: Timer? = null
+    private var lastProcessedLen = 0
+    private var recordingStartTime = 0L
+    @Volatile private var streamingIncrementalInProgress = false
+    private var streamingResultCard: LinearLayout? = null
+    private var streamingResultTextView: TextView? = null
 
     // ── Blink animation ──
     private var blinkAnimation: AlphaAnimation? = null
@@ -309,7 +319,17 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                 setStatus("● Listening...")
                 tvStatus.startAnimation(blinkAnimation)
             }
-            TestMode.OMNI -> setStatus("● Recording (Omni)... tap STOP when done")
+            TestMode.OMNI -> {
+                setStatus("● Recording (Stream)... tap STOP when done")
+                lastProcessedLen = 0
+                recordingStartTime = System.currentTimeMillis()
+                streamingIncrementalInProgress = false
+                // Remove any stale streaming card from a previous session
+                streamingResultCard?.let { resultsContainer.removeView(it) }
+                streamingResultCard = null
+                streamingResultTextView = null
+                startStreamingTimer()
+            }
         }
 
         // Init audio
@@ -327,6 +347,8 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             // then check stoppedByUser to decide whether to auto-restart.
             stoppedByUser.set(true)
         }
+        // Phase 2: Cancel streaming timer (Omni mode)
+        stopStreamingTimer()
         isRecording.set(false)
         tvStatus.clearAnimation()
     }
@@ -403,7 +425,9 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         isRecording.set(false)
 
         if (isOmni) {
-            // ── Omni mode: write WAV, send to LlmSession ──
+            // ── Phase 2: Stop streaming timer, run final full-buffer inference ──
+            stopStreamingTimer()
+
             val samples = synchronized(omniAudioBuffer) { omniAudioBuffer.toList() }
             omniAudioBuffer.clear()
             if (samples.isEmpty()) {
@@ -414,9 +438,9 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                 btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
                 btnRecord.text = "..."
                 btnRecord.isEnabled = false
-                setStatus("Omni: writing WAV + LLM inference...")
+                setStatus("Final decoding...")
             }
-            processOmniAudio(samples.toFloatArray())
+            processIncrementalOmni(samples.toFloatArray(), isFinal = true)
         } else if (isStreaming) {
             // Decide what to do based on speech and user intent
             if (speechDetected) {
@@ -510,58 +534,176 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         }
     }
 
-    private fun processOmniAudio(samples: FloatArray) {
+    // ══════════════════════════════════════════════
+    //  Phase 2: Streaming Timer & Incremental Omni
+    // ══════════════════════════════════════════════
+
+    private fun startStreamingTimer() {
+        streamingTimer = Timer("omni-stream", true).apply {
+            scheduleAtFixedRate(object : TimerTask() {
+                override fun run() {
+                    if (!isRecording.get() || streamingIncrementalInProgress) return
+
+                    val snapshot = synchronized(omniAudioBuffer) { omniAudioBuffer.toFloatArray() }
+                    val newSamples = snapshot.size - lastProcessedLen
+                    // Skip if less than 1 second of new audio (avoids redundant inference)
+                    if (newSamples < SAMPLE_RATE) return
+
+                    lastProcessedLen = snapshot.size
+                    streamingIncrementalInProgress = true
+
+                    val elapsed = (System.currentTimeMillis() - recordingStartTime) / 1000f
+                    runOnUiThread {
+                        setStatus("Streaming — recorded %.1fs, processing...".format(elapsed))
+                    }
+                    Log.i(TAG, "Phase2 incremental: ${snapshot.size} samples, ${newSamples} new")
+                    processIncrementalOmni(snapshot, isFinal = false)
+                }
+            }, 2000, 2000)  // initial delay 2s, then every 2s
+        }
+    }
+
+    private fun stopStreamingTimer() {
+        streamingTimer?.cancel()
+        streamingTimer = null
+    }
+
+    /**
+     * Send audio to Omni engine and handle progress. Used for both:
+     * - Incremental snapshots during recording (isFinal=false): updates live streaming card
+     * - Final full-buffer inference at STOP (isFinal=true): finalizes result and returns to idle
+     */
+    private fun processIncrementalOmni(samples: FloatArray, isFinal: Boolean) {
         if (llmSession == null) {
-            runOnUiThread {
-                appendSystemMessage("OMNI ERROR: LlmSession not loaded")
-                returnToIdle()
-            }
+            Log.w(TAG, "Phase2: LlmSession is null, skipping")
+            streamingIncrementalInProgress = false
+            if (isFinal) runOnUiThread { returnToIdle() }
             return
         }
 
-        // Phase 1: Direct PCM path — bypass WAV file I/O
         llmSession?.setAudioData(samples, SAMPLE_RATE)
-
-        // Use "stream" as the audio tag content — matches the key in processor.cpp
         val audioTag = "<audio>stream</audio>"
-        Log.i(TAG, "Omni prompt (direct PCM): $audioTag, ${samples.size} samples")
+        Log.i(TAG, "Phase2 ${if (isFinal) "FINAL" else "incr"}: $audioTag, ${samples.size} samples")
 
-        // Run generate on background thread (it blocks)
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 var fullText = ""
-                val result = llmSession?.generate(audioTag, mapOf(), object : GenerateProgressListener {
+                llmSession?.generate(audioTag, mapOf(), object : GenerateProgressListener {
                     override fun onProgress(progress: String?): Boolean {
                         if (progress != null) {
                             fullText += progress
-                            Log.d(TAG, "Omni progress: $progress")
+                            withContext(Dispatchers.Main) {
+                                updateStreamingResult(fullText)
+                            }
                         }
                         return false  // don't cancel
                     }
-                }) ?: emptyMap()
+                })
 
                 val response = fullText
-                Log.i(TAG, "Omni result: $response (decode_len=${result["decode_len"]})")
+                Log.i(TAG, "Phase2 ${if (isFinal) "FINAL" else "incr"} result: $response")
 
                 withContext(Dispatchers.Main) {
-                    if (response.isNotBlank()) {
-                        addResultCard(response)
-                        appendSystemMessage("Omni OK — decode_len=${result["decode_len"]}, " +
-                            "audio_time=${result["audio_time"]}ms, " +
-                            "decode_time=${result["decode_time"]}ms")
+                    if (isFinal) {
+                        finalizeStreamingResult(response)
                     } else {
-                        appendSystemMessage("Omni: empty response (check logs)")
+                        // Incremental done — update status with elapsed time
+                        if (isRecording.get()) {
+                            val elapsed = (System.currentTimeMillis() - recordingStartTime) / 1000f
+                            setStatus("Streaming — recorded %.1fs".format(elapsed))
+                        }
                     }
-                    returnToIdle()
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Omni generate error", e)
+                Log.e(TAG, "Phase2 Omni error", e)
                 withContext(Dispatchers.Main) {
-                    appendSystemMessage("OMNI ERROR: ${e.message}")
-                    returnToIdle()
+                    if (isFinal) {
+                        appendSystemMessage("OMNI ERROR: ${e.message}")
+                        returnToIdle()
+                    }
                 }
+            } finally {
+                streamingIncrementalInProgress = false
             }
         }
+    }
+
+    // ── Streaming Result UI ──
+
+    /** Create or get the live streaming result card (idempotent) */
+    private fun ensureStreamingCard() {
+        if (streamingResultCard != null) return
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundResource(R.drawable.bg_asr_result_card)
+            val pad = dp(16)
+            setPadding(pad, pad, pad, pad)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(12) }
+        }
+
+        // Header: LIVE badge + elapsed time
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+        }
+
+        val liveBadge = TextView(this).apply {
+            setText("● LIVE")
+            setTextColor(Color.parseColor("#FF4444"))
+            textSize = 11f
+            setTypeface(typeface, Typeface.BOLD)
+            val bpad = dp(6)
+            setPadding(bpad, dp(2), bpad, dp(2))
+        }
+        header.addView(liveBadge)
+
+        val textView = TextView(this).apply {
+            setTextColor(Color.parseColor("#E0E0EE"))
+            textSize = 16f
+            setLineSpacing(dp(4).toFloat(), 1.0f)
+            setTextIsSelectable(true)
+            setText("Listening...")
+        }
+
+        card.addView(header)
+        card.addView(textView)
+
+        // Insert at top of results container
+        resultsContainer.addView(card, 0)
+        tvEmptyResults.visibility = View.GONE
+
+        streamingResultCard = card
+        streamingResultTextView = textView
+    }
+
+    /** Update the streaming card text in real-time */
+    private fun updateStreamingResult(text: String) {
+        ensureStreamingCard()
+        streamingResultTextView?.text = text.ifBlank { "Listening..." }
+    }
+
+    /** Replace the live streaming card with a permanent result card, then return to idle */
+    private fun finalizeStreamingResult(text: String) {
+        // Remove live streaming card
+        streamingResultCard?.let { resultsContainer.removeView(it) }
+        streamingResultCard = null
+        streamingResultTextView = null
+
+        if (text.isNotBlank()) {
+            addResultCard(text)
+            val duration = (System.currentTimeMillis() - recordingStartTime) / 1000f
+            appendSystemMessage("Omni OK — %.1fs audio decoded".format(duration))
+        } else {
+            appendSystemMessage("Omni: empty response (check logs)")
+        }
+        returnToIdle()
     }
 
     // ══════════════════════════════════════════════
@@ -651,6 +793,10 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     // ══════════════════════════════════════════════
 
     private fun returnToIdle() {
+        // Phase 2: Clean up streaming resources
+        stopStreamingTimer()
+        streamingIncrementalInProgress = false
+
         btnRecord.text = "REC"
         btnRecord.setBackgroundResource(R.drawable.bg_rec_button_idle)
         btnRecord.isEnabled = true
@@ -660,7 +806,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         when (currentMode) {
             TestMode.BATCH -> setStatus("Ready — tap REC to try again")
             TestMode.STREAMING -> setStatus("Streaming stopped — tap REC to restart")
-            TestMode.OMNI -> setStatus("Omni ready — tap REC to test")
+            TestMode.OMNI -> setStatus("Omni ready — tap REC to test (streaming mode)")
         }
     }
 
@@ -774,6 +920,8 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         tvEmptyResults.visibility = View.VISIBLE
         btnClear.visibility = View.GONE
         resultCardCount = 0
+        streamingResultCard = null
+        streamingResultTextView = null
     }
 
     // ══════════════════════════════════════════════
@@ -823,6 +971,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     override fun onStop() {
         super.onStop()
         tvStatus.clearAnimation()
+        stopStreamingTimer()
         // Pause recording when app goes to background
         if (isRecording.get()) {
             stoppedByUser.set(true)
@@ -836,6 +985,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         stoppedByUser.set(true)
         isRecording.set(false)
         tvStatus.clearAnimation()
+        stopStreamingTimer()
         stopAudioHardware()
         engine?.release()
         engine = null
