@@ -1,0 +1,39 @@
+{
+  "llm_model": "llm.mnn",
+  "llm_weight": "llm.mnn.weight",
+  "backend_type": "cpu",
+  "thread_num": 4,
+  "precision": "low",
+  "memory": "low",
+  "sampler_type": "mixed",
+  "temperature": 0.01,
+  "top_k": 40,
+  "top_p": 0.9,
+  "min_p": 0.05,
+  "tfs_z": 1.0,
+  "typical": 0.95,
+  "repetition_penalty": 1.05,
+  "presence_penalty": 0.0,
+  "frequency_penalty": 0.0,
+  "penalty_window": 0,
+  "n_gram": 8,
+  "ngram_factor": 1.0,
+  "tokenizer_file": "tokenizer.mtok",
+  "is_audio": true,
+  "audio_type": "qwen3_asr",
+  "audio_model": "audio.mnn",
+  "audio_pad": 151676,
+  "audio_start": 151669,
+  "audio_end": 151670,
+  "system_prompt": "Transcribe speech to text.",
+  "mllm": {
+    "backend_type": "cpu",
+    "thread_num": 4,
+    "precision": "normal",
+    "memory": "low"
+  },
+  "jinja": {
+    "chat_template": "{% if messages[0]['role'] == 'system' %}<|im_start|>system\n{{ messages[0]['content'] }}<|im_end|>\n{% endif %}<|im_start|>user\n{{ messages[1]['content'] }}<|im_end|>\n{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}",
+    "eos": "<|im_end|>"
+  }
+}

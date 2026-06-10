@@ -28,7 +28,10 @@ import com.alibaba.mnnllm.android.llm.ChatService
 import com.alibaba.mnnllm.android.llm.GenerateProgressListener
 import com.alibaba.mnnllm.android.llm.LlmSession
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
@@ -38,8 +41,6 @@ import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.Timer
-import java.util.TimerTask
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.sqrt
@@ -59,6 +60,12 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         private const val MAX_SILENCE_CHUNKS = 15
         private const val MAX_TOTAL_CHUNKS = 300
         private const val CHUNK_INTERVAL_MS = 100
+
+        // ── VAD thresholds for Omni mode (float PCM, normalized to ±1.0) ──
+        private const val OMNI_SPEECH_RMS = 0.005f       // speech detection threshold
+        private const val OMNI_SILENCE_RMS = 0.003f      // silence threshold
+        private const val OMNI_MIN_SPEECH_FRAMES = 5     // 500ms minimum speech before trigger
+        private const val OMNI_MAX_SILENCE_FRAMES = 8    // 800ms pause = segment boundary
     }
 
     // ── UI ──
@@ -93,13 +100,23 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     @Volatile private var currentRms = 0f
     private val omniAudioBuffer = mutableListOf<Float>()  // Omni: accumulate PCM float samples
 
-    // ── Phase 2: Sliding-window pseudo-streaming state ──
-    private var streamingTimer: Timer? = null
-    private var lastProcessedLen = 0
-    private var recordingStartTime = 0L
-    @Volatile private var streamingIncrementalInProgress = false
-    private var streamingResultCard: LinearLayout? = null
-    private var streamingResultTextView: TextView? = null
+    // ── VAD + Segment state ──
+    private enum class VadState { SILENCE, SPEAKING }
+    @Volatile private var omniVadState = VadState.SILENCE
+    private var omniSilenceFrames = 0
+    private var omniSpeechFrames = 0
+    private var omniSegmentCount = 0
+    private val omniPreSpeechRing = mutableListOf<Float>()  // 1s ring buffer for pre-speech context
+    private var omniAllResults = StringBuilder()             // accumulated across segments
+    private var idleReturned = false                         // guard against double returnToIdle()
+    private var segmentStartTime = 0L                        // for logging segment duration
+
+    // ── Serial segment processing (sherpa-onnx pattern) ──
+    private lateinit var segmentChannel: Channel<FloatArray>
+    private var segmentConsumerJob: Job? = null
+
+    // ── Omni sub-mode: VAD vs BATCH ──
+    private var omniUseVad = true  // true=VAD-segmented, false=full-audio BATCH
 
     // ── Blink animation ──
     private var blinkAnimation: AlphaAnimation? = null
@@ -153,7 +170,17 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         // Listeners
         chipBatch.setOnClickListener { switchMode(TestMode.BATCH) }
         chipStreaming.setOnClickListener { switchMode(TestMode.STREAMING) }
-        chipOmni.setOnClickListener { switchMode(TestMode.OMNI) }
+        chipOmni.setOnClickListener {
+            if (currentMode == TestMode.OMNI && !isRecording.get()) {
+                // Toggle VAD / BATCH sub-mode
+                omniUseVad = !omniUseVad
+                updateOmniChipLabel()
+                val label = if (omniUseVad) "VAD-segmented" else "BATCH (full audio)"
+                setStatus("Omni $label — tap REC to test")
+            } else {
+                switchMode(TestMode.OMNI)
+            }
+        }
         btnRecord.setOnClickListener {
             if (isRecording.get()) {
                 stopRecording()
@@ -291,9 +318,15 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             TestMode.OMNI -> {
                 chipOmni.setBackgroundResource(R.drawable.bg_mode_chip_selected)
                 chipOmni.setTextColor(Color.WHITE)
-                setStatus("Omni mode — LLM-powered ASR (WAV → Omni engine)")
+                updateOmniChipLabel()
+                val label = if (omniUseVad) "VAD-segmented" else "BATCH (full audio)"
+                setStatus("Omni $label — tap REC to test")
             }
         }
+    }
+
+    private fun updateOmniChipLabel() {
+        chipOmni.text = if (omniUseVad) "OMNI-VAD" else "OMNI-BATCH"
     }
 
     // ══════════════════════════════════════════════
@@ -305,6 +338,8 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
         engine?.reset()
         omniAudioBuffer.clear()
+        omniPreSpeechRing.clear()
+        idleReturned = false
         isRecording.set(true)
         stoppedByUser.set(false)
         silenceChunkCount = 0
@@ -321,21 +356,32 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                 tvStatus.startAnimation(blinkAnimation)
             }
             TestMode.OMNI -> {
-                setStatus("● Recording (Stream)... tap STOP when done")
-                lastProcessedLen = 0
-                recordingStartTime = System.currentTimeMillis()
-                streamingIncrementalInProgress = false
-                // Remove any stale streaming card from a previous session
-                streamingResultCard?.let { resultsContainer.removeView(it) }
-                streamingResultCard = null
-                streamingResultTextView = null
-                startStreamingTimer()
+                omniSegmentCount = 0
+                omniAllResults.clear()
+                if (omniUseVad) {
+                    // ── Init VAD state ──
+                    omniVadState = VadState.SILENCE
+                    omniSilenceFrames = 0
+                    omniSpeechFrames = 0
+                    setStatus("● Recording — waiting for speech...")
+                } else {
+                    // ── BATCH mode: accumulate until STOP ──
+                    setStatus("● Recording (BATCH) — tap STOP when done")
+                }
             }
         }
 
         // Init audio
         initAudioRecord()
         audioRecord?.startRecording()
+
+        // Start serial segment consumer (sherpa-onnx pattern: one consumer, no concurrent inference)
+        if (currentMode == TestMode.OMNI) {
+            segmentChannel = Channel(Channel.UNLIMITED)
+            segmentConsumerJob = lifecycleScope.launch(Dispatchers.IO) {
+                runSegmentConsumer()
+            }
+        }
 
         val chunkSize = (CHUNK_INTERVAL_MS * SAMPLE_RATE / 1000).toInt()
         recordingThread = Thread { recordingLoop(chunkSize) }
@@ -348,8 +394,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             // then check stoppedByUser to decide whether to auto-restart.
             stoppedByUser.set(true)
         }
-        // Phase 2: Cancel streaming timer (Omni mode)
-        stopStreamingTimer()
+        // Omni: signal recording thread to stop; any active segment will be finalized
         isRecording.set(false)
         tvStatus.clearAnimation()
     }
@@ -372,16 +417,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
             val floatBuf = FloatArray(ret) { i -> shortBuf[i] / 32768.0f }
 
-            if (isOmni) {
-                // Omni mode: collect audio samples for WAV writing
-                synchronized(omniAudioBuffer) {
-                    omniAudioBuffer.addAll(floatBuf.asList())
-                }
-            } else {
-                engine?.pushAudio(floatBuf)
-            }
-
-            // RMS on raw int16 values (thresholds are in raw PCM scale)
+            // Compute RMS early — needed by VAD before buffer operations
             var sumSq = 0f
             for (i in 0 until ret) {
                 val s = shortBuf[i].toFloat()
@@ -390,6 +426,60 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             val rms = sqrt(sumSq / ret)
             currentRms = rms
             runOnUiThread { updateAudioLevel(rms) }
+
+            if (isOmni) {
+                if (!omniUseVad) {
+                    // ── BATCH mode: just accumulate all audio ──
+                    synchronized(omniAudioBuffer) {
+                        omniAudioBuffer.addAll(floatBuf.toList())
+                    }
+                } else {
+                    // ── VAD-driven segment management ──
+                    // Compute float-domain RMS for Omni VAD (float PCM, range ~0-1）
+                    var floatSumSq = 0f
+                    for (i in 0 until ret) {
+                        floatSumSq += floatBuf[i] * floatBuf[i]
+                    }
+                    val floatRms = sqrt(floatSumSq / ret)
+                    val isSpeech = floatRms > OMNI_SPEECH_RMS
+
+                    when (omniVadState) {
+                        VadState.SILENCE -> {
+                            // Keep a 1s ring buffer for pre-speech context
+                            synchronized(omniPreSpeechRing) {
+                                omniPreSpeechRing.addAll(floatBuf.toList())
+                                val ringMax = SAMPLE_RATE  // 1 second
+                                while (omniPreSpeechRing.size > ringMax) {
+                                    omniPreSpeechRing.removeAt(0)
+                                }
+                            }
+                            if (isSpeech) {
+                                omniSpeechFrames++
+                                if (omniSpeechFrames >= OMNI_MIN_SPEECH_FRAMES) {
+                                    enterSpeakingState()
+                                }
+                            } else {
+                                omniSpeechFrames = 0
+                            }
+                        }
+                        VadState.SPEAKING -> {
+                            synchronized(omniAudioBuffer) {
+                                omniAudioBuffer.addAll(floatBuf.toList())
+                            }
+                            if (isSpeech) {
+                                omniSilenceFrames = 0
+                            } else if (floatRms < OMNI_SILENCE_RMS) {
+                                omniSilenceFrames++
+                                if (omniSilenceFrames >= OMNI_MAX_SILENCE_FRAMES) {
+                                    endCurrentSegment()
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                engine?.pushAudio(floatBuf)
+            }
 
             if (isStreaming) {
                 // VAD logic
@@ -426,22 +516,62 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         isRecording.set(false)
 
         if (isOmni) {
-            // ── Phase 2: Stop streaming timer, run final full-buffer inference ──
-            stopStreamingTimer()
+            if (!omniUseVad) {
+                // ── BATCH mode: send entire recording as one segment ──
+                val snapshot = synchronized(omniAudioBuffer) { omniAudioBuffer.toFloatArray() }
+                omniAudioBuffer.clear()
+                omniPreSpeechRing.clear()
+                omniSegmentCount = 1
 
-            val samples = synchronized(omniAudioBuffer) { omniAudioBuffer.toList() }
-            omniAudioBuffer.clear()
-            if (samples.isEmpty()) {
+                if (snapshot.isNotEmpty()) {
+                    runOnUiThread {
+                        btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
+                        btnRecord.text = "..."
+                        btnRecord.isEnabled = false
+                        setStatus("BATCH decoding ${snapshot.size} samples (%.1fs)...".format(snapshot.size / SAMPLE_RATE.toFloat()))
+                    }
+                    segmentChannel.trySend(snapshot)
+                }
+
+                // Close channel and wait for consumer to finish
+                segmentChannel.close()
+                try {
+                    runBlocking { segmentConsumerJob?.join() }
+                } catch (_: Exception) {}
                 runOnUiThread { returnToIdle() }
                 return
             }
-            runOnUiThread {
-                btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
-                btnRecord.text = "..."
-                btnRecord.isEnabled = false
-                setStatus("Final decoding...")
+
+            // ── VAD mode: Flush + close channel (sherpa-onnx pattern) ──
+            if (omniVadState == VadState.SPEAKING) {
+                omniVadState = VadState.SILENCE
+                omniSilenceFrames = 0
+                omniSpeechFrames = 0
+
+                val snapshot = synchronized(omniAudioBuffer) { omniAudioBuffer.toFloatArray() }
+                omniAudioBuffer.clear()
+                omniPreSpeechRing.clear()
+
+                if (snapshot.isNotEmpty()) {
+                    runOnUiThread {
+                        btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
+                        btnRecord.text = "..."
+                        btnRecord.isEnabled = false
+                        setStatus("Final decoding...")
+                    }
+                    segmentChannel.trySend(snapshot)
+                }
             }
-            processIncrementalOmni(samples.toFloatArray(), isFinal = true)
+
+            // Close channel and wait for consumer to finish all segments
+            omniPreSpeechRing.clear()
+            omniAudioBuffer.clear()
+            segmentChannel.close()
+            try {
+                runBlocking { segmentConsumerJob?.join() }
+            } catch (_: Exception) {}
+            runOnUiThread { returnToIdle() }
+            return
         } else if (isStreaming) {
             // Decide what to do based on speech and user intent
             if (speechDetected) {
@@ -476,7 +606,6 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         }
     }
 
-    // ══════════════════════════════════════════════
     // ══════════════════════════════════════════════
     //  Omni: Write WAV and Send to LlmSession
     // ══════════════════════════════════════════════
@@ -536,173 +665,148 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     }
 
     // ══════════════════════════════════════════════
-    //  Phase 2: Streaming Timer & Incremental Omni
+    //  VAD State Machine
     // ══════════════════════════════════════════════
 
-    private fun startStreamingTimer() {
-        streamingTimer = Timer("omni-stream", true).apply {
-            scheduleAtFixedRate(object : TimerTask() {
-                override fun run() {
-                    if (!isRecording.get() || streamingIncrementalInProgress) return
+    /** Called when VAD detects sustained speech: enter SPEAKING, start a new segment. */
+    private fun enterSpeakingState() {
+        if (!isRecording.get()) return  // Race guard: recording stopped between VAD check and this call
+        omniVadState = VadState.SPEAKING
+        omniSilenceFrames = 0
+        omniSegmentCount++
+        segmentStartTime = System.currentTimeMillis()
 
-                    val snapshot = synchronized(omniAudioBuffer) { omniAudioBuffer.toFloatArray() }
-                    val newSamples = snapshot.size - lastProcessedLen
-                    // Skip if less than 1 second of new audio (avoids redundant inference)
-                    if (newSamples < SAMPLE_RATE) return
-
-                    lastProcessedLen = snapshot.size
-                    streamingIncrementalInProgress = true
-
-                    val elapsed = (System.currentTimeMillis() - recordingStartTime) / 1000f
-                    runOnUiThread {
-                        setStatus("Streaming — recorded %.1fs, processing...".format(elapsed))
-                    }
-                    Log.i(TAG, "Phase2 incremental: ${snapshot.size} samples, ${newSamples} new")
-                    processIncrementalOmni(snapshot, isFinal = false)
-                }
-            }, 2000, 2000)  // initial delay 2s, then every 2s
+        // Build segment buffer: pre-speech ring tail (context) + clear for new audio
+        synchronized(omniPreSpeechRing) {
+            val context = omniPreSpeechRing.toList()
+            omniPreSpeechRing.clear()
+            synchronized(omniAudioBuffer) {
+                omniAudioBuffer.clear()
+                omniAudioBuffer.addAll(context)
+            }
         }
-    }
 
-    private fun stopStreamingTimer() {
-        streamingTimer?.cancel()
-        streamingTimer = null
+        runOnUiThread {
+            setStatus("● Segment #$omniSegmentCount — speaking...")
+        }
+        Log.i(TAG, "VAD: enterSpeakingState — segment #$omniSegmentCount, " +
+                "context=${omniAudioBuffer.size} samples")
     }
 
     /**
-     * Send audio to Omni engine and handle progress. Used for both:
-     * - Incremental snapshots during recording (isFinal=false): updates live streaming card
-     * - Final full-buffer inference at STOP (isFinal=true): finalizes result and returns to idle
+     * Called when VAD detects sustained silence: end current segment, send to Omni engine
+     * for one-shot transcription. No incremental inference — pure VAD-segmented ASR.
      */
-    private fun processIncrementalOmni(samples: FloatArray, isFinal: Boolean) {
-        if (llmSession == null) {
-            Log.w(TAG, "Phase2: LlmSession is null, skipping")
-            streamingIncrementalInProgress = false
-            if (isFinal) runOnUiThread { returnToIdle() }
+    private fun endCurrentSegment() {
+        if (!isRecording.get()) return  // Race guard: user pressed STOP while VAD was counting silence
+        omniVadState = VadState.SILENCE
+        omniSilenceFrames = 0
+        omniSpeechFrames = 0
+
+        val snapshot = synchronized(omniAudioBuffer) { omniAudioBuffer.toFloatArray() }
+        omniAudioBuffer.clear()
+
+        val segNum = omniSegmentCount
+        Log.i(TAG, "VAD: endCurrentSegment — segment #$segNum, ${snapshot.size} samples")
+
+        val minSpeechSamples = OMNI_MIN_SPEECH_FRAMES * (CHUNK_INTERVAL_MS * SAMPLE_RATE / 1000)
+        if (snapshot.size < minSpeechSamples) {
+            Log.i(TAG, "VAD: segment #$segNum too short (${snapshot.size} < $minSpeechSamples), skipping")
+            runOnUiThread {
+                setStatus("Segment too short — listening...")
+            }
             return
         }
 
-        llmSession?.setAudioData(samples, SAMPLE_RATE)
+        runOnUiThread {
+            btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
+            btnRecord.text = "..."
+            btnRecord.isEnabled = false
+            setStatus("Segment #$segNum — transcribing...")
+        }
+        segmentChannel.trySend(snapshot)
+    }
+
+    // ══════════════════════════════════════════════
+    //  Omni Segment Inference (one-shot per VAD segment)
+    // ══════════════════════════════════════════════
+
+    /**
+     * Serial consumer coroutine: reads segments from the Channel and processes them
+     * one at a time. This matches the sherpa-onnx pattern — no concurrent inference.
+     * Concurrency would risk pending_audio_ overwrite and prompt contamination.
+     */
+    private suspend fun runSegmentConsumer() {
+        try {
+            for (samples in segmentChannel) {
+                processSegmentSync(samples)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Segment consumer error", e)
+        }
+    }
+
+    /**
+     * Synchronous segment processing — called from the serial consumer coroutine.
+     * No coroutine launch: the consumer processes segments one at a time.
+     */
+    private suspend fun processSegmentSync(samples: FloatArray) {
+        if (llmSession == null) {
+            Log.w(TAG, "processSegmentSync: LlmSession is null, skipping")
+            return
+        }
+
+        val segNum = omniSegmentCount
+        val segStart = segmentStartTime
         val audioTag = "<audio>stream</audio>"
-        Log.i(TAG, "Phase2 ${if (isFinal) "FINAL" else "incr"}: $audioTag, ${samples.size} samples")
+        Log.i(TAG, "processSegment #$segNum: $audioTag, ${samples.size} samples")
 
-        lifecycleScope.launch(Dispatchers.IO) {
-            try {
-                var fullText = ""
-                llmSession?.generate(audioTag, mapOf(), object : GenerateProgressListener {
-                    override fun onProgress(progress: String?): Boolean {
-                        if (progress != null) {
-                            fullText += progress
-                            runOnUiThread { updateStreamingResult(fullText) }
-                        }
-                        return false  // don't cancel
-                    }
-                })
+        try {
+            llmSession?.setAudioData(samples, SAMPLE_RATE)
 
-                val response = fullText
-                Log.i(TAG, "Phase2 ${if (isFinal) "FINAL" else "incr"} result: $response")
-
-                withContext(Dispatchers.Main) {
-                    if (isFinal) {
-                        finalizeStreamingResult(response)
-                    } else {
-                        // Incremental done — update status with elapsed time
-                        if (isRecording.get()) {
-                            val elapsed = (System.currentTimeMillis() - recordingStartTime) / 1000f
-                            setStatus("Streaming — recorded %.1fs".format(elapsed))
+            var fullText = ""
+            llmSession?.generate(audioTag, mapOf(), object : GenerateProgressListener {
+                override fun onProgress(progress: String?): Boolean {
+                    if (progress != null) {
+                        fullText += progress
+                        val dur = (System.currentTimeMillis() - segStart) / 1000f
+                        runOnUiThread {
+                            setStatus("Segment #$segNum — transcribing... (%.1fs)".format(dur))
                         }
                     }
+                    return false
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Phase2 Omni error", e)
-                withContext(Dispatchers.Main) {
-                    if (isFinal) {
-                        appendSystemMessage("OMNI ERROR: ${e.message}")
-                        returnToIdle()
-                    }
+            })
+
+            val response = fullText
+            Log.i(TAG, "processSegment #$segNum result: $response")
+
+            withContext(Dispatchers.Main) {
+                if (response.isNotBlank()) {
+                    addResultCard(response)
+                    omniAllResults.append(response).append("\n")
+                    val duration = (System.currentTimeMillis() - segStart) / 1000f
+                    appendSystemMessage("Segment #$segNum OK — %.1fs".format(duration))
+                } else {
+                    appendSystemMessage("Segment #$segNum: empty response (check logs)")
                 }
-            } finally {
-                streamingIncrementalInProgress = false
+
+                if (isRecording.get()) {
+                    // Segment ended naturally → prepare for next segment
+                    btnRecord.isEnabled = true
+                    btnRecord.text = "STOP"
+                    btnRecord.setBackgroundResource(R.drawable.bg_rec_button_active)
+                    setStatus("Segment #$segNum done — listening...")
+                }
+                // Note: returnToIdle() is called by recordingLoop after channel closes,
+                // not here — that ensures all segments are processed before going idle.
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "processSegment error", e)
+            withContext(Dispatchers.Main) {
+                appendSystemMessage("OMNI ERROR: ${e.message}")
             }
         }
-    }
-
-    // ── Streaming Result UI ──
-
-    /** Create or get the live streaming result card (idempotent) */
-    private fun ensureStreamingCard() {
-        if (streamingResultCard != null) return
-
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundResource(R.drawable.bg_asr_result_card)
-            val pad = dp(16)
-            setPadding(pad, pad, pad, pad)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12) }
-        }
-
-        // Header: LIVE badge + elapsed time
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(8) }
-        }
-
-        val liveBadge = TextView(this).apply {
-            setText("● LIVE")
-            setTextColor(Color.parseColor("#FF4444"))
-            textSize = 11f
-            setTypeface(typeface, Typeface.BOLD)
-            val bpad = dp(6)
-            setPadding(bpad, dp(2), bpad, dp(2))
-        }
-        header.addView(liveBadge)
-
-        val textView = TextView(this).apply {
-            setTextColor(Color.parseColor("#E0E0EE"))
-            textSize = 16f
-            setLineSpacing(dp(4).toFloat(), 1.0f)
-            setTextIsSelectable(true)
-            setText("Listening...")
-        }
-
-        card.addView(header)
-        card.addView(textView)
-
-        // Insert at top of results container
-        resultsContainer.addView(card, 0)
-        tvEmptyResults.visibility = View.GONE
-
-        streamingResultCard = card
-        streamingResultTextView = textView
-    }
-
-    /** Update the streaming card text in real-time */
-    private fun updateStreamingResult(text: String) {
-        ensureStreamingCard()
-        streamingResultTextView?.text = text.ifBlank { "Listening..." }
-    }
-
-    /** Replace the live streaming card with a permanent result card, then return to idle */
-    private fun finalizeStreamingResult(text: String) {
-        // Remove live streaming card
-        streamingResultCard?.let { resultsContainer.removeView(it) }
-        streamingResultCard = null
-        streamingResultTextView = null
-
-        if (text.isNotBlank()) {
-            addResultCard(text)
-            val duration = (System.currentTimeMillis() - recordingStartTime) / 1000f
-            appendSystemMessage("Omni OK — %.1fs audio decoded".format(duration))
-        } else {
-            appendSystemMessage("Omni: empty response (check logs)")
-        }
-        returnToIdle()
     }
 
     // ══════════════════════════════════════════════
@@ -792,9 +896,19 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     // ══════════════════════════════════════════════
 
     private fun returnToIdle() {
-        // Phase 2: Clean up streaming resources
-        stopStreamingTimer()
-        streamingIncrementalInProgress = false
+        if (idleReturned) return
+        idleReturned = true
+
+        // Clear Omni session history between recording sessions.
+        // Without this, prompt accumulates across sessions (reset() inside submitNative
+        // only clears per-call history, not session-level cached prompt text).
+        llmSession?.reset()
+
+        // Clean up VAD state
+        omniVadState = VadState.SILENCE
+        omniSilenceFrames = 0
+        omniSpeechFrames = 0
+        omniPreSpeechRing.clear()
 
         btnRecord.text = "REC"
         btnRecord.setBackgroundResource(R.drawable.bg_rec_button_idle)
@@ -805,7 +919,11 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         when (currentMode) {
             TestMode.BATCH -> setStatus("Ready — tap REC to try again")
             TestMode.STREAMING -> setStatus("Streaming stopped — tap REC to restart")
-            TestMode.OMNI -> setStatus("Omni ready — tap REC to test (streaming mode)")
+            TestMode.OMNI -> {
+                val label = if (omniUseVad) "VAD" else "BATCH"
+                val segInfo = if (omniSegmentCount > 0) " (${omniSegmentCount} segments)" else ""
+                setStatus("Omni-$label ready — tap REC to test$segInfo")
+            }
         }
     }
 
@@ -892,7 +1010,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
         resultsContainer.addView(card, 0) // newest at top
 
-        // Only auto-scroll in batch mode; in streaming mode let the user read freely
+        // Only auto-scroll in batch mode; in VAD/streaming mode let the user read freely
         if (currentMode == TestMode.BATCH) {
             findViewById<ScrollView>(R.id.scrollView).post {
                 findViewById<ScrollView>(R.id.scrollView).fullScroll(View.FOCUS_UP)
@@ -919,8 +1037,6 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         tvEmptyResults.visibility = View.VISIBLE
         btnClear.visibility = View.GONE
         resultCardCount = 0
-        streamingResultCard = null
-        streamingResultTextView = null
     }
 
     // ══════════════════════════════════════════════
@@ -970,7 +1086,6 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     override fun onStop() {
         super.onStop()
         tvStatus.clearAnimation()
-        stopStreamingTimer()
         // Pause recording when app goes to background
         if (isRecording.get()) {
             stoppedByUser.set(true)
@@ -984,7 +1099,6 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         stoppedByUser.set(true)
         isRecording.set(false)
         tvStatus.clearAnimation()
-        stopStreamingTimer()
         stopAudioHardware()
         engine?.release()
         engine = null
