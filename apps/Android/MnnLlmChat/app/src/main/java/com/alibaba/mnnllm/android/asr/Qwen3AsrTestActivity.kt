@@ -161,6 +161,11 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             return
         }
 
+        // Hide all mode chips initially — avoid flash of wrong UI before engine detection
+        chipBatch.visibility = View.GONE
+        chipStreaming.visibility = View.GONE
+        chipOmni.visibility = View.GONE
+
         // Init engine
         setStatus("Initializing engine...")
         btnRecord.isEnabled = false
@@ -229,11 +234,40 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         return bestPath
     }
 
+    /**
+     * Scan /data/local/tmp/mnn_models/ for Qwen3-ASR old-engine models.
+     * Detected by presence of audio_encoder.mnn (as used by qwen3_asr_engine.cpp).
+     * Also checks the legacy /data/local/tmp/asr_models path.
+     * Returns the model directory path if found.
+     */
+    private fun findQwen3OldModel(): String? {
+        // ── Priority 1: /data/local/tmp/mnn_models/ (auto-scanned by app) ──
+        val localDir = File("/data/local/tmp/mnn_models")
+        if (localDir.exists() && localDir.isDirectory) {
+            localDir.listFiles()?.forEach { subdir ->
+                if (!subdir.isDirectory) return@forEach
+                if (File(subdir, "audio_encoder.mnn").exists()) {
+                    Log.i(TAG, "Found Qwen3-ASR old model in mnn_models: ${subdir.absolutePath}")
+                    return subdir.absolutePath
+                }
+            }
+        }
+        // ── Priority 2: legacy /data/local/tmp/asr_models ──
+        val legacyDir = File("/data/local/tmp/asr_models")
+        if (legacyDir.exists() && legacyDir.isDirectory) {
+            if (File(legacyDir, "audio_encoder.mnn").exists()) {
+                Log.i(TAG, "Found Qwen3-ASR old model in legacy path: ${legacyDir.absolutePath}")
+                return legacyDir.absolutePath
+            }
+        }
+        return null
+    }
+
     private suspend fun initEngine() {
         try {
-            // ── Omni model detection + loading ──
-            val omniDir = findOmniModel()
+            // ── Step 1: Prefer Omni model (FP16 auto-preferred via findOmniModel scoring) ──
             var omniReady = false
+            val omniDir = findOmniModel()
             if (omniDir != null) {
                 Log.i(TAG, "Omni model dir: $omniDir")
                 withContext(Dispatchers.Main) {
@@ -248,10 +282,10 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                         "omni_test_${System.currentTimeMillis()}",
                         null,          // no history
                         true,          // supportOmni = true
-                        "cpu"          // backendType — GPU (OpenCL/Vulkan) both too slow on Mali-G76
+                        "cpu"          // backendType
                     ) as? LlmSession
                     llmSession?.load()
-                    llmSession?.setKeepHistory(false)  // ASR: each call independent, no history accumulation
+                    llmSession?.setKeepHistory(false)
                     Log.i(TAG, "Omni LlmSession loaded OK")
                     omniModelDir = omniDir
                     omniReady = true
@@ -267,22 +301,68 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                 }
             }
 
+            // ── Step 2: Fallback to Qwen3-ASR old-engine model ──
+            var qwen3OldReady = false
+            if (!omniReady) {
+                val oldDir = findQwen3OldModel()
+                if (oldDir != null) {
+                    Log.i(TAG, "Qwen3-ASR old model dir: $oldDir")
+                    withContext(Dispatchers.Main) {
+                        setStatus("Qwen3-ASR model found — loading...")
+                    }
+
+                    try {
+                        engine = Qwen3AsrEngine()
+                        val ok = engine!!.init(oldDir, cacheDir.absolutePath, numThreads = 4)
+                        if (ok) {
+                            Log.i(TAG, "Qwen3AsrEngine initialized OK")
+                            qwen3OldReady = true
+                            withContext(Dispatchers.Main) {
+                                appendSystemMessage("Qwen3-ASR loaded: $oldDir")
+                            }
+                        } else {
+                            Log.e(TAG, "Qwen3AsrEngine.init() returned false")
+                            engine = null
+                            withContext(Dispatchers.Main) {
+                                appendSystemMessage("Qwen3-ASR init FAILED")
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Qwen3AsrEngine init failed", e)
+                        engine = null
+                        withContext(Dispatchers.Main) {
+                            appendSystemMessage("Qwen3-ASR init FAILED: ${e.message}")
+                        }
+                    }
+                }
+            }
+
             // ── Determine final state ──
             withContext(Dispatchers.Main) {
                 if (omniReady) {
-                    setStatus("Omni ready — tap REC to test")
+                    setStatus("Omni-VAD ready — tap REC to test")
                     chipBatch.visibility = View.GONE
                     chipStreaming.visibility = View.GONE
                     chipOmni.visibility = View.VISIBLE
-                    chipOmni.performClick()  // auto-select Omni mode
+                    chipOmni.performClick()  // auto-select Omni-VAD mode
+                    btnRecord.isEnabled = true
+                } else if (qwen3OldReady) {
+                    // QWEN3_OLD mode: support BATCH + STREAMING, hide OMNI
+                    setStatus("Qwen3-ASR ready — tap REC to test")
+                    chipBatch.visibility = View.VISIBLE
+                    chipStreaming.visibility = View.VISIBLE
+                    chipOmni.visibility = View.GONE
+                    chipBatch.performClick()  // auto-select Batch mode
                     btnRecord.isEnabled = true
                 } else {
-                    setStatus("ERROR: Omni not available")
+                    setStatus("ERROR: No ASR model found")
                     chipBatch.visibility = View.GONE
                     chipStreaming.visibility = View.GONE
                     chipOmni.visibility = View.GONE
-                    appendSystemMessage("Place model at /data/local/tmp/mnn_models/Qwen3-ASR-MNN-INT8/")
-                    appendSystemMessage("Ensure audio.mnn + config.json (is_audio=true) exist")
+                    appendSystemMessage("Place model at /data/local/tmp/mnn_models/<model>/")
+                    appendSystemMessage("Omni: need audio.mnn + config.json with is_audio=true")
+                    appendSystemMessage("Old engine: need audio_encoder.mnn (+ llm_kv_8bit.mnn, etc.)")
+                    appendSystemMessage("Or legacy: /data/local/tmp/asr_models/audio_encoder.mnn")
                     btnRecord.isEnabled = false
                 }
             }
