@@ -392,7 +392,7 @@ class VoiceChatPresenter(
     /**
      * Detect which ASR engine mode to use for the given model directory.
      * - QWEN3_OMNI: audio.mnn + config.json with is_audio=true (new llmexport.py path)
-     * - QWEN3_OLD: audio_encoder.mnn exists (legacy export path)
+     * - QWEN3_OLD: audio_encoder.mnn exists (legacy), OR audio.mnn + embeddings_bf16.bin (new seperate_embed)
      * - SHERPA: default
      */
     private fun detectAsrMode(modelDir: String): AsrMode {
@@ -409,7 +409,15 @@ class VoiceChatPresenter(
                 Log.w(TAG, "Failed to parse config.json: ${e.message}")
             }
         }
-        // Old path: audio_encoder.mnn
+        // New old-engine format: audio.mnn + embeddings_bf16.bin (llmexport.py with seperate_embed)
+        // Not Omni (already checked and rejected above), but compatible with Qwen3AsrEngine.
+        if (File(dir, "audio.mnn").exists() &&
+            File(dir, "embeddings_bf16.bin").exists() &&
+            File(dir, "tokenizer.txt").exists()) {
+            Log.i(TAG, "Qwen3-ASR old-engine model (new format) detected: $modelDir")
+            return AsrMode.QWEN3_OLD
+        }
+        // Legacy path: audio_encoder.mnn
         if (File(dir, "audio_encoder.mnn").exists()) {
             Log.i(TAG, "Legacy Qwen3-ASR model detected: $modelDir")
             return AsrMode.QWEN3_OLD

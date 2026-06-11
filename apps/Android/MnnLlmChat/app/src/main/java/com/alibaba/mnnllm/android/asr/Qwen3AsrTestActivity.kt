@@ -1,6 +1,7 @@
 package com.alibaba.mnnllm.android.asr
 
 import android.Manifest
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
@@ -51,6 +52,14 @@ import kotlin.math.sqrt
 
 enum class TestMode { BATCH, STREAMING, OMNI }
 
+enum class EngineType { OLD_ENGINE, OMNI }
+
+private data class AvailableEngine(
+    val type: EngineType,
+    val modelDir: String,
+    val label: String
+)
+
 class Qwen3AsrTestActivity : AppCompatActivity() {
 
     companion object {
@@ -64,12 +73,19 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         private const val MAX_SILENCE_CHUNKS = 15
         private const val MAX_TOTAL_CHUNKS = 1800  // 3 min safety net (1800 × 100ms)
         private const val CHUNK_INTERVAL_MS = 100
+
+        // SharedPreferences keys
+        private const val PREFS_NAME = "qwen3_asr_test"
+        private const val KEY_ENGINE_TYPE = "engine_type"
+        private const val KEY_ENGINE_DIR = "engine_dir"
     }
 
     // ── UI ──
     private lateinit var chipBatch: TextView
     private lateinit var chipStreaming: TextView
     private lateinit var chipOmni: TextView
+    private lateinit var engineSelector: LinearLayout
+    private val engineChips = mutableListOf<TextView>()
     private lateinit var btnRecord: TextView
     private lateinit var tvStatus: TextView
     private lateinit var tvEmptyResults: TextView
@@ -83,6 +99,9 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     private var engine: Qwen3AsrEngine? = null
     private var llmSession: LlmSession? = null          // Omni path
     private var omniModelDir: String? = null             // Omni model config directory
+    private var availableEngines = listOf<AvailableEngine>()
+    private var selectedEngine: AvailableEngine? = null
+    @Volatile private var isSwitchingEngine = false
     private var audioRecord: AudioRecord? = null
     private var aec: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
@@ -128,6 +147,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         chipBatch = findViewById(R.id.chipBatch)
         chipStreaming = findViewById(R.id.chipStreaming)
         chipOmni = findViewById(R.id.chipOmni)
+        engineSelector = findViewById(R.id.engineSelector)
         btnRecord = findViewById(R.id.btnRecord)
         tvStatus = findViewById(R.id.tvStatus)
         tvEmptyResults = findViewById(R.id.tvEmptyResults)
@@ -180,7 +200,11 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                 omniUseVad = !omniUseVad
                 updateOmniChipLabel()
                 val label = if (omniUseVad) "VAD-segmented" else "BATCH (full audio)"
-                setStatus("Omni $label — tap REC to test")
+                val engLabel = when (selectedEngine?.type) {
+                    EngineType.OMNI -> "Omni"
+                    else -> ""
+                }
+                setStatus("$engLabel $label — tap REC to test")
             } else {
                 switchMode(TestMode.OMNI)
             }
@@ -196,20 +220,45 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     }
 
     // ══════════════════════════════════════════════
-    //  Engine Init
+    //  Engine Discovery & Selection
     // ══════════════════════════════════════════════
 
     /**
-     * Scan /data/local/tmp/mnn_models/ for Omni-compatible audio models.
-     * Prefers FP16 over INT8; returns the config directory path if found.
+     * Scan /data/local/tmp/mnn_models/ for all compatible ASR engines.
+     * Returns a list of AvailableEngine, sorted by preference (FP16 > INT8 within each type).
      */
-    private fun findOmniModel(): String? {
+    private fun scanAllEngines(): List<AvailableEngine> {
+        val result = mutableListOf<AvailableEngine>()
         val localDir = File("/data/local/tmp/mnn_models")
-        if (!localDir.exists() || !localDir.isDirectory) return null
-        var bestPath: String? = null
-        var bestScore = -1  // higher = preferred
+        if (!localDir.exists() || !localDir.isDirectory) return result
+
+        val omniCandidates = mutableListOf<Pair<String, Int>>()  // (dir, score)
+
         localDir.listFiles()?.forEach { subdir ->
             if (!subdir.isDirectory) return@forEach
+
+            // ── Old-engine: legacy naming ──
+            if (File(subdir, "audio_encoder.mnn").exists()) {
+                val label = "Old Engine (${subdir.name})"
+                result.add(AvailableEngine(EngineType.OLD_ENGINE, subdir.absolutePath, label))
+                Log.i(TAG, "Found old-engine model (legacy): ${subdir.absolutePath}")
+            }
+            // ── Old-engine: new naming (seperate_embed, no is_audio) ──
+            else if (File(subdir, "audio.mnn").exists() &&
+                File(subdir, "embeddings_bf16.bin").exists() &&
+                File(subdir, "tokenizer.txt").exists()) {
+                val configFile = File(subdir, "config.json")
+                val isOmni = configFile.exists() && try {
+                    JSONObject(configFile.readText()).optBoolean("is_audio", false)
+                } catch (_: Exception) { false }
+                if (!isOmni) {
+                    val label = "Old Engine (${subdir.name})"
+                    result.add(AvailableEngine(EngineType.OLD_ENGINE, subdir.absolutePath, label))
+                    Log.i(TAG, "Found old-engine model (new format): ${subdir.absolutePath}")
+                }
+            }
+
+            // ── Omni: audio.mnn + config.json with is_audio=true ──
             val audioMnn = File(subdir, "audio.mnn")
             val configJson = File(subdir, "config.json")
             if (audioMnn.exists() && configJson.exists()) {
@@ -222,147 +271,229 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                             name.contains("INT8") -> 1
                             else -> 0
                         }
-                        if (score > bestScore) {
-                            bestScore = score
-                            bestPath = subdir.absolutePath
-                        }
+                        omniCandidates.add(subdir.absolutePath to score)
                     }
                 } catch (_: Exception) {}
             }
         }
-        if (bestPath != null) Log.i(TAG, "Found Omni model: $bestPath (score=$bestScore)")
-        return bestPath
-    }
 
-    /**
-     * Scan /data/local/tmp/mnn_models/ for Qwen3-ASR old-engine models.
-     * Detected by presence of audio_encoder.mnn (as used by qwen3_asr_engine.cpp).
-     * Also checks the legacy /data/local/tmp/asr_models path.
-     * Returns the model directory path if found.
-     */
-    private fun findQwen3OldModel(): String? {
-        // ── Priority 1: /data/local/tmp/mnn_models/ (auto-scanned by app) ──
-        val localDir = File("/data/local/tmp/mnn_models")
-        if (localDir.exists() && localDir.isDirectory) {
-            localDir.listFiles()?.forEach { subdir ->
-                if (!subdir.isDirectory) return@forEach
-                if (File(subdir, "audio_encoder.mnn").exists()) {
-                    Log.i(TAG, "Found Qwen3-ASR old model in mnn_models: ${subdir.absolutePath}")
-                    return subdir.absolutePath
-                }
-            }
+        // Add best Omni model (FP16 preferred, then INT8)
+        val bestOmni = omniCandidates.maxByOrNull { it.second }
+        if (bestOmni != null) {
+            val dir = bestOmni.first
+            val label = "Omni (${File(dir).name})"
+            result.add(AvailableEngine(EngineType.OMNI, dir, label))
+            Log.i(TAG, "Found Omni model: $dir (score=${bestOmni.second})")
         }
-        // ── Priority 2: legacy /data/local/tmp/asr_models ──
+
+        // Also scan legacy asr_models path
         val legacyDir = File("/data/local/tmp/asr_models")
         if (legacyDir.exists() && legacyDir.isDirectory) {
             if (File(legacyDir, "audio_encoder.mnn").exists()) {
-                Log.i(TAG, "Found Qwen3-ASR old model in legacy path: ${legacyDir.absolutePath}")
-                return legacyDir.absolutePath
+                result.add(AvailableEngine(EngineType.OLD_ENGINE, legacyDir.absolutePath, "Old Engine (legacy)"))
+                Log.i(TAG, "Found old-engine model in legacy path: ${legacyDir.absolutePath}")
             }
         }
-        return null
+
+        return result
     }
 
-    private suspend fun initEngine() {
-        try {
-            // ── Step 1: Prefer Omni model (FP16 auto-preferred via findOmniModel scoring) ──
-            var omniReady = false
-            val omniDir = findOmniModel()
-            if (omniDir != null) {
-                Log.i(TAG, "Omni model dir: $omniDir")
-                withContext(Dispatchers.Main) {
-                    setStatus("Omni model found — loading...")
-                }
+    /**
+     * Load a selected engine. Called from IO dispatcher.
+     */
+    private suspend fun loadEngine(eng: AvailableEngine): Boolean {
+        Log.i(TAG, "Loading engine: ${eng.label} (type=${eng.type})")
+        withContext(Dispatchers.Main) {
+            setStatus("Loading ${eng.label}...")
+            btnRecord.isEnabled = false
+            isSwitchingEngine = true
+        }
 
-                try {
-                    val configPath = "$omniDir/config.json"
-                    llmSession = ChatService.provide().createLlmSession(
+        return try {
+            when (eng.type) {
+                EngineType.OLD_ENGINE -> {
+                    val qwen3Eng = Qwen3AsrEngine()
+                    val ok = qwen3Eng.init(eng.modelDir, cacheDir.absolutePath, numThreads = 4)
+                    if (ok) {
+                        this.engine = qwen3Eng
+                        Log.i(TAG, "Qwen3AsrEngine initialized OK")
+                        withContext(Dispatchers.Main) {
+                            appendSystemMessage("Loaded: ${eng.label}")
+                        }
+                        true
+                    } else {
+                        Log.e(TAG, "Qwen3AsrEngine.init() returned false")
+                        withContext(Dispatchers.Main) {
+                            appendSystemMessage("FAILED: ${eng.label}")
+                        }
+                        false
+                    }
+                }
+                EngineType.OMNI -> {
+                    val configPath = "${eng.modelDir}/config.json"
+                    val session = ChatService.provide().createLlmSession(
                         "omni_test",
                         configPath,
                         "omni_test_${System.currentTimeMillis()}",
-                        null,          // no history
-                        true,          // supportOmni = true
-                        "cpu"          // backendType
+                        null,
+                        true,
+                        "cpu"
                     ) as? LlmSession
-                    llmSession?.load()
-                    llmSession?.setKeepHistory(false)
-                    Log.i(TAG, "Omni LlmSession loaded OK")
-                    omniModelDir = omniDir
-                    omniReady = true
-                    withContext(Dispatchers.Main) {
-                        appendSystemMessage("Omni loaded: $omniDir")
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Omni LlmSession load failed", e)
-                    llmSession = null
-                    withContext(Dispatchers.Main) {
-                        appendSystemMessage("Omni load FAILED: ${e.message}")
-                    }
-                }
-            }
-
-            // ── Step 2: Fallback to Qwen3-ASR old-engine model ──
-            var qwen3OldReady = false
-            if (!omniReady) {
-                val oldDir = findQwen3OldModel()
-                if (oldDir != null) {
-                    Log.i(TAG, "Qwen3-ASR old model dir: $oldDir")
-                    withContext(Dispatchers.Main) {
-                        setStatus("Qwen3-ASR model found — loading...")
-                    }
-
-                    try {
-                        engine = Qwen3AsrEngine()
-                        val ok = engine!!.init(oldDir, cacheDir.absolutePath, numThreads = 4)
-                        if (ok) {
-                            Log.i(TAG, "Qwen3AsrEngine initialized OK")
-                            qwen3OldReady = true
-                            withContext(Dispatchers.Main) {
-                                appendSystemMessage("Qwen3-ASR loaded: $oldDir")
-                            }
-                        } else {
-                            Log.e(TAG, "Qwen3AsrEngine.init() returned false")
-                            engine = null
-                            withContext(Dispatchers.Main) {
-                                appendSystemMessage("Qwen3-ASR init FAILED")
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Qwen3AsrEngine init failed", e)
-                        engine = null
+                    session?.load()
+                    session?.setKeepHistory(false)
+                    if (session != null) {
+                        llmSession = session
+                        omniModelDir = eng.modelDir
+                        Log.i(TAG, "Omni LlmSession loaded OK")
                         withContext(Dispatchers.Main) {
-                            appendSystemMessage("Qwen3-ASR init FAILED: ${e.message}")
+                            appendSystemMessage("Loaded: ${eng.label}")
                         }
+                        true
+                    } else {
+                        Log.e(TAG, "Omni LlmSession creation returned null")
+                        withContext(Dispatchers.Main) {
+                            appendSystemMessage("FAILED: ${eng.label}")
+                        }
+                        false
                     }
                 }
             }
-
-            // ── Determine final state ──
+        } catch (e: Exception) {
+            Log.e(TAG, "Engine load failed: ${eng.label}", e)
             withContext(Dispatchers.Main) {
-                if (omniReady) {
-                    setStatus("Omni-VAD ready — tap REC to test")
-                    chipBatch.visibility = View.GONE
-                    chipStreaming.visibility = View.GONE
-                    chipOmni.visibility = View.VISIBLE
-                    chipOmni.performClick()  // auto-select Omni-VAD mode
-                    btnRecord.isEnabled = true
-                } else if (qwen3OldReady) {
-                    // QWEN3_OLD mode: support BATCH + STREAMING, hide OMNI
-                    setStatus("Qwen3-ASR ready — tap REC to test")
-                    chipBatch.visibility = View.VISIBLE
-                    chipStreaming.visibility = View.VISIBLE
-                    chipOmni.visibility = View.GONE
-                    chipBatch.performClick()  // auto-select Batch mode
+                appendSystemMessage("ERROR: ${e.message}")
+            }
+            false
+        } finally {
+            // Always reset switching flag, regardless of success or caller (initEngine/switchToEngine)
+            withContext(Dispatchers.Main) {
+                isSwitchingEngine = false
+            }
+        }
+    }
+
+    /**
+     * Switch to a different engine. Releases current engine, loads new one.
+     * Called from UI thread on engine chip tap.
+     */
+    private fun switchToEngine(target: AvailableEngine) {
+        if (isSwitchingEngine || isRecording.get()) return
+        if (selectedEngine?.modelDir == target.modelDir && selectedEngine?.type == target.type) {
+            return  // already selected
+        }
+
+        // Set guard immediately on UI thread to prevent double-tap race.
+        // loadEngine() will reset it in its finally block.
+        isSwitchingEngine = true
+
+        // Release current engine
+        releaseCurrentEngine()
+        selectedEngine = null
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            val ok = loadEngine(target)
+            withContext(Dispatchers.Main) {
+                if (ok) {
+                    selectedEngine = target
+                    saveEnginePreference(target)
+                    updateEngineChipSelection()
+                    updateModeChipsForEngine(target.type)
+                    selectDefaultMode()
+                    setStatus("${target.label} — tap REC to test")
                     btnRecord.isEnabled = true
                 } else {
+                    // Mark chip as failed (dim it, disable click)
+                    engineChips.forEach { chip ->
+                        if (chip.text == target.label || chip.text.toString().contains(target.label)) {
+                            chip.alpha = 0.3f
+                        }
+                    }
+                    setStatus("Failed to load ${target.label}")
+                    // If other engines are available and loaded, keep them selectable
+                }
+            }
+        }
+    }
+
+    private fun releaseCurrentEngine() {
+        engine?.release()
+        engine = null
+        try { llmSession?.release() } catch (_: Exception) {}
+        llmSession = null
+        omniModelDir = null
+    }
+
+    /**
+     * Main engine initialization flow.
+     * Scans for available engines and either auto-selects (single engine or saved pref)
+     * or shows the selector for user choice.
+     */
+    private suspend fun initEngine() {
+        try {
+            // ── Scan for all available engines ──
+            availableEngines = scanAllEngines()
+
+            if (availableEngines.isEmpty()) {
+                withContext(Dispatchers.Main) {
                     setStatus("ERROR: No ASR model found")
-                    chipBatch.visibility = View.GONE
-                    chipStreaming.visibility = View.GONE
-                    chipOmni.visibility = View.GONE
                     appendSystemMessage("Place model at /data/local/tmp/mnn_models/<model>/")
                     appendSystemMessage("Omni: need audio.mnn + config.json with is_audio=true")
-                    appendSystemMessage("Old engine: need audio_encoder.mnn (+ llm_kv_8bit.mnn, etc.)")
-                    appendSystemMessage("Or legacy: /data/local/tmp/asr_models/audio_encoder.mnn")
+                    appendSystemMessage("Old engine (legacy): audio_encoder.mnn + llm_kv_8bit.mnn + embeddings_bf16.bin")
+                    appendSystemMessage("Old engine (new):   audio.mnn + llm.mnn + embeddings_bf16.bin + tokenizer.txt")
+                    btnRecord.isEnabled = false
+                }
+                return
+            }
+
+            // ── Single engine: auto-select, hide selector ──
+            if (availableEngines.size == 1) {
+                val only = availableEngines[0]
+                val ok = loadEngine(only)
+                withContext(Dispatchers.Main) {
+                    if (ok) {
+                        selectedEngine = only
+                        updateModeChipsForEngine(only.type)
+                        selectDefaultMode()
+                        setStatus("${only.label} — tap REC to test")
+                        btnRecord.isEnabled = true
+                    } else {
+                        setStatus("ERROR: Failed to load ${only.label}")
+                        btnRecord.isEnabled = false
+                    }
+                }
+                return
+            }
+
+            // ── Multiple engines: show selector ──
+            withContext(Dispatchers.Main) { buildEngineSelectorUI() }
+
+            // Try to restore saved preference
+            val savedType = restoreEnginePreferenceType()
+            val savedDir = restoreEnginePreferenceDir()
+            val preferred = if (savedType != null && savedDir != null) {
+                availableEngines.find { it.type.name == savedType && it.modelDir == savedDir }
+            } else null
+
+            if (preferred != null) {
+                val ok = loadEngine(preferred)
+                withContext(Dispatchers.Main) {
+                    if (ok) {
+                        selectedEngine = preferred
+                        updateEngineChipSelection()
+                        updateModeChipsForEngine(preferred.type)
+                        selectDefaultMode()
+                        setStatus("${preferred.label} — tap REC to test")
+                        btnRecord.isEnabled = true
+                    } else {
+                        // Saved engine failed — let user pick another
+                        setStatus("Previous engine failed. Select another:")
+                        btnRecord.isEnabled = false
+                    }
+                }
+            } else {
+                // No saved preference — wait for user choice
+                withContext(Dispatchers.Main) {
+                    setStatus("Select engine to load")
                     btnRecord.isEnabled = false
                 }
             }
@@ -372,6 +503,118 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         }
     }
 
+    // ══════════════════════════════════════════════
+    //  Engine Selector UI
+    // ══════════════════════════════════════════════
+
+    private fun buildEngineSelectorUI() {
+        engineSelector.removeAllViews()
+        engineChips.clear()
+
+        for (eng in availableEngines) {
+            val chip = TextView(this).apply {
+                text = eng.label
+                gravity = Gravity.CENTER
+                textSize = 12f
+                setTypeface(typeface, Typeface.BOLD)
+                val padH = dp(14)
+                val padV = dp(8)
+                setPadding(padH, padV, padH, padV)
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginEnd = dp(4) }
+                setTextColor(Color.parseColor("#888899"))
+                background = resources.getDrawable(R.drawable.bg_mode_chip_normal, null)
+                setOnClickListener { switchToEngine(eng) }
+            }
+            engineSelector.addView(chip)
+            engineChips.add(chip)
+        }
+
+        engineSelector.visibility = View.VISIBLE
+        Log.i(TAG, "Engine selector built: ${availableEngines.size} engines")
+    }
+
+    private fun updateEngineChipSelection() {
+        val sel = selectedEngine ?: return
+        val selColor = Color.WHITE
+        val dimColor = Color.parseColor("#888899")
+
+        for (chip in engineChips) {
+            if (chip.text == sel.label || chip.text.toString().contains(sel.label)) {
+                chip.setBackgroundResource(R.drawable.bg_mode_chip_selected)
+                chip.setTextColor(selColor)
+                chip.alpha = 1.0f
+            } else {
+                chip.setBackgroundResource(R.drawable.bg_mode_chip_normal)
+                chip.setTextColor(dimColor)
+                // Keep failed chips dimmed
+                if (chip.alpha > 0.5f) chip.alpha = 1.0f
+            }
+        }
+    }
+
+    /**
+     * Show/hide mode chips based on engine capabilities.
+     * Old Engine → Batch + Streaming
+     * Omni       → Omni-VAD toggle
+     */
+    private fun updateModeChipsForEngine(type: EngineType) {
+        when (type) {
+            EngineType.OLD_ENGINE -> {
+                chipBatch.visibility = View.VISIBLE
+                chipStreaming.visibility = View.VISIBLE
+                chipOmni.visibility = View.GONE
+            }
+            EngineType.OMNI -> {
+                chipBatch.visibility = View.GONE
+                chipStreaming.visibility = View.GONE
+                chipOmni.visibility = View.VISIBLE
+                updateOmniChipLabel()
+            }
+        }
+    }
+
+    /** Auto-select a valid default mode for the current engine */
+    private fun selectDefaultMode() {
+        val type = selectedEngine?.type ?: return
+        when (type) {
+            EngineType.OLD_ENGINE -> {
+                currentMode = TestMode.BATCH
+                chipBatch.setBackgroundResource(R.drawable.bg_mode_chip_selected)
+                chipBatch.setTextColor(Color.WHITE)
+                chipStreaming.setBackgroundResource(R.drawable.bg_mode_chip_normal)
+                chipStreaming.setTextColor(Color.parseColor("#888899"))
+            }
+            EngineType.OMNI -> {
+                currentMode = TestMode.OMNI
+                chipOmni.setBackgroundResource(R.drawable.bg_mode_chip_selected)
+                chipOmni.setTextColor(Color.WHITE)
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════
+    //  Preference Persistence
+    // ══════════════════════════════════════════════
+
+    private fun getPrefs(): SharedPreferences =
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+
+    private fun saveEnginePreference(eng: AvailableEngine) {
+        getPrefs().edit()
+            .putString(KEY_ENGINE_TYPE, eng.type.name)
+            .putString(KEY_ENGINE_DIR, eng.modelDir)
+            .apply()
+    }
+
+    private fun restoreEnginePreferenceType(): String? =
+        getPrefs().getString(KEY_ENGINE_TYPE, null)
+
+    private fun restoreEnginePreferenceDir(): String? =
+        getPrefs().getString(KEY_ENGINE_DIR, null)
+
 
     // ══════════════════════════════════════════════
     //  Mode Switching
@@ -379,6 +622,13 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
     private fun switchMode(mode: TestMode) {
         if (isRecording.get()) return
+
+        // Guard: reject OMNI mode when Old Engine is active (no LlmSession)
+        if (mode == TestMode.OMNI && selectedEngine?.type != EngineType.OMNI) {
+            Log.w(TAG, "switchMode: OMNI mode rejected — engine type is ${selectedEngine?.type}")
+            return
+        }
+
         currentMode = mode
 
         // Reset all chips
@@ -394,23 +644,28 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         btnRecord.setBackgroundResource(R.drawable.bg_rec_button_idle)
         audioLevelContainer.visibility = View.GONE
 
+        val engLabel = when (selectedEngine?.type) {
+            EngineType.OLD_ENGINE -> "Old Engine"
+            EngineType.OMNI -> "Omni"
+            null -> ""
+        }
         when (mode) {
             TestMode.BATCH -> {
                 chipBatch.setBackgroundResource(R.drawable.bg_mode_chip_selected)
                 chipBatch.setTextColor(Color.WHITE)
-                setStatus("Batch mode — tap REC to start")
+                setStatus("$engLabel Batch — tap REC to start")
             }
             TestMode.STREAMING -> {
                 chipStreaming.setBackgroundResource(R.drawable.bg_mode_chip_selected)
                 chipStreaming.setTextColor(Color.WHITE)
-                setStatus("Streaming mode — auto endpoint detection")
+                setStatus("$engLabel Streaming — auto endpoint detection")
             }
             TestMode.OMNI -> {
                 chipOmni.setBackgroundResource(R.drawable.bg_mode_chip_selected)
                 chipOmni.setTextColor(Color.WHITE)
                 updateOmniChipLabel()
                 val label = if (omniUseVad) "VAD-segmented" else "BATCH (full audio)"
-                setStatus("Omni $label — tap REC to test")
+                setStatus("$engLabel $label — tap REC to test")
             }
         }
     }
@@ -943,13 +1198,18 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         audioLevelContainer.visibility = View.GONE
         tvStatus.clearAnimation()
 
+        val engLabel = when (selectedEngine?.type) {
+            EngineType.OLD_ENGINE -> "Old Engine"
+            EngineType.OMNI -> "Omni"
+            null -> ""
+        }
         when (currentMode) {
-            TestMode.BATCH -> setStatus("Ready — tap REC to try again")
-            TestMode.STREAMING -> setStatus("Streaming stopped — tap REC to restart")
+            TestMode.BATCH -> setStatus("$engLabel Batch — tap REC to try again")
+            TestMode.STREAMING -> setStatus("$engLabel Streaming — tap REC to restart")
             TestMode.OMNI -> {
                 val label = if (omniUseVad) "VAD" else "BATCH"
                 val segInfo = if (omniSegmentCount > 0) " (${omniSegmentCount} segments)" else ""
-                setStatus("Omni-$label ready — tap REC to test$segInfo")
+                setStatus("$engLabel $label — tap REC to test$segInfo")
             }
         }
     }

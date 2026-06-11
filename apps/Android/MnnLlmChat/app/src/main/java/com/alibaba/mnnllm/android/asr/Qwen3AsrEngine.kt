@@ -29,8 +29,9 @@ class Qwen3AsrEngine {
 
     /**
      * Initialize the ASR engine.
-     * @param modelDir Path to directory containing:
-     *   audio_encoder.mnn, llm_kv_8bit.mnn, llm_kv_8bit.mnn.weight, embeddings_bf16.bin
+     * @param modelDir Path to directory containing one of:
+     *   New format (llmexport.py): audio.mnn, llm.mnn, llm.mnn.weight, embeddings_bf16.bin, tokenizer.txt
+     *   Legacy format (sherpa-onnx): audio_encoder.mnn, llm_kv_8bit.mnn, llm_kv_8bit.mnn.weight, embeddings_bf16.bin
      * @param cacheDir App's internal cache directory for temp files (must be writable)
      * @param numThreads Number of inference threads (default: 4, Phase 3: raised from 2)
      * @return true if initialization succeeded

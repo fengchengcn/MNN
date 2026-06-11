@@ -46,8 +46,9 @@ object VoiceModelPathUtils {
 
     /**
      * Scan /data/local/tmp/mnn_models/ for a Qwen3-ASR model directory.
-     * Detects both:
-     * - Old path: audio_encoder.mnn presence
+     * Detects three formats:
+     * - Legacy path: audio_encoder.mnn presence
+     * - New old-engine format: audio.mnn + embeddings_bf16.bin (seperate_embed, no is_audio)
      * - New Omni path: audio.mnn + config.json with is_audio=true
      * @return the first matching directory path, or null if none found.
      */
@@ -56,10 +57,24 @@ object VoiceModelPathUtils {
         if (!localDir.exists() || !localDir.isDirectory) return null
         localDir.listFiles()?.forEach { subdir ->
             if (!subdir.isDirectory) return@forEach
-            // Old path: check for audio_encoder.mnn
+            // Legacy path: check for audio_encoder.mnn
             if (File(subdir, "audio_encoder.mnn").exists()) {
-                Log.i(TAG, "Found Qwen3-ASR model (old) in local models: ${subdir.absolutePath}")
+                Log.i(TAG, "Found Qwen3-ASR model (legacy) in local models: ${subdir.absolutePath}")
                 return subdir.absolutePath
+            }
+            // New old-engine format: audio.mnn + embeddings_bf16.bin (llmexport.py with seperate_embed)
+            // Must NOT have is_audio=true in config.json (those are Omni models)
+            if (File(subdir, "audio.mnn").exists() &&
+                File(subdir, "embeddings_bf16.bin").exists() &&
+                File(subdir, "tokenizer.txt").exists()) {
+                val configFile = File(subdir, "config.json")
+                val isOmni = configFile.exists() && try {
+                    JSONObject(configFile.readText()).optBoolean("is_audio", false)
+                } catch (_: Exception) { false }
+                if (!isOmni) {
+                    Log.i(TAG, "Found Qwen3-ASR model (new old-engine) in local models: ${subdir.absolutePath}")
+                    return subdir.absolutePath
+                }
             }
             // New Omni path: check for audio.mnn + config.json is_audio=true
             if (isOmniAudioModel(subdir)) {

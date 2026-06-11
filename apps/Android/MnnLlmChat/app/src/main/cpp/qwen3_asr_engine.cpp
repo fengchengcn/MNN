@@ -21,6 +21,27 @@
 
 using namespace MNN::Express;
 
+// ====== Model file name resolution (auto-detect old vs new naming) ======
+
+/**
+ * Resolve a model file path by trying the new naming convention first,
+ * then falling back to the legacy name.
+ *
+ * New naming (llmexport.py direct):  audio.mnn, llm.mnn, llm.mnn.weight
+ * Legacy naming (sherpa-onnx port):  audio_encoder.mnn, llm_kv_8bit.mnn, llm_kv_8bit.mnn.weight
+ */
+static std::string resolveModelFile(const std::string& model_dir,
+                                     const std::string& new_name,
+                                     const std::string& legacy_name) {
+    std::string new_path = model_dir + "/" + new_name;
+    std::string legacy_path = model_dir + "/" + legacy_name;
+    struct stat st;
+    if (stat(new_path.c_str(), &st) == 0) {
+        return new_path;
+    }
+    return legacy_path;
+}
+
 // ====== Constructor / Destructor ======
 
 Qwen3AsrEngine::Qwen3AsrEngine()
@@ -163,7 +184,9 @@ std::vector<VARP> Qwen3AsrEngine::createEmptyCache() {
 
 std::shared_ptr<Module> Qwen3AsrEngine::loadAudioEncoder() {
     LOGI("Loading audio encoder (on-demand)...");
-    auto mod = std::shared_ptr<Module>(Module::load({}, {}, (m_model_dir + "/audio_encoder.mnn").c_str()));
+    auto aePath = resolveModelFile(m_model_dir, "audio.mnn", "audio_encoder.mnn");
+    LOGI("Audio encoder path: %s", aePath.c_str());
+    auto mod = std::shared_ptr<Module>(Module::load({}, {}, aePath.c_str()));
     if (!mod) {
         LOGE("Failed to load audio encoder");
     } else {
@@ -230,13 +253,13 @@ bool Qwen3AsrEngine::ensureDecoderLoaded() {
     m_rt->setHint(MNN::Interpreter::WINOGRAD_MEMORY_LEVEL, 0);    // Minimal winograd memory
     m_rt->setHint(MNN::Interpreter::DYNAMIC_QUANT_OPTIONS, 1);    // Per-tensor dynamic quant
 
-    m_rt->setExternalFile(m_model_dir + "/llm_kv_8bit.mnn.weight");
+    m_rt->setExternalFile(resolveModelFile(m_model_dir, "llm.mnn.weight", "llm_kv_8bit.mnn.weight"));
 
     Module::Config mc;
     mc.shapeMutable = true;
     mc.rearrange = true;
     m_llm_mod = std::shared_ptr<Module>(Module::load(
-        {}, {}, (m_model_dir + "/llm_kv_8bit.mnn").c_str(), m_rt, &mc));
+        {}, {}, resolveModelFile(m_model_dir, "llm.mnn", "llm_kv_8bit.mnn").c_str(), m_rt, &mc));
 
     if (!m_llm_mod) {
         LOGE("Failed to load LLM decoder");
