@@ -2,8 +2,13 @@
 // Provides a MNN Sampler pre-configured for deterministic ASR (penalty + greedy).
 //
 // Usage:
-//   std::shared_ptr<MNN::Transformer::LlmContext> ctx;
-//   auto sampler = MNN::Transformer::createAsrSampler(ctx);
+//   // Option A: Read sampler params from config.json (recommended)
+//   auto config = std::make_shared<LlmConfig>(config_json_path);
+//   auto sampler = createAsrSampler(ctx, config);
+//
+//   // Option B: Use hardcoded defaults (fallback when no config.json)
+//   auto sampler = createAsrSampler(ctx);
+//
 //   // Before each sample, update history:
 //   ctx->history_tokens = token_ids;
 //   int token = sampler->sample(logits);
@@ -20,11 +25,12 @@
 namespace MNN {
 namespace Transformer {
 
-// ASR-optimized sampler config (Penalty + Greedy).
+// ASR-optimized sampler defaults (Penalty + Greedy).
+// Used as fallback when no config.json is provided.
 // ASR is a deterministic task — one correct transcription per audio input.
 // Greedy selection is preferred over temperature-based sampling for accuracy.
 // Repetition penalty (1.15) prevents the decoder from looping on repeated tokens.
-constexpr const char* ASR_SAMPLER_CONFIG_JSON = R"({
+constexpr const char* ASR_SAMPLER_DEFAULTS_JSON = R"({
     "sampler_type": "penalty",
     "penalty": 1.15,
     "penalty_sampler": "greedy",
@@ -32,13 +38,19 @@ constexpr const char* ASR_SAMPLER_CONFIG_JSON = R"({
     "max_all_tokens": 2048
 })";
 
-// Create a Sampler pre-configured for ASR.
+// Create a Sampler pre-configured for ASR from config.json.
+// When config is provided, sampler params are read from config.json (e.g.
+// sampler_type, penalty, penalty_sampler, temperature, top_k, top_p, min_p,
+// repetition_penalty). When nullptr, falls back to hardcoded defaults.
 // Returns the sampler and (via out_ctx) the LlmContext that must be kept alive.
 // Update out_ctx->history_tokens before each sample() call for penalty to work.
-inline std::unique_ptr<Sampler> createAsrSampler(std::shared_ptr<LlmContext>& out_ctx) {
+inline std::unique_ptr<Sampler> createAsrSampler(std::shared_ptr<LlmContext>& out_ctx,
+                                                   std::shared_ptr<LlmConfig> config = nullptr) {
     out_ctx = std::make_shared<LlmContext>();
-    auto config = std::make_shared<LlmConfig>();
-    config->config_ = ujson::json::parse(ASR_SAMPLER_CONFIG_JSON);
+    if (!config) {
+        config = std::make_shared<LlmConfig>();
+        config->config_ = ujson::json::parse(ASR_SAMPLER_DEFAULTS_JSON);
+    }
     return std::unique_ptr<Sampler>(Sampler::createSampler(out_ctx, config));
 }
 

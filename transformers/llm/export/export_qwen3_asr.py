@@ -574,9 +574,30 @@ class Qwen3DecoderWithKVCache(nn.Module):
 # ============================================================
 
 def export_tokenizer(model_path, dst_path):
-    """Copy tokenizer files to output directory."""
+    """Copy tokenizer files to output directory.
+
+    Priority:
+    1. If tokenizer.json exists, use LlmTokenizer to export as .mtok binary format
+    2. Otherwise, copy tokenizer.txt or create from vocab.json
+
+    Returns the filename of the exported tokenizer.
+    """
     import shutil
-    tokenizer_files = ['tokenizer.json', 'tokenizer_config.json', 'vocab.json', 'merges.txt',
+
+    # Try .mtok export first (binary pipeline format) if tokenizer.json exists
+    tokenizer_json = os.path.join(model_path, 'tokenizer.json')
+    if os.path.exists(tokenizer_json):
+        try:
+            from utils.tokenizer import LlmTokenizer
+            tokenizer = LlmTokenizer.from_pretrained(model_path, model_type='qwen3_asr')
+            mtok_path = tokenizer.export_mtok(dst_path, tokenizer_json)
+            if mtok_path and os.path.exists(mtok_path):
+                print(f"  Exported: {os.path.basename(mtok_path)} (binary pipeline format)")
+                return os.path.basename(mtok_path)
+        except Exception as e:
+            print(f"  WARNING: .mtok export failed ({e}), falling back to text format")
+
+    tokenizer_files = ['tokenizer_config.json', 'vocab.json', 'merges.txt',
                        'tokenizer.txt', 'added_tokens.json', 'special_tokens_map.json']
     for f in tokenizer_files:
         src = os.path.join(model_path, f)
@@ -595,6 +616,8 @@ def export_tokenizer(model_path, dst_path):
                 for token, idx in sorted(vocab.items(), key=lambda x: x[1]):
                     f.write(f'{token}\n')
             print(f"  Created: tokenizer.txt ({len(vocab)} tokens)")
+
+    return 'tokenizer.txt'
 
 
 # ============================================================
@@ -956,16 +979,17 @@ def main():
         'system_prompt': 'Transcribe speech to text.',
     }
 
+    # Export tokenizer first so we know the filename for config
+    print("\n" + "=" * 60)
+    print("COPYING TOKENIZER")
+    print("=" * 60)
+    tokenizer_file = export_tokenizer(args.model_path, args.dst_path)
+    llm_config['tokenizer_file'] = tokenizer_file
+
     config_path_out = os.path.join(args.dst_path, 'config.json')
     with open(config_path_out, 'w') as f:
         json.dump(llm_config, f, indent=2)
     print(f"  Saved: config.json")
-
-    # Copy tokenizer
-    print("\n" + "=" * 60)
-    print("COPYING TOKENIZER")
-    print("=" * 60)
-    export_tokenizer(args.model_path, args.dst_path)
 
     # =========================================
     # Summary

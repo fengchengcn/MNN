@@ -341,7 +341,7 @@ class LlmExporter(torch.nn.Module):
                 "n_gram": 8,
                 "ngram_factor": 1.0
             }
-            config['tokenizer_file'] = 'tokenizer.mtok'
+            config['tokenizer_file'] = self.tokenizer_file if hasattr(self, 'tokenizer_file') else 'tokenizer.mtok'
             if self.args.embed_bit < 16:
                 config['embedding_file'] = f"embeddings_int{self.args.embed_bit}.bin"
             if hasattr(self, 'talker') and self.talker is not None:
@@ -371,7 +371,20 @@ class LlmExporter(torch.nn.Module):
                     'audio_pad': 151676,
                     'audio_start': 151669,
                     'audio_end': 151670,
-                    'system_prompt': '',
+                    'system_prompt': 'Transcribe speech to text.',
+                    # ASR decoding: Penalty + Greedy (deterministic, prevents repetition loops)
+                    'sampler_type': 'penalty',
+                    'penalty': 1.15,
+                    'penalty_sampler': 'greedy',
+                    'repetition_penalty': 1.15,
+                    # Override base-template sampling params for deterministic ASR
+                    'temperature': 0.0,
+                    'top_k': 1,
+                    'top_p': 1.0,
+                    'min_p': 0.0,
+                    'max_new_tokens': 256,
+                    'tfs_z': 1.0,
+                    'typical': 1.0,
                     'jinja': {
                         'chat_template': qwen_chat_template,
                         'eos': '<|im_end|>',
@@ -736,7 +749,7 @@ class LlmExporter(torch.nn.Module):
         self.export_dflash()
         self.export_language()
         self.export_mtp()
-        self.export_tokenizer()
+        self.tokenizer_file = os.path.basename(self.export_tokenizer())
         self.export_config(export_mnn)
         if export_mnn:
             # delete onnx file

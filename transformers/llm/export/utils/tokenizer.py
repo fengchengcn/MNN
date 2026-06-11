@@ -197,7 +197,7 @@ class LlmTokenizer(PreTrainedTokenizer):
                 s = s.encode('utf-8')
             return struct.pack('<H', len(s)) + s
 
-        with open(file_path, "w", encoding="utf8") as fp:
+        with open(file_path, "w", encoding="utf8", newline='\n') as fp:
             # Text header: magic number + type
             fp.write(f'{MAGIC_NUMBER} {PIPELINE}\n')
 
@@ -675,7 +675,7 @@ class LlmTokenizer(PreTrainedTokenizer):
                         pass
 
             # Write SentencePiece format
-            with open(file_path, "w", encoding="utf8") as fp:
+            with open(file_path, "w", encoding="utf8", newline='\n') as fp:
                 write_header(fp, SENTENCEPIECE, special_list, prefix_list)
                 if model_type == "gemma3" or model_type == "gemma3-text":
                     fp.write(f'{len(vocab_list) + 1}\n')  # +1 for image_soft_token
@@ -700,7 +700,7 @@ class LlmTokenizer(PreTrainedTokenizer):
                     vocab_list.append(line)
 
             # Write TikToken format
-            with open(file_path, "w", encoding="utf8") as fp:
+            with open(file_path, "w", encoding="utf8", newline='\n') as fp:
                 write_header(fp, TIKTOIKEN, special_list, prefix_list)
                 fp.write(f'{len(vocab_list)}\n')
                 for vocab in vocab_list:
@@ -723,7 +723,7 @@ class LlmTokenizer(PreTrainedTokenizer):
                     merge_list.append(line)
 
             # Write HuggingFace format
-            with open(file_path, "w", encoding="utf8") as fp:
+            with open(file_path, "w", encoding="utf8", newline='\n') as fp:
                 write_header(fp, HUGGINGFACE, special_list)
                 fp.write(f'{len(vocab_list)} {len(merge_list)}\n')
                 for v in vocab_list:
@@ -770,7 +770,7 @@ class LlmTokenizer(PreTrainedTokenizer):
                         token_b64 = base64.b64encode('▁'.encode('utf-8')).decode('utf-8')
                         vocab_list.append(f'{token_b64} 0.0 {NORMAL}\n')
 
-                with open(file_path, "w", encoding="utf8") as fp:
+                with open(file_path, "w", encoding="utf8", newline='\n') as fp:
                     write_header(fp, SENTENCEPIECE, special_list, prefix_list)
                     fp.write(f'{len(vocab_list)}\n')
                     for vocab_line in vocab_list:
@@ -806,7 +806,7 @@ class LlmTokenizer(PreTrainedTokenizer):
                             print(f"Warning: Failed to encode token '{k}' with id {v}: {e2}")
                             vocab_list[int(v)] = k.encode('utf-8', errors='replace')
 
-                with open(file_path, "w", encoding="utf8") as fp:
+                with open(file_path, "w", encoding="utf8", newline='\n') as fp:
                     write_header(fp, tokenizer_type, special_list)
                     fp.write(f'{len(vocab_list)}\n')
                     for v in vocab_list:

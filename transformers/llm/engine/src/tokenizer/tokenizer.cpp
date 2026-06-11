@@ -783,6 +783,7 @@ bool HuggingfaceTokenizer::load_vocab(std::ifstream& tok_file) {
     int vocab_len = 0;
     int merge_len = 0;
     if (std::getline(tok_file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         std::istringstream line_str(line);
         line_str >> vocab_len >> merge_len;
     }
@@ -793,6 +794,8 @@ bool HuggingfaceTokenizer::load_vocab(std::ifstream& tok_file) {
 
     for (int i = 0; i < vocab_len; i++) {
         std::getline(tok_file, line);
+        // Strip trailing \r for Windows-exported files (CRLF → LF)
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         // Move string to decoder to avoid copy, then use reference for encoder
         decoder_[i] = std::move(line);
         encoder_.emplace(decoder_[i], i);
@@ -802,6 +805,8 @@ bool HuggingfaceTokenizer::load_vocab(std::ifstream& tok_file) {
     bpe_ranks_.reserve(merge_len);
     for (int i = 0; i < merge_len; i++) {
         std::getline(tok_file, line);
+        // Strip trailing \r for Windows-exported files (CRLF → LF)
+        if (!line.empty() && line.back() == '\r') line.pop_back();
 
         size_t d = line.find(' ');
         if (d != std::string::npos) {
