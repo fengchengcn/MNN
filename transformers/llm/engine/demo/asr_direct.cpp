@@ -4,6 +4,7 @@
 #include <MNN/expr/Executor.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
 #include <MNN/Interpreter.hpp>
+#include "asr_sampler.hpp"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -68,32 +69,6 @@ static VARP embed_lookup(VARP tbl, const std::vector<int>& ids) {
     return r;
 }
 
-// Greedy argmax
-static int argmax(const float* logits) {
-    int idx = 0;
-    for (int i = 1; i < VOCAB; i++) if (logits[i] > logits[idx]) idx = i;
-    return idx;
-}
-
-// Argmax with repetition penalty: penalize already-generated tokens
-static int argmax_penalized(const float* logits, const std::vector<int>& history, float penalty) {
-    if (penalty <= 1.0f || history.empty()) return argmax(logits);
-
-    // Copy logits and apply penalty
-    std::vector<float> penalized(VOCAB);
-    memcpy(penalized.data(), logits, VOCAB * sizeof(float));
-    for (int id : history) {
-        if (id < 0 || id >= VOCAB) continue;
-        if (penalized[id] < 0)
-            penalized[id] *= penalty;
-        else
-            penalized[id] /= penalty;
-    }
-    int idx = 0;
-    for (int i = 1; i < VOCAB; i++) if (penalized[i] > penalized[idx]) idx = i;
-    return idx;
-}
-
 // Create causal mask: [1, 1, S_new, S_total], where S_total = past_len + S_new
 // For prefill (past_len=0): standard causal mask
 // For decode (past_len>0, S_new=1): single query attending to all positions
@@ -153,6 +128,10 @@ int main(int argc, char* argv[]) {
     std::cout << "[3/6] Loading embeddings..." << std::endl;
     auto embed_tbl = load_embed(dir + "/embeddings_bf16.bin");
     if (embed_tbl.get() == nullptr) { std::cerr << "FAIL\n"; return 1; }
+
+    // ======= 3.5. Create ASR sampler (Penalty + Greedy, shared config) =======
+    std::shared_ptr<MNN::Transformer::LlmContext> sampler_ctx;
+    auto sampler = MNN::Transformer::createAsrSampler(sampler_ctx);
 
     // ======= 4. Process audio =======
 #ifdef LLM_SUPPORT_AUDIO
@@ -246,7 +225,9 @@ int main(int argc, char* argv[]) {
     k_cache = out[1];
     v_cache = out[2];
 
-    int current_token = argmax(logits->readMap<float>() + (S - 1) * VOCAB);
+    // Sample first token from prefill logits (last position only)
+    VARP prefill_logits = _Const(logits->readMap<float>() + (S - 1) * VOCAB, {VOCAB}, NHWC, halide_type_of<float>());
+    int current_token = sampler->sample(prefill_logits);
 
     // Show top-5 logits at last position for debugging
     std::cout << "  [Prefill] top-5 tokens: ";
@@ -286,9 +267,6 @@ int main(int argc, char* argv[]) {
     std::vector<int> token_ids;
     token_ids.push_back(current_token);
 
-    // Repetition penalty (1.0 = disabled, 1.1-1.2 = typical)
-    const float REP_PENALTY = 1.15f;  // 1.0=off, 1.1-1.2 typical for ASR
-
     while (gen_len < max_new && current_token != EOS_TOKEN && current_token != 151645) {
         auto td0 = NOW();
 
@@ -315,7 +293,9 @@ int main(int argc, char* argv[]) {
         k_cache = out[1];
         v_cache = out[2];
 
-        current_token = argmax_penalized(logits->readMap<float>(), token_ids, REP_PENALTY);
+        // Update history for repetition penalty, then sample
+        sampler_ctx->history_tokens = token_ids;
+        current_token = sampler->sample(logits);
         token_ids.push_back(current_token);
         gen_len++;
         S = cache_len + 1;  // update for next iteration

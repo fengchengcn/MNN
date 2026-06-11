@@ -69,6 +69,8 @@ include_directories("${MNN_SOURCE_ROOT}/transformers/llm/engine/include")
 
 #audio
 include_directories("${MNN_SOURCE_ROOT}/tools/audio/include")
+# LLM engine source (for sampler, config, asr_sampler)
+include_directories("${MNN_SOURCE_ROOT}/transformers/llm/engine/src")
 #tokenizer (from LLM engine)
 include_directories("${MNN_SOURCE_ROOT}/transformers/llm/engine/src/tokenizer")
 include_directories("${MNN_SOURCE_ROOT}/3rd_party/")

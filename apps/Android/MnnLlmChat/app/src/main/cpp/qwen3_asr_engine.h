@@ -13,6 +13,7 @@
 #include <MNN/expr/Executor.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
 #include <MNN/expr/NeuralNetWorkOp.hpp>
+#include "asr_sampler.hpp"
 
 // POSIX mmap for embedding file (Android/Linux)
 #include <sys/mman.h>
@@ -117,7 +118,10 @@ private:
     size_t m_embed_file_size = 0;
 
     // Reusable buffers
-    std::vector<float> m_penalty_buf;
+
+    // ASR sampler (Penalty + Greedy, shared config — replaces manual argmax)
+    std::shared_ptr<MNN::Transformer::LlmContext> m_sampler_ctx;
+    std::unique_ptr<MNN::Transformer::Sampler> m_sampler;
 
     // Concurrency guard: prevent concurrent runDecoder() calls from multi-threaded JNI
     std::mutex m_decode_mutex;
@@ -141,12 +145,10 @@ private:
     static constexpr int LAYERS = 28;
     static constexpr int KV_HEADS = 8;
     static constexpr int HEAD_DIM = 128;
-    static constexpr float REP_PENALTY = 1.15f;
     static constexpr int MAX_NEW_TOKENS = 100;
 
     // Helpers
     static float bf16_to_f32(uint16_t v);
-    static int argmaxPenalized(const float* logits, float* penalized_buf, const std::vector<int>& history, float penalty);
     MNN::Express::VARP createCausalMask(int S_new, int past_len);
     std::vector<MNN::Express::VARP> createEmptyCache();
 };

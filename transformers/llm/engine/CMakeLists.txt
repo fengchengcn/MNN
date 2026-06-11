@@ -94,6 +94,7 @@ if(MNN_LLM_BUILD_DEMO)
     target_link_libraries(tokenizer_demo ${LLM_DEPS})
 
     add_executable(asr_demo ${CMAKE_CURRENT_LIST_DIR}/demo/asr_direct.cpp)
+    target_include_directories(asr_demo PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/)
     target_link_libraries(asr_demo ${LLM_DEPS})
 
     add_executable(test_compare_models ${CMAKE_CURRENT_LIST_DIR}/demo/test_compare_models.cpp)

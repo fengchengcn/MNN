@@ -138,28 +138,6 @@ void Qwen3AsrEngine::embedLookup(const std::vector<int>& ids, float* dst) {
     }
 }
 
-// ====== argmax with repetition penalty ======
-
-int Qwen3AsrEngine::argmaxPenalized(const float* logits, float* penalized_buf,
-                                     const std::vector<int>& history, float penalty) {
-    if (penalty <= 1.0f || history.empty()) {
-        int idx = 0;
-        for (int i = 1; i < VOCAB; i++) if (logits[i] > logits[idx]) idx = i;
-        return idx;
-    }
-    memcpy(penalized_buf, logits, VOCAB * sizeof(float));
-    for (int id : history) {
-        if (id < 0 || id >= VOCAB) continue;
-        if (penalized_buf[id] < 0)
-            penalized_buf[id] *= penalty;
-        else
-            penalized_buf[id] /= penalty;
-    }
-    int idx = 0;
-    for (int i = 1; i < VOCAB; i++) if (penalized_buf[i] > penalized_buf[idx]) idx = i;
-    return idx;
-}
-
 // ====== Causal mask & empty KV cache ======
 
 VARP Qwen3AsrEngine::createCausalMask(int S_new, int past_len) {
@@ -292,7 +270,7 @@ void Qwen3AsrEngine::buildPromptTokens() {
     // failure in Omni engine; Chinese prompt echoed back as output. English
     // "Transcribe speech to text." tested OK. If modifying, verify in both
     // Omni (config.json) and QWEN3_OLD (here) paths. See mnn-models/ANALYSIS.md.
-    auto sys_msg = tok->encode("You are a helpful assistant.");
+    auto sys_msg = tok->encode("Transcribe speech to text.");
     m_prefix_tokens.insert(m_prefix_tokens.end(), sys_msg.begin(), sys_msg.end());
     m_prefix_tokens.push_back(198);   // \n
     m_prefix_tokens.push_back(151645); // <|im_end|>
@@ -316,8 +294,9 @@ bool Qwen3AsrEngine::init(const std::string& model_dir, const std::string& cache
     m_cache_dir = cache_dir;
     m_num_threads = num_threads;
 
-    // Pre-allocate penalty buffer (607 KB)
-    m_penalty_buf.resize(VOCAB);
+    // Create ASR sampler (Penalty + Greedy, shared config — replaces manual argmax)
+    m_sampler = MNN::Transformer::createAsrSampler(m_sampler_ctx);
+    LOGI("ASR Sampler created (penalty + greedy)");
 
     // Load tokenizer via MNN's Tokenizer class (handles SentencePiece/Tiktoken binary formats)
     LOGI("Loading tokenizer...");
@@ -517,9 +496,10 @@ bool Qwen3AsrEngine::startDecode() {
     m_v_cache = out[2];
 
     // Extract first token from prefill output (last position logits)
-    m_decode_current_token = argmaxPenalized(
-        logits->readMap<float>() + (S - 1) * VOCAB,
-        m_penalty_buf.data(), {}, 1.0f);
+    // Clear penalty history from previous utterance before first sample
+    m_sampler_ctx->history_tokens.clear();
+    auto prefill_logits = _Const(logits->readMap<float>() + (S - 1) * VOCAB, {VOCAB}, NHWC, halide_type_of<float>());
+    m_decode_current_token = m_sampler->sample(prefill_logits);
     m_token_ids.clear();
     m_token_ids.push_back(m_decode_current_token);
     m_prefill_token_count = S;
@@ -620,8 +600,8 @@ bool Qwen3AsrEngine::decodeStep(int* token_out) {
     m_k_cache = out[1];
     m_v_cache = out[2];
 
-    m_decode_current_token = argmaxPenalized(logits->readMap<float>(), m_penalty_buf.data(),
-                                              m_token_ids, REP_PENALTY);
+    m_sampler_ctx->history_tokens = m_token_ids;
+    m_decode_current_token = m_sampler->sample(logits);
     m_token_ids.push_back(m_decode_current_token);
     m_decode_gen_len++;
 
@@ -673,6 +653,8 @@ void Qwen3AsrEngine::reset() {
     m_decode_current_token = 0;
     m_decode_T = 0;
     m_decode_executor.reset();
+    // Clear sampler penalty history for next utterance
+    if (m_sampler_ctx) m_sampler_ctx->history_tokens.clear();
 }
 
 void Qwen3AsrEngine::release() {
@@ -687,8 +669,8 @@ void Qwen3AsrEngine::release() {
         delete static_cast<MNN::Transformer::Tokenizer*>(m_tokenizer);
         m_tokenizer = nullptr;
     }
-    m_penalty_buf.clear();
-    m_penalty_buf.shrink_to_fit();
+    m_sampler.reset();
+    m_sampler_ctx.reset();
     closeEmbeddingFile();
     m_initialized = false;
 }
@@ -807,9 +789,10 @@ std::string Qwen3AsrEngine::runDecoder() {
     m_k_cache = out[1];
     m_v_cache = out[2];
 
-    int current_token = argmaxPenalized(
-        logits->readMap<float>() + (S - 1) * VOCAB,
-        m_penalty_buf.data(), {}, 1.0f);
+    // Clear penalty history from previous utterance before first sample
+    m_sampler_ctx->history_tokens.clear();
+    auto prefill_logits = _Const(logits->readMap<float>() + (S - 1) * VOCAB, {VOCAB}, NHWC, halide_type_of<float>());
+    int current_token = m_sampler->sample(prefill_logits);
     m_token_ids.clear();
     m_token_ids.push_back(current_token);
     m_prefill_token_count = S;
@@ -844,8 +827,8 @@ std::string Qwen3AsrEngine::runDecoder() {
         m_k_cache = out[1];
         m_v_cache = out[2];
 
-        current_token = argmaxPenalized(logits->readMap<float>(), m_penalty_buf.data(),
-                                        m_token_ids, REP_PENALTY);
+        m_sampler_ctx->history_tokens = m_token_ids;
+        current_token = m_sampler->sample(logits);
         m_token_ids.push_back(current_token);
         gen_len++;
     }
