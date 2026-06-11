@@ -110,6 +110,12 @@ if(MNN_LLM_BUILD_DEMO)
 
     add_executable(test_ae_perf ${CMAKE_CURRENT_LIST_DIR}/demo/test_ae_perf.cpp)
     target_link_libraries(test_ae_perf ${LLM_DEPS})
+
+    add_executable(test_direct_fp16 ${CMAKE_CURRENT_LIST_DIR}/demo/test_direct_fp16.cpp)
+    target_link_libraries(test_direct_fp16 ${LLM_DEPS})
+
+    add_executable(test_asr_fp16 ${CMAKE_CURRENT_LIST_DIR}/demo/test_asr_fp16.cpp)
+    target_link_libraries(test_asr_fp16 ${LLM_DEPS})
 endif()
 
 option(MNN_LLM_BUILD_TEST "Build LLM unit tests" OFF)

@@ -613,12 +613,15 @@ def export_onnx(model, onnx_path, input_tensors, input_names, output_names, dyna
 
     # For torch 2.12+, use dynamic_shapes instead of dynamic_axes
     try:
-        dynamic_shapes = {}
-        for name, axes in dynamic_axes.items():
-            dim_shapes = {}
-            for k, v in axes.items():
-                dim_shapes[k] = torch.export.Dim(v)
-            dynamic_shapes[name] = dim_shapes
+        dynamic_shapes = []
+        for name in input_names:
+            if name in dynamic_axes:
+                dim_shapes = {}
+                for k, v in dynamic_axes[name].items():
+                    dim_shapes[k] = torch.export.Dim(v)
+                dynamic_shapes.append(dim_shapes)
+            else:
+                dynamic_shapes.append(None)
 
         torch.onnx.export(
             model,
@@ -626,12 +629,12 @@ def export_onnx(model, onnx_path, input_tensors, input_names, output_names, dyna
             onnx_path,
             input_names=input_names,
             output_names=output_names,
-            dynamic_shapes=dynamic_shapes,
-            opset_version=15,
+            dynamic_shapes=dynamic_shapes if any(dynamic_shapes) else None,
+            opset_version=18,
             do_constant_folding=True,
         )
-    except:
-        # Fallback to dynamic_axes for older torch versions
+    except Exception as e:
+        print(f"  torch.export failed ({e}), falling back to dynamo=False...")
         torch.onnx.export(
             model,
             input_tensors,
@@ -639,8 +642,9 @@ def export_onnx(model, onnx_path, input_tensors, input_names, output_names, dyna
             input_names=input_names,
             output_names=output_names,
             dynamic_axes=dynamic_axes,
-            opset_version=15,
+            opset_version=18,
             do_constant_folding=True,
+            dynamo=False,
         )
     print(f"  ONNX saved to: {onnx_path}")
     return onnx_path

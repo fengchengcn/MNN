@@ -423,10 +423,14 @@ apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen2.5-Omni-3B-MNN
 # mnn-models — local model files for development/testing
 /mnn-models/*-MNN*/
 /mnn-models/Qwen3-ASR-0.6B/
+/mnn-models/Qwen3-ASR-0.6B-old-engine-output/
+/mnn-models/Qwen3-ASR-sherpa-onnx-old-engine/
 /mnn-models/venv/
 /mnn-models/*.cpp
 /mnn-models/*.bin
 /mnn-models/*.zip
+/mnn-models/*.tar.gz
+/mnn-models/*.m4a
 *.mnn.weight
 
 # large model archives (too big for GitHub)

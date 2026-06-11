@@ -17,6 +17,21 @@ int main(int argc, const char* argv[]) {
     std::cout << "config path is " << config_path << std::endl;
 
     // Step 1: Create LLM (should return Omni since is_audio=true)
+    auto config = std::make_shared<LlmConfig>(config_path);
+    std::cout << "base_dir: " << config->base_dir_ << std::endl;
+    std::cout << "llm_model: " << config->llm_model() << std::endl;
+    std::cout << "llm_weight: " << config->llm_weight() << std::endl;
+    std::cout << "audio_model: " << config->audio_model() << std::endl;
+    std::cout << "tokenizer_file: " << config->tokenizer_file() << std::endl;
+    std::cout << "has input_names: " << config->config_.contains("input_names") << std::endl;
+    if (config->config_.contains("input_names")) {
+        auto input_names = config->config_.value("input_names", std::vector<std::string>());
+        std::cout << "input_names: [";
+        for (const auto& n : input_names) std::cout << n << ", ";
+        std::cout << "]" << std::endl;
+    }
+    std::cout << "has tie_embeddings: " << config->config_.contains("tie_embeddings") << std::endl;
+
     std::unique_ptr<Llm> llm(Llm::createLLM(config_path));
     if (!llm) {
         std::cerr << "Failed to create LLM" << std::endl;
