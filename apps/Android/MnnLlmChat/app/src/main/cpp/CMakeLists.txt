@@ -35,9 +35,6 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         video/byte_buffer_decoder.cpp
         video/image_utils.cpp
         video/video_processor.cpp
-        # Qwen3-ASR engine files
-        qwen3_asr_engine.cpp
-        qwen3_asr_jni.cpp
         # Silero VAD JNI (self-contained, uses MNN Express directly)
         silero_vad_jni.cpp
 )

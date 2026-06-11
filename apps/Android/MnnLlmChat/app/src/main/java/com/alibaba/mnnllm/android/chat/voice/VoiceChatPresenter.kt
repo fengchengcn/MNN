@@ -12,7 +12,6 @@ import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
 import android.util.Log
 import com.alibaba.mnnllm.android.asr.AsrService
-import com.alibaba.mnnllm.android.asr.Qwen3AsrEngine
 import com.alibaba.mnnllm.android.audio.AudioChunksPlayer
 import com.k2fsa.sherpa.mnn.Vad
 import com.k2fsa.sherpa.mnn.VadModelConfig
@@ -67,12 +66,10 @@ enum class VoiceChatState {
 /**
  * ASR engine mode:
  * - SHERPA: Original Sherpa MNN ASR (separate ASR engine, text-only LLM)
- * - QWEN3_OLD: Old Qwen3-ASR engine (qwen3_asr_engine.cpp, CPU only, manual decode loop)
- * - QWEN3_OMNI: New Omni engine path (LlmSession via <audio> tag, supports GPU)
+ * - QWEN3_OMNI: Omni engine path (LlmSession via <audio> tag, supports GPU)
  */
 private enum class AsrMode {
     SHERPA,
-    QWEN3_OLD,
     QWEN3_OMNI
 }
 
@@ -90,8 +87,7 @@ class VoiceChatPresenter(
     // --- Sherpa MNN ASR ---
     private var asrService: AsrService? = null
 
-    // --- Qwen3-ASR ---
-    private var qwen3AsrEngine: Qwen3AsrEngine? = null
+    // --- Qwen3-ASR (Omni) ---
     private var qwen3AudioRecord: AudioRecord? = null
     private var qwen3Aec: AcousticEchoCanceler? = null
     private var qwen3Ns: NoiseSuppressor? = null
@@ -391,13 +387,12 @@ class VoiceChatPresenter(
 
     /**
      * Detect which ASR engine mode to use for the given model directory.
-     * - QWEN3_OMNI: audio.mnn + config.json with is_audio=true (new llmexport.py path)
-     * - QWEN3_OLD: audio_encoder.mnn exists (legacy), OR audio.mnn + embeddings_bf16.bin (new seperate_embed)
-     * - SHERPA: default
+     * - QWEN3_OMNI: audio.mnn + config.json with is_audio=true
+     * - SHERPA: default (no Omni audio model found)
      */
     private fun detectAsrMode(modelDir: String): AsrMode {
         val dir = File(modelDir)
-        // New Omni path: audio.mnn + config.json is_audio=true
+        // Omni path: audio.mnn + config.json is_audio=true
         if (File(dir, "audio.mnn").exists() && File(dir, "config.json").exists()) {
             try {
                 val config = JSONObject(File(dir, "config.json").readText())
@@ -409,20 +404,7 @@ class VoiceChatPresenter(
                 Log.w(TAG, "Failed to parse config.json: ${e.message}")
             }
         }
-        // New old-engine format: audio.mnn + embeddings_bf16.bin (llmexport.py with seperate_embed)
-        // Not Omni (already checked and rejected above), but compatible with Qwen3AsrEngine.
-        if (File(dir, "audio.mnn").exists() &&
-            File(dir, "embeddings_bf16.bin").exists() &&
-            File(dir, "tokenizer.txt").exists()) {
-            Log.i(TAG, "Qwen3-ASR old-engine model (new format) detected: $modelDir")
-            return AsrMode.QWEN3_OLD
-        }
-        // Legacy path: audio_encoder.mnn
-        if (File(dir, "audio_encoder.mnn").exists()) {
-            Log.i(TAG, "Legacy Qwen3-ASR model detected: $modelDir")
-            return AsrMode.QWEN3_OLD
-        }
-        Log.d(TAG, "Sherpa ASR mode (no audio model files found): $modelDir")
+        Log.d(TAG, "Sherpa ASR mode (no Omni audio model found): $modelDir")
         return AsrMode.SHERPA
     }
 
@@ -440,7 +422,6 @@ class VoiceChatPresenter(
 
                 when (asrMode) {
                     AsrMode.QWEN3_OMNI -> startQwen3AsrOmni(modelDir)
-                    AsrMode.QWEN3_OLD -> startQwen3Asr(modelDir)
                     AsrMode.SHERPA -> startSherpaAsr(modelDir)
                 }
             } catch (e: Exception) {
@@ -498,36 +479,6 @@ class VoiceChatPresenter(
     }
 
     // ==================== Qwen3-ASR (batch processing) ====================
-
-    private suspend fun startQwen3Asr(modelDir: String) {
-        withContext(Dispatchers.IO) {
-            if (isStopped) return@withContext
-
-            qwen3AsrEngine = Qwen3AsrEngine()
-            val ok = qwen3AsrEngine!!.init(modelDir, activity.cacheDir.absolutePath, numThreads = 4)
-            if (!ok) {
-                Log.e(TAG, "Qwen3AsrEngine init failed")
-                withContext(Dispatchers.Main) { view.showError("Qwen3-ASR init failed") }
-                return@withContext
-            }
-            Log.i(TAG, "Qwen3AsrEngine initialized successfully")
-
-            // Initialize Silero VAD from assets
-            initVad()
-        }
-
-        if (isStopped) return
-
-        isGenerationFinished = false
-        startQwen3Record()
-        currentStatus = VoiceChatPresenterState.LISTENING
-        if (!isStopped) withContext(Dispatchers.Main) {
-            view.updateStatus(VoiceChatState.LISTENING)
-            view.showGreetingMessage()
-            speakGreetingMessage()
-        }
-        Log.i(TAG, "Qwen3-ASR started with Silero VAD. Now listening.")
-    }
 
     // ==================== Omni Audio (new LlmSession path, supports GPU) ====================
 
@@ -646,20 +597,15 @@ class VoiceChatPresenter(
      * - The VAD internally runs a GRU-based neural model to discriminate speech from noise.
      * - Completed speech segments are extracted and dispatched for ASR decoding.
      *
-     * QWEN3_OLD mode: segments are collected during recording, then decoded in batch after
-     *                  recording stops (the engine requires complete audio via pushAudio).
-     * QWEN3_OMNI mode: each segment is immediately written as a WAV and dispatched to the
-     *                   Omni engine via <audio> tag through the serial task channel.
+     * Omni mode: each VAD segment is immediately written as a WAV and dispatched to the
+     *            Omni engine via <audio> tag through the serial task channel.
      */
     private fun processQwen3Samples() {
         val isOmni = (asrMode == AsrMode.QWEN3_OMNI)
-        val engine = qwen3AsrEngine  // Non-null only in QWEN3_OLD mode
 
         val maxChunks = 1200  // ~38s max recording (1200 * 32ms)
         var totalChunks = 0
         var omniSegmentsEmitted = 0 // track Omni segments to decide auto-restart
-        // QWEN3_OLD: collect segments for post-recording batch decode
-        val collectedSegments = mutableListOf<FloatArray>()
 
         Log.i(TAG, "Qwen3 VAD recording started (window=${vadWindowSize}, isOmni=$isOmni)")
 
@@ -694,18 +640,13 @@ class VoiceChatPresenter(
 
                 // Filter out noise bursts (< 150ms)
                 if (segment.samples.size >= qwen3SampleRate * 0.15f) {
-                    if (isOmni) {
-                        omniSegmentsEmitted++
-                        // Omni: dispatch to IO coroutine for WAV write → <audio> tag.
-                        // No busy-check needed — serial task channel handles ordering;
-                        // VAD interruption handles conflicts with active generation.
-                        val samples = segment.samples.copyOf()
-                        lifecycleScope.launch(Dispatchers.IO) {
-                            dispatchOmniSegment(samples)
-                        }
-                    } else {
-                        // QWEN3_OLD: collect for post-recording batch decode
-                        collectedSegments.add(segment.samples.copyOf())
+                    omniSegmentsEmitted++
+                    // Omni: dispatch to IO coroutine for WAV write → <audio> tag.
+                    // No busy-check needed — serial task channel handles ordering;
+                    // VAD interruption handles conflicts with active generation.
+                    val samples = segment.samples.copyOf()
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        dispatchOmniSegment(samples)
                     }
                 }
                 vad!!.pop()
@@ -721,14 +662,10 @@ class VoiceChatPresenter(
         while (vad?.empty() == false) {
             val segment = vad!!.front()
             if (segment.samples.size >= qwen3SampleRate * 0.15f) {
-                if (isOmni) {
-                    omniSegmentsEmitted++
-                    val samples = segment.samples.copyOf()
-                    lifecycleScope.launch(Dispatchers.IO) {
-                        dispatchOmniSegment(samples)
-                    }
-                } else {
-                    collectedSegments.add(segment.samples.copyOf())
+                omniSegmentsEmitted++
+                val samples = segment.samples.copyOf()
+                lifecycleScope.launch(Dispatchers.IO) {
+                    dispatchOmniSegment(samples)
                 }
             }
             vad!!.pop()
@@ -744,27 +681,13 @@ class VoiceChatPresenter(
 
         // ── Post-recording processing ──
 
-        if (isOmni) {
-            // Omni: segments were dispatched via dispatchOmniSegment().
-            // Those segments → HandleAsrResult → OnTtsComplete → startRecord() handles restart.
-            // Only auto-restart here if NO segments were produced (pure silence).
-            if (omniSegmentsEmitted == 0 && !isStopped) {
-                lifecycleScope.launch {
-                    kotlinx.coroutines.delay(300)
-                    if (!isStopped && !isSpeaking && !isProcessingLlm) startQwen3Record()
-                }
-            }
-        } else if (collectedSegments.isNotEmpty()) {
-            // QWEN3_OLD: batch-decode all collected VAD segments
-            lifecycleScope.launch(Dispatchers.IO) {
-                processOldQwen3Segments(collectedSegments)
-            }
-        } else {
-            // No speech detected — restart listening
-            Log.d(TAG, "VAD: no speech detected, restarting")
+        // Omni: segments were dispatched via dispatchOmniSegment().
+        // Those segments → HandleAsrResult → OnTtsComplete → startRecord() handles restart.
+        // Only auto-restart here if NO segments were produced (pure silence).
+        if (omniSegmentsEmitted == 0 && !isStopped) {
             lifecycleScope.launch {
-                kotlinx.coroutines.delay(200)
-                if (!isStopped) startQwen3Record()
+                kotlinx.coroutines.delay(300)
+                if (!isStopped && !isSpeaking && !isProcessingLlm) startQwen3Record()
             }
         }
     }
@@ -789,65 +712,6 @@ class VoiceChatPresenter(
         val audioTag = "<audio>${wavFile.absolutePath}</audio>"
         Log.i(TAG, "VAD Omni dispatch: ${samples.size} samples → $audioTag")
         taskChannel.send(SerialTask.HandleAsrResult(audioTag))
-    }
-
-    /**
-     * QWEN3_OLD mode: decode collected VAD speech segments using Qwen3AsrEngine.
-     * Each segment is decoded independently; results from all segments are concatenated.
-     * Called from IO dispatcher.
-     */
-    private suspend fun processOldQwen3Segments(segments: List<FloatArray>) {
-        val engine = qwen3AsrEngine ?: return
-        if (segments.isEmpty() || isStopped) return
-
-        withContext(Dispatchers.Main) {
-            view.updateStatus(VoiceChatState.ASR_DECODING)
-        }
-
-        val allResults = StringBuilder()
-        var lastPartial = ""
-
-        for ((i, segment) in segments.withIndex()) {
-            if (isStopped) break
-            Log.i(TAG, "QWEN3_OLD decoding segment $i/${segments.size}: ${segment.size} samples (%.1fs)"
-                .format(segment.size.toFloat() / qwen3SampleRate))
-
-            engine.reset()
-            engine.pushAudio(segment)
-            engine.endAudio()
-
-            val ok = engine.startDecode()
-            Log.i(TAG, "QWEN3_OLD startDecode #$i: $ok")
-
-            if (ok) {
-                while (engine.isDecoding() && !isStopped) {
-                    engine.decodeStep()
-                    val partialText = engine.getPartialResult()
-                    if (partialText.isNotEmpty() && partialText != lastPartial) {
-                        lastPartial = partialText
-                        withContext(Dispatchers.Main) {
-                            view.updateAsrPartialText(allResults.toString() + partialText)
-                        }
-                    }
-                }
-                val text = engine.getResultText()
-                if (text.isNotBlank()) {
-                    allResults.append(text)
-                    if (i < segments.size - 1) allResults.append(" ")
-                }
-            }
-        }
-
-        val finalText = allResults.toString().trim()
-        Log.i(TAG, "QWEN3_OLD VAD decode complete: ${segments.size} segments → \"$finalText\"")
-
-        if (finalText.isNotEmpty() && !isStopped && !isSpeaking && !isProcessingLlm) {
-            taskChannel.send(SerialTask.HandleAsrResult(finalText))
-        } else if (!isStopped && !isSpeaking && !isProcessingLlm) {
-            // No text produced — restart listening
-            kotlinx.coroutines.delay(200)
-            if (!isStopped) startQwen3Record()
-        }
     }
 
     private fun stopQwen3Record() {
@@ -1094,13 +958,8 @@ class VoiceChatPresenter(
         
         if (isRecording) {
             try {
-                if (asrMode == AsrMode.QWEN3_OLD) {
+                if (asrMode == AsrMode.QWEN3_OMNI) {
                     stopQwen3Record()
-                    qwen3AsrEngine?.release()
-                    qwen3AsrEngine = null
-                } else if (asrMode == AsrMode.QWEN3_OMNI) {
-                    stopQwen3Record()
-                    // VAD released in stopQwen3Record()
                 } else {
                     asrService?.stopRecord()
                     asrService = null
@@ -1217,13 +1076,8 @@ class VoiceChatPresenter(
                 isGenerationFinished = false
                 
                 // Cleanup existing services
-                if (asrMode == AsrMode.QWEN3_OLD) {
+                if (asrMode == AsrMode.QWEN3_OMNI) {
                     stopQwen3Record()
-                    qwen3AsrEngine?.release()
-                    qwen3AsrEngine = null
-                } else if (asrMode == AsrMode.QWEN3_OMNI) {
-                    stopQwen3Record()
-                    // VAD released in stopQwen3Record()
                 } else {
                     asrService?.stopRecord()
                     asrService = null

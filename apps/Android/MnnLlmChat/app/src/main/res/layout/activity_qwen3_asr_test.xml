@@ -13,19 +13,19 @@
         android:layout_height="wrap_content"
         android:gravity="center_horizontal"
         android:orientation="vertical"
-        android:padding="24dp">
+        android:padding="20dp">
 
-        <!-- Header -->
+        <!-- ── Header ── -->
         <TextView
             android:id="@+id/tvTitle"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="Qwen3-ASR Test"
             android:textColor="#FFFFFF"
-            android:textSize="26sp"
+            android:textSize="24sp"
             android:textStyle="bold"
             android:letterSpacing="0.02"
-            android:layout_marginBottom="4dp" />
+            android:layout_marginBottom="2dp" />
 
         <TextView
             android:id="@+id/tvSubtitle"
@@ -33,29 +33,47 @@
             android:layout_height="wrap_content"
             android:text="Speech Recognition Testing Tool"
             android:textColor="#888899"
-            android:textSize="13sp"
-            android:layout_marginBottom="16dp" />
+            android:textSize="12sp"
+            android:layout_marginBottom="24dp" />
 
-        <!-- Engine Selector (dynamically populated, hidden when single engine) -->
+        <!-- ═══════════ Engine Section ═══════════ -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="ENGINE"
+            android:textColor="#5E5E72"
+            android:textSize="10sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.08"
+            android:layout_marginBottom="10dp"
+            android:layout_marginStart="4dp" />
+
         <LinearLayout
             android:id="@+id/engineSelector"
-            android:layout_width="wrap_content"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:background="@drawable/bg_mode_chip_normal"
-            android:padding="4dp"
-            android:layout_marginBottom="20dp"
+            android:orientation="vertical"
+            android:layout_marginBottom="22dp"
             android:visibility="gone" />
 
-        <!-- Mode Toggle -->
+        <!-- ═══════════ Mode Section ═══════════ -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="MODE"
+            android:textColor="#5E5E72"
+            android:textSize="10sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.08"
+            android:layout_marginBottom="10dp"
+            android:layout_marginStart="4dp" />
+
         <LinearLayout
             android:id="@+id/modeSelector"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
-            android:background="@drawable/bg_mode_chip_normal"
-            android:padding="4dp"
-            android:layout_marginBottom="32dp">
+            android:layout_marginBottom="28dp">
 
             <TextView
                 android:id="@+id/chipBatch"
@@ -69,6 +87,7 @@
                 android:background="@drawable/bg_mode_chip_selected"
                 android:clickable="true"
                 android:focusable="true"
+                android:layout_marginEnd="8dp"
                 android:foreground="?attr/selectableItemBackgroundBorderless" />
 
             <TextView
@@ -82,13 +101,14 @@
                 android:background="@drawable/bg_mode_chip_normal"
                 android:clickable="true"
                 android:focusable="true"
+                android:layout_marginEnd="8dp"
                 android:foreground="?attr/selectableItemBackgroundBorderless" />
 
             <TextView
                 android:id="@+id/chipOmni"
                 android:layout_width="100dp"
                 android:layout_height="40dp"
-                android:text="Omni"
+                android:text="OMNI-VAD"
                 android:gravity="center"
                 android:textColor="#888899"
                 android:textSize="14sp"
@@ -99,7 +119,7 @@
                 android:visibility="gone" />
         </LinearLayout>
 
-        <!-- Recording Section -->
+        <!-- ── Record Button ── -->
         <FrameLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
@@ -121,41 +141,41 @@
                 android:foreground="?attr/selectableItemBackgroundBorderless" />
         </FrameLayout>
 
-        <!-- Status -->
+        <!-- ── Status ── -->
         <TextView
             android:id="@+id/tvStatus"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="Ready"
             android:textColor="#888899"
-            android:textSize="15sp"
-            android:layout_marginBottom="8dp" />
+            android:textSize="14sp"
+            android:layout_marginBottom="6dp" />
 
-        <!-- Audio Level Bar -->
+        <!-- ── Audio Level Bar ── -->
         <LinearLayout
             android:id="@+id/audioLevelContainer"
             android:layout_width="200dp"
-            android:layout_height="4dp"
+            android:layout_height="3dp"
             android:orientation="horizontal"
             android:background="#2A2A3E"
-            android:layout_marginBottom="28dp"
+            android:layout_marginBottom="24dp"
             android:visibility="gone">
 
             <View
                 android:id="@+id/audioLevelFill"
                 android:layout_width="0dp"
-                android:layout_height="4dp"
+                android:layout_height="3dp"
                 android:background="@drawable/bg_audio_level_bar" />
         </LinearLayout>
 
-        <!-- Divider -->
+        <!-- ── Divider ── -->
         <View
             android:layout_width="match_parent"
             android:layout_height="1dp"
-            android:background="#2A2A3E"
-            android:layout_marginBottom="20dp" />
+            android:background="#1E1E30"
+            android:layout_marginBottom="18dp" />
 
-        <!-- Results Header -->
+        <!-- ── Results Header ── -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -167,10 +187,11 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="Results"
-                android:textColor="#CCCCCC"
-                android:textSize="16sp"
-                android:textStyle="bold" />
+                android:text="RESULTS"
+                android:textColor="#5E5E72"
+                android:textSize="10sp"
+                android:textStyle="bold"
+                android:letterSpacing="0.08" />
 
             <TextView
                 android:id="@+id/btnClear"
@@ -178,7 +199,7 @@
                 android:layout_height="32dp"
                 android:text="Clear"
                 android:textColor="#2E65C2"
-                android:textSize="13sp"
+                android:textSize="12sp"
                 android:gravity="center"
                 android:paddingStart="12dp"
                 android:paddingEnd="12dp"
@@ -188,14 +209,13 @@
                 android:visibility="gone" />
         </LinearLayout>
 
-        <!-- Results Container -->
+        <!-- ── Results Container ── -->
         <LinearLayout
             android:id="@+id/resultsContainer"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical">
 
-            <!-- Empty state -->
             <TextView
                 android:id="@+id/tvEmptyResults"
                 android:layout_width="match_parent"
@@ -208,7 +228,6 @@
                 android:lineSpacingExtra="4dp" />
         </LinearLayout>
 
-        <!-- Bottom spacing -->
         <View
             android:layout_width="match_parent"
             android:layout_height="32dp" />
