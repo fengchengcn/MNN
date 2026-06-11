@@ -129,15 +129,16 @@ else
 
 ---
 
-## 3. 建议验证优先级
+## 3. 验证进度
 
-| 优先级 | 验证项 | 改动量 | 预期效果 |
-|--------|--------|--------|----------|
-| **P0** | 将 system prompt 改为空字符串或中文 ASR 指令 | 1 行 | 可能解决 30%+ |
-| **P0** | 在 `whisper_fbank` 中加 `clamp(min=1e-10)` | 1 行 | 修复 NaN 问题 |
-| **P1** | 对比 tokenizer.txt 与 HuggingFace BPE tokenizer 的 encode/decode 往返 | 离线测试 | 确认 tokenizer 准确性 |
-| **P1** | 改为逐句均值-方差归一化 `(x-μ)/(σ+1e-5)` | ~10 行 | 与 SherpaOnnx 对齐归一化 |
-| **P2** | 去掉重复惩罚（设 `REP_PENALTY=1.0`） | 1 行 | 排除惩罚干扰 |
+| 优先级 | 验证项 | 状态 | 结论 |
+|--------|--------|:--:|------|
+| **P0** | System prompt 实验（空/英文/中文） | ✅ 已完成 | 非根因 |
+| **P0** | `whisper_fbank` 加 `clamp(min=1e-10)` | ✅ 已修复 | 正确性修复，非主因 |
+| **P1** | Tokenizer 往返对比 | ✅ 已完成 | 格式完整，非根因 |
+| **P1** | FBank 逐句均值-方差归一化 | ❌ 不适用 | 训练和推理公式一致，无需改 |
+| **P2** | 重复惩罚检查 | ✅ 已完成 | Omni 引擎已为 1.0（无惩罚） |
+| **P0** | **模型导出逐层对比（新）** | 🔴 待做 | 同音频对比 fbank→AE→decoder 输出 |
 
 ---
 
@@ -163,3 +164,87 @@ else
 - **方法**：对比 SherpaOnnx (ONNX Runtime) 与 MNN 两个推理框架的 Qwen3-ASR 实现，深度阅读所有相关源码（C++、Python、Kotlin），对比 fbank 预处理、tokenizer、prompt 构造、解码策略等维度，结合 Web 搜索 sherpa-onnx 开源实现文档进行交叉验证。
 - **SherpaOnnx 参考项目**：`D:\mojing\SherpaOnnxSimulateStreamingAsr\SherpaOnnxSimulateStreamingAsr`
 - **MNN 参考源码**：`apps/Android/MnnLlmChat/app/src/main/cpp/`、`tools/audio/source/`、`transformers/llm/export/`
+
+---
+
+## 6. 实验验证记录（2026-06-11）
+
+### 6.1 System Prompt 实验（已排除）
+
+在 Omni FP16 模型（`Qwen3-ASR-MNN-FP16/config.json`）上测试了三种 system_prompt：
+
+| system_prompt | 结果 | 结论 |
+|---|---|---|
+| `""` (空) | ❌ 完全不识别，仅输出 `<asr_text>` 标记 | Jinja 模板跳过空 system 块，模型无 ASR 指令 |
+| `"Transcribe speech to text."` (英文原版) | ✅ 能识别，罕见词仍差 | 任务相关，不会被回显 |
+| `"请准确转写音频内容。"` (中文) | ⚠️ 部分识别，但 prompt 被模型回显为转写结果 | 中文 prompt 和输出在同一语言空间，模型混淆 |
+
+**结论**：system_prompt 影响能否识别，但**不是罕见词精度差的根因**。保留英文原版 `"Transcribe speech to text."`。
+
+### 6.2 Tokenizer 验证（已排除）
+
+对比了 MNN `tokenizer.txt` 与 HuggingFace Qwen2 BPE tokenizer：
+
+| | Omni FP16 tokenizer.txt | Old-Engine tokenizer.txt | HuggingFace BPE |
+|---|---|---|---|
+| 大小 | 3.2 MB | 952 KB | vocab.json 2.6MB + merges.txt 1.6MB |
+| 格式 | Tiktoken BPE（完整） | 仅 token ID 列表 | BPE 目录 |
+| 罕见字符 "龘靐旮旯" | 0 次出现（**正常**，字节级 BPE 编码） | 0 次出现 | — |
+
+罕见字符通过 UTF-8 字节级 BPE 组合编码是 Qwen tokenizer 的正常行为。MNN 的 Tiktoken 格式包含完整 BPE 合并规则。
+
+**结论**：Tokenizer 格式完整，**不是罕见词精度差的根因**。
+
+### 6.3 C++ FBank Bug 修复（已完成，非根因）
+
+在 `tools/audio/source/audio.cpp:657` 添加了 `clamp(min=1e-10)`：
+```cpp
+// Before: auto log_specgram = _Log(mel_specgram) / _Log(_Scalar<float>(10.0));
+// After:
+auto log_specgram = _Log(_Maximum(mel_specgram, _Scalar<float>(1e-10))) / _Log(_Scalar<float>(10.0));
+```
+
+另两个疑似 Bug 复查结果：
+- **Nyquist bin 未移除**：❌ 误判。C++ 的 `_Slice` 切的是时间维，Python 的 `stft[..., :-1]` 也是切时间维。两者一致。
+- **非周期性 Hann window**：差异仅在第 399/400 个样本（~0.0005），**可忽略**。
+
+**结论**：Log floor guard 修复是正确性改进（防止 NaN），但三个"Bug"都与罕见词精度无关。
+
+### 6.4 SherpaOnnx 模型对比（关键发现）
+
+直接对比了两个 0.6B Qwen3-ASR 模型：
+
+| | SherpaOnnx（准） | MNN FP16（不准） |
+|---|---|---|
+| 量化精度 | **INT8** | **FP16**（理论上更高精度） |
+| 解码器大小 | 720.9 MB | 1137.2 MB |
+| 模型来源 | ModelScope 第三方导出 | MNN 自有导出 |
+| 导出脚本 | [Wasser1462/Qwen3-ASR-onnx](https://github.com/Wasser1462/Qwen3-ASR-onnx) | `transformers/llm/export/` |
+| 测试集 | 含 15 个 WAV + 标准转录文本 | 无 |
+
+**关键矛盾**：FP16 精度理应高于 INT8，但 MNN FP16 识别效果反而不如 SherpaOnnx INT8。这**排除了量化误差是主要因素**，指向模型导出质量差异。
+
+### 6.5 更新后的根因判断
+
+经过实验逐一排除后：
+
+| 假设 | 状态 | 说明 |
+|------|:--:|------|
+| System prompt | ❌ 已排除 | 影响识别与否，不影响精度 |
+| Tokenizer 格式 | ❌ 已排除 | Tiktoken BPE 完整 |
+| C++ FBank Bug | ❌ 已排除 | 修复了 log guard，窗口和 Nyquist 非 bug |
+| FBank 归一化 | ❌ 已排除 | Python 训练和 C++ 推理公式一致 `(x+4)/4` |
+| 重复惩罚 | — 未测试 | Omni 引擎 `repetition_penalty=1.0`（无惩罚），不影响 |
+| **模型导出/转换质量** | **🔴 主嫌疑** | MNN 导出与 Wasser1462 ONNX 导出产生不同质量的模型 |
+
+### 6.6 下一步方向
+
+同一份 HuggingFace 权重 → 两个导出脚本 → 两种推理引擎 → 显著不同的精度。应该做**同音频逐层对比**：
+
+1. 用同一 WAV 文件，分别跑 SherpaOnnx ONNX 和 MNN
+2. 对比 fbank 输出 → audio encoder embedding → decoder logits
+3. 定位从哪一层开始出现显著差异
+4. 反向追溯 MNN 导出脚本的问题
+
+SherpaOnnx 模型目录已包含测试 WAV + 标准转录文本：
+`D:\dowload\sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25\sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25\test_wavs\`
