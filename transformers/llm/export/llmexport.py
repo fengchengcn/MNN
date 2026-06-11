@@ -371,7 +371,7 @@ class LlmExporter(torch.nn.Module):
                     'audio_pad': 151676,
                     'audio_start': 151669,
                     'audio_end': 151670,
-                    'system_prompt': 'You are a helpful assistant.',
+                    'system_prompt': '',
                     'jinja': {
                         'chat_template': qwen_chat_template,
                         'eos': '<|im_end|>',
@@ -650,7 +650,8 @@ class LlmExporter(torch.nn.Module):
         # encoder's internal transformer layers (sinusoidal pos-enc + 18-layer
         # encoder-only Transformer), which would create incompatible fused ops.
         # The old export path (export_qwen3_asr.py) also omits --transformerFuse.
-        if self.mnn_converter: self.mnn_converter.export(audio_onnx, self.audio.quant_bit,
+        audio_quant = self.args.quant_bit if self.args.quant_bit >= 16 else max(8, self.args.quant_bit)
+        if self.mnn_converter: self.mnn_converter.export(audio_onnx, audio_quant,
                                                           transformer_fuse=False)
 
     def export_talker(self):

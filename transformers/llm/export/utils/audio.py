@@ -453,13 +453,16 @@ class Qwen3AsrAudio(Audio):
         self.feature_size = 128
         self.n_fft = 400
         self.hop_length = 160
-        self.quant_bit = 8  # INT8 quantization for mobile deployment
+        self.quant_bit = 8  # default: INT8, will be overridden by export_audio() if args.quant_bit >= 16
 
     def load(self):
         self.encoder = self.audio.float()
         self.llm_config['is_audio'] = True
         self.llm_config['audio_type'] = 'qwen3_asr'
         self.llm_config['audio_pad'] = self.audio_pad_id
+        self.llm_config['audio_start'] = 151669
+        self.llm_config['audio_end'] = 151670
+        self.llm_config['attn_scale'] = 0.08838834764831845  # 1/sqrt(128)
 
     def forward(self, input_features):
         return self.encoder(input_features)
