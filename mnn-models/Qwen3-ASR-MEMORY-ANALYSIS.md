@@ -1,8 +1,11 @@
 # Qwen3-ASR 模型运行时内存分析：旧路径 vs Omni 新路径
 
-> 创建：2026-06-10
+> 创建：2026-06-10 | **状态：理论分析，待 Omni 实机验证**
 > 基于：MNN 源码分析 + 模型架构参数
-> 关联文档：[[Qwen3-ASR-LLMEXPORT-MIGRATION-PLAN]] [[Qwen3-ASR-MNN-PROGRESS]]
+> 关联：[[Qwen3-ASR-ANDROID-MEMORY-ANALYSIS]] (实机数据) | [[Qwen3-ASR-LLMEXPORT-MIGRATION-PLAN]]
+>
+> ⚠️ 下文为理论估算。旧引擎实机数据见 [[Qwen3-ASR-ANDROID-MEMORY-ANALYSIS]]（Kirin 990, FP16: Native Heap 1,646 MB, RSS 1,841 MB）。
+> Omni 引擎实机数据待采集。
 
 ---
 

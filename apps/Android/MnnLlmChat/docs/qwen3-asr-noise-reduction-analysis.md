@@ -6,7 +6,9 @@
 
 ## 核心结论
 
-Qwen3-ASR demo **有降噪处理**，但全部依赖于 **Android 平台层（DSP + AudioEffect API）**，**没有**在 C++ 原生层做任何自定义音频预处理（如 digital filter、dither、preemphasis、降噪 AI 模型等）。降噪架构从采集到推理分三层：**硬件 DSP → 软件 AudioEffect → 应用层 VAD**。
+Qwen3-ASR demo **有降噪处理**，但全部依赖于 **Android 平台层（DSP + AudioEffect API）**，C++ 引擎层无额外音频预处理。降噪架构从采集到推理分三层：**硬件 DSP → 软件 AudioEffect → Silero VAD（神经网络）**。
+
+> **更新 (2026-06-11)**：Qwen3AsrTestActivity Omni 模式已从 RMS 能量 VAD 升级为 **Silero VAD**（LSTM 神经网络模型，通过 `silero_vad.onnx` → MNN Interpreter 推理）。VoiceChatPresenter 旧引擎仍使用 RMS VAD。
 
 ---
 
@@ -147,40 +149,47 @@ Hardware Driver → HAL → AudioEffect (AEC/NS) → AudioRecord.read() → 应�
 
 ---
 
-## 四、Layer 3: 应用层 RMS-based VAD
+## 四、Layer 3: 应用层 VAD
 
-### 4.1 Qwen3AsrTestActivity
+### 4.1 Qwen3AsrTestActivity（Omni 模式 — Silero VAD）
+
+Omni 模式使用 **Silero VAD**（神经网络），通过 `silero_vad.onnx` → MNN Interpreter 推理：
 
 ```kotlin
-// Qwen3AsrTestActivity.kt:46-51
-private const val SPEECH_RMS_THRESHOLD = 400.0f   // raw int16 PCM 能量阈值
-private const val SILENCE_RMS_THRESHOLD = 100.0f   // 低于此值视为静音
-private const val MAX_SILENCE_CHUNKS = 15           // ~1.5s 持续静音触发端点
-private const val MAX_TOTAL_CHUNKS = 300             // ~30s 最大录音时长
-private const val CHUNK_INTERVAL_MS = 100            // 100ms 每帧
-```
+// Qwen3AsrTestActivity.kt:83-84
+private var vad: Vad? = null
+private val vadWindowSize = 512  // 32ms at 16kHz
 
-**RMS 计算（Qwen3AsrTestActivity.kt:278-285）**：
-```kotlin
-// RMS on raw int16 values (thresholds are in raw PCM scale)
-var sumSq = 0f
-for (i in 0 until ret) {
-    val s = shortBuf[i].toFloat()
-    sumSq += s * s
+// 初始化（Qwen3AsrTestActivity.kt:447-451）
+config.sileroVadModelConfig.windowSize = vadWindowSize
+vad = Vad(assetManager = assets, config = config)
+
+// 使用（Qwen3AsrTestActivity.kt:352-362）
+vad?.acceptWaveform(floatBuf)
+if (vad?.isSpeechDetected() == true) { ... }
+while (vad?.empty() == false) {
+    val segment = vad!!.front()
+    // process segment...
+    vad!!.pop()
 }
-val rms = sqrt(sumSq / ret)
-currentRms = rms
 ```
 
-**VAD 状态机（Qwen3AsrTestActivity.kt:288-309）**：
-```
-       rms > 400          → speechDetected = true（进入语音状态）
-语音状态下 rms < 100       → silenceChunkCount++（累计静音帧）
-语音状态下 100 ≤ rms ≤ 400 → silenceChunkCount = 0（重置静音计数）
-silenceChunkCount ≥ 15     → 触发 endpoint，停止录音，开始解码
+Silero VAD 是 LSTM 模型（支持 V4/V5），通过 `silero_vad_jni.cpp` 加载运行。
+参数：threshold=0.5, minSpeechDuration=0.25s, minSilenceDuration=0.25s, maxSpeechDuration=5.0s。
+
+### 4.2 Qwen3AsrTestActivity（旧引擎模式 — RMS VAD，已废弃）
+
+旧引擎模式使用 RMS 能量 VAD：
+
+```kotlin
+private const val SPEECH_RMS_THRESHOLD = 400.0f   // raw int16 PCM
+private const val SILENCE_RMS_THRESHOLD = 100.0f
+private const val MAX_SILENCE_CHUNKS = 15           // ~1.5s
 ```
 
-### 4.2 VoiceChatPresenter
+状态机：rms > 400 → 语音开始；rms < 100 × 15 帧 → 端点检测。
+
+### 4.3 VoiceChatPresenter（旧引擎 — RMS VAD）
 
 ```kotlin
 // VoiceChatPresenter.kt:81-84
@@ -291,7 +300,7 @@ VARP whisper_fbank(VARP waveform, int sample_rate = 16000, int n_mels = 128,
 | AudioSource.VOICE_COMMUNICATION | ✅ | ✅ | ✅ |
 | AcousticEchoCanceler | ✅ | ✅ | ✅ |
 | NoiseSuppressor | ✅ | ✅ | ✅ |
-| RMS-based VAD | ✅ (静音门限) | ✅ (静音门限) | ❌ (Sherpa 内置) |
+| VAD | Silero VAD (Omni) / RMS (旧) | RMS (静音门限) | ❌ (Sherpa 内置) |
 | Sherpa endpoint detection | N/A | N/A | ✅ |
 | Mute (zero-fill) | ❌ | ✅ | ✅ |
 | 硬件 DSP AEC/NS | ✅ | ✅ | ✅ |

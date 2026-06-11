@@ -1,10 +1,12 @@
 # Qwen3-ASR Android 运行时内存与推理性能分析
 
-**日期:** 2026-06-11
-**设备:** 华为 TAS-AL00 (Kirin 990, 5.4GB RAM, Android 12)
-**应用:** MnnLlmChat (`com.alibaba.mnnllm.android`)
-**页面:** `Qwen3AsrTestActivity` — OMNI-VAD 模式
-**推理后端:** CPU (MNN)
+> **日期:** 2026-06-11 | **状态:** 实机测试完成
+> **设备:** 华为 TAS-AL00 (Kirin 990, 5.4GB RAM, Android 12)
+> **应用:** MnnLlmChat | **页面:** `Qwen3AsrTestActivity` — OMNI-VAD 模式
+> **后端:** CPU (MNN)
+>
+> ⚠️ 此数据来自旧引擎 FP16 模型。Omni 引擎预计内存 ~30-40% 更低（DiskEmbedding + mmap AE 权重）。
+> 理论分析见 [[Qwen3-ASR-MEMORY-ANALYSIS]]。
 
 ---
 
@@ -363,14 +365,10 @@ Segment #1 — transcribing... 42.5s                     ← 推理卡死，无 
 
 **当前最优配置：CPU + 4 线程 + FP16 + Low Precision + Low Memory。**
 
-### 8.7 建议路线
+### 8.7 最终建议
 
-| 优先级 | 行动 | 说明 |
-|--------|------|------|
-| **1 (立即)** | 试 OpenCL | 仅改 1 行代码，`libMNN_CL.so` 已就绪，快速验证 GPU 可行性 |
-| 2 | 对比 CPU/OpenCL 实测 | 用 `MNN_DEBUG PERF` 对比真实 Prefill/Decode 速度 |
-| 3 | 如 OpenCL 不理想 | 编译 Vulkan 版本，KVMeta 可用 |
-| 4 | 长期 | NPU (DaVinci) 适配，利用 Kirin 990 内置 NPU |
+移动端 LLM Decode 是 memory-bound 任务，CPU 是最优解。
+**当前最优配置：CPU + 4 线程 + FP16 + Low Precision + Low Memory。**
 
 ---
 
