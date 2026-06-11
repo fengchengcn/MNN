@@ -67,10 +67,6 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         private const val SAMPLE_RATE = 16000
         private const val REQUEST_AUDIO = 100
 
-        // Silence detection thresholds (reused from VoiceChatPresenter)
-        private const val SPEECH_RMS_THRESHOLD = 400.0f
-        private const val SILENCE_RMS_THRESHOLD = 100.0f
-        private const val MAX_SILENCE_CHUNKS = 15
         private const val MAX_TOTAL_CHUNKS = 1800  // 3 min safety net (1800 × 100ms)
         private const val CHUNK_INTERVAL_MS = 100
 
@@ -112,7 +108,6 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     private val timeFormatter = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
     // ── Streaming / Omni state ──
-    @Volatile private var silenceChunkCount = 0
     @Volatile private var speechDetected = false
     @Volatile private var currentRms = 0f
     private val omniAudioBuffer = mutableListOf<Float>()  // Omni BATCH mode: accumulate PCM float samples
@@ -686,7 +681,6 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         idleReturned = false
         isRecording.set(true)
         stoppedByUser.set(false)
-        silenceChunkCount = 0
         speechDetected = false
         currentRms = 0f
 
@@ -696,6 +690,8 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         when (currentMode) {
             TestMode.BATCH -> setStatus("● Recording... tap STOP when done")
             TestMode.STREAMING -> {
+                // ── Init Silero VAD for neural speech detection ──
+                initTestVad()
                 setStatus("● Listening...")
                 tvStatus.startAnimation(blinkAnimation)
             }
@@ -813,27 +809,31 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             }
 
             if (isStreaming) {
-                // VAD logic
-                if (rms > SPEECH_RMS_THRESHOLD) {
-                    if (!speechDetected) {
-                        speechDetected = true
-                        runOnUiThread {
-                            tvStatus.clearAnimation()
-                            setStatus("● Speech detected...")
-                        }
+                // ── Silero VAD (neural voice activity detection) ──
+                // Feed audio to neural VAD model (replaces energy-based RMS threshold)
+                vad?.acceptWaveform(floatBuf)
+
+                // Update UI based on speech detection
+                if (vad?.isSpeechDetected() == true && !speechDetected) {
+                    speechDetected = true
+                    runOnUiThread {
+                        tvStatus.clearAnimation()
+                        setStatus("● Speech detected...")
                     }
-                    silenceChunkCount = 0
-                } else if (speechDetected && rms < SILENCE_RMS_THRESHOLD) {
-                    silenceChunkCount++
-                } else if (rms >= SILENCE_RMS_THRESHOLD) {
-                    silenceChunkCount = 0
                 }
 
-                // Endpoint check
-                if (speechDetected && silenceChunkCount >= MAX_SILENCE_CHUNKS) {
-                    Log.i(TAG, "Endpoint: $silenceChunkCount silence chunks")
-                    break
+                // Endpoint: Silero VAD detects completed speech segment
+                var endpointTriggered = false
+                while (vad?.empty() == false) {
+                    val segment = vad!!.front()
+                    if (segment.samples.size >= SAMPLE_RATE * 0.15f) {
+                        Log.i(TAG, "VAD endpoint: segment ${segment.samples.size} samples " +
+                                "(${"%.1f".format(segment.samples.size / SAMPLE_RATE.toFloat())}s)")
+                        endpointTriggered = true
+                    }
+                    vad!!.pop()
                 }
+                if (endpointTriggered) break
             }
         }
 
@@ -901,6 +901,19 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             runOnUiThread { returnToIdle() }
             return
         } else if (isStreaming) {
+            // ── Flush Silero VAD to extract any in-progress speech ──
+            vad?.flush()
+            while (vad?.empty() == false) {
+                val segment = vad!!.front()
+                if (segment.samples.size >= SAMPLE_RATE * 0.15f) {
+                    speechDetected = true
+                    Log.i(TAG, "VAD flush: found speech segment ${segment.samples.size} samples")
+                }
+                vad!!.pop()
+            }
+            // Reset VAD state for next utterance (keep model loaded for auto-restart)
+            vad?.reset()
+
             // Decide what to do based on speech and user intent
             if (speechDetected) {
                 runOnUiThread {
@@ -912,6 +925,8 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             } else {
                 // No speech detected yet
                 if (stoppedByUser.get()) {
+                    try { vad?.release() } catch (_: Exception) {}
+                    vad = null
                     runOnUiThread { returnToIdle() }
                 } else {
                     runOnUiThread {
@@ -1134,15 +1149,14 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     }
 
     private fun restartStreamingIfNeeded() {
-        if (stoppedByUser.get() || currentMode != TestMode.STREAMING) return
+        if (isRecording.get() || stoppedByUser.get() || currentMode != TestMode.STREAMING) return
 
         // Small delay before auto-restart
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
             if (isDestroyed || isFinishing) return@postDelayed
-            if (stoppedByUser.get() || currentMode != TestMode.STREAMING) return@postDelayed
+            if (isRecording.get() || stoppedByUser.get() || currentMode != TestMode.STREAMING) return@postDelayed
 
             isRecording.set(true)
-            silenceChunkCount = 0
             speechDetected = false
             currentRms = 0f
 
@@ -1189,7 +1203,9 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         // Clear Omni session history between recording sessions.
         llmSession?.reset()
 
-        // Clean up VAD state
+        // Clean up VAD state (release neural VAD model when returning to idle)
+        try { vad?.release() } catch (_: Exception) {}
+        vad = null
         omniLiveCardId = -1
 
         btnRecord.text = "REC"
