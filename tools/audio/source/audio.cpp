@@ -411,13 +411,13 @@ VARP spectrogram(VARP waveform, const SpectrogramParams *params) {
     VARP window;
     switch (window_type) {
         case HANNING:
-            window = hann_window(win_length);
+            window = hann_window(win_length, true);
             break;
         case HAMMING:
-            window = hamming_window(win_length);
+            window = hamming_window(win_length, true);
             break;
         default:
-            window = hann_window(win_length);
+            window = hann_window(win_length, true);
             break;
     }
     std::unique_ptr<OpT> op(new OpT);
@@ -549,7 +549,7 @@ VARP conformer_fbank(VARP waveform, int sample_rate, int n_mels, int n_fft, int 
     waveform = _Reshape(waveform, {1, -1, 1});
     // 3. Create zero-padded window: hann(win_length) padded to n_fft
     if (win_length <= 0) win_length = n_fft;
-    auto window = hann_window(win_length);
+    auto window = hann_window(win_length, true);
     if (win_length < n_fft) {
         int pad_left_w = (n_fft - win_length) / 2;
         int pad_right_w = n_fft - win_length - pad_left_w;

@@ -101,7 +101,7 @@ MNN_PUBLIC bool save(const std::string& filename, VARP audio, int sample_rate);
  * @param beta beta
  * @return hamming window tensor
  */
-MNN_PUBLIC VARP hamming_window(int window_size, bool periodic = false, float alpha = 0.54, float beta = 0.46);
+MNN_PUBLIC VARP hamming_window(int window_size, bool periodic = true, float alpha = 0.54, float beta = 0.46);
 
 /**
  * @brief compute hann window
@@ -109,7 +109,7 @@ MNN_PUBLIC VARP hamming_window(int window_size, bool periodic = false, float alp
  * @param periodic periodic
  * @return hann window tensor
  */
-MNN_PUBLIC VARP hann_window(int window_size, bool periodic = false);
+MNN_PUBLIC VARP hann_window(int window_size, bool periodic = true);
 
 /**
  * @brief compute melscale fbanks

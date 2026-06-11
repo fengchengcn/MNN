@@ -17,7 +17,7 @@ static PyObject *PyMNNAUDIO_save(PyObject *self, PyObject *args) {
     PyMNN_ERROR("save require args: (string, Var, int)");
 }
 static PyObject *PyMNNAUDIO_hamming_window(PyObject *self, PyObject *args) {
-    int window_size = 0, periodic = 0;
+    int window_size = 0, periodic = 1;
     float alpha = 0.54, beta = 0.46;
     if (PyArg_ParseTuple(args, "i|iff", &window_size, &periodic, &alpha, &beta)) {
         return toPyObj(AUDIO::hamming_window(window_size, periodic, alpha, beta));
@@ -25,7 +25,7 @@ static PyObject *PyMNNAUDIO_hamming_window(PyObject *self, PyObject *args) {
     PyMNN_ERROR("hamming_window require args: (int, |bool, float, float)");
 }
 static PyObject *PyMNNAUDIO_hann_window(PyObject *self, PyObject *args) {
-    int window_size = 0, periodic = 0;
+    int window_size = 0, periodic = 1;
     if (PyArg_ParseTuple(args, "i|i", &window_size, &periodic)) {
         return toPyObj(AUDIO::hann_window(window_size, periodic));
     }
