@@ -36,88 +36,63 @@
             android:textSize="12sp"
             android:layout_marginBottom="24dp" />
 
-        <!-- ═══════════ Engine Section ═══════════ -->
+        <!-- ── Omni Mode Toggle ── -->
         <TextView
+            android:id="@+id/chipOmni"
+            android:layout_width="100dp"
+            android:layout_height="40dp"
+            android:text="OMNI-VAD"
+            android:gravity="center"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:background="@drawable/bg_mode_chip_selected"
+            android:clickable="true"
+            android:focusable="true"
+            android:layout_marginBottom="28dp"
+            android:foreground="?attr/selectableItemBackgroundBorderless" />
+
+        <!-- ── Model Parameters (collapsible) ── -->
+        <LinearLayout
+            android:id="@+id/paramsHeader"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="ENGINE"
-            android:textColor="#5E5E72"
-            android:textSize="10sp"
-            android:textStyle="bold"
-            android:letterSpacing="0.08"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:clickable="true"
+            android:focusable="true"
+            android:foreground="?attr/selectableItemBackgroundBorderless"
             android:layout_marginBottom="10dp"
-            android:layout_marginStart="4dp" />
+            android:layout_marginStart="4dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="PARAMETERS"
+                android:textColor="#5E5E72"
+                android:textSize="10sp"
+                android:textStyle="bold"
+                android:letterSpacing="0.08" />
+
+            <TextView
+                android:id="@+id/paramsArrow"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="▶"
+                android:textColor="#5E5E72"
+                android:textSize="10sp" />
+        </LinearLayout>
 
         <LinearLayout
-            android:id="@+id/engineSelector"
+            android:id="@+id/paramsCard"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:layout_marginBottom="22dp"
+            android:background="@drawable/bg_asr_result_card"
+            android:padding="14dp"
+            android:layout_marginBottom="28dp"
             android:visibility="gone" />
-
-        <!-- ═══════════ Mode Section ═══════════ -->
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="MODE"
-            android:textColor="#5E5E72"
-            android:textSize="10sp"
-            android:textStyle="bold"
-            android:letterSpacing="0.08"
-            android:layout_marginBottom="10dp"
-            android:layout_marginStart="4dp" />
-
-        <LinearLayout
-            android:id="@+id/modeSelector"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:layout_marginBottom="28dp">
-
-            <TextView
-                android:id="@+id/chipBatch"
-                android:layout_width="100dp"
-                android:layout_height="40dp"
-                android:text="Batch"
-                android:gravity="center"
-                android:textColor="#FFFFFF"
-                android:textSize="14sp"
-                android:textStyle="bold"
-                android:background="@drawable/bg_mode_chip_selected"
-                android:clickable="true"
-                android:focusable="true"
-                android:layout_marginEnd="8dp"
-                android:foreground="?attr/selectableItemBackgroundBorderless" />
-
-            <TextView
-                android:id="@+id/chipStreaming"
-                android:layout_width="100dp"
-                android:layout_height="40dp"
-                android:text="Streaming"
-                android:gravity="center"
-                android:textColor="#888899"
-                android:textSize="14sp"
-                android:background="@drawable/bg_mode_chip_normal"
-                android:clickable="true"
-                android:focusable="true"
-                android:layout_marginEnd="8dp"
-                android:foreground="?attr/selectableItemBackgroundBorderless" />
-
-            <TextView
-                android:id="@+id/chipOmni"
-                android:layout_width="100dp"
-                android:layout_height="40dp"
-                android:text="OMNI-VAD"
-                android:gravity="center"
-                android:textColor="#888899"
-                android:textSize="14sp"
-                android:background="@drawable/bg_mode_chip_normal"
-                android:clickable="true"
-                android:focusable="true"
-                android:foreground="?attr/selectableItemBackgroundBorderless"
-                android:visibility="gone" />
-        </LinearLayout>
 
         <!-- ── Record Button ── -->
         <FrameLayout

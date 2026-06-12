@@ -28,6 +28,7 @@ import androidx.lifecycle.lifecycleScope
 import com.alibaba.mnnllm.android.llm.ChatService
 import com.alibaba.mnnllm.android.llm.GenerateProgressListener
 import com.alibaba.mnnllm.android.llm.LlmSession
+import com.alibaba.mnnllm.android.modelsettings.ModelConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
@@ -61,6 +62,10 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     private lateinit var audioLevelFill: View
     private lateinit var audioLevelContainer: LinearLayout
     private lateinit var resultsContainer: LinearLayout
+    private lateinit var paramsHeader: LinearLayout
+    private lateinit var paramsArrow: TextView
+    private lateinit var paramsCard: LinearLayout
+    private var paramsExpanded = false
 
     // ── State ──
     private var llmSession: LlmSession? = null
@@ -115,11 +120,21 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         audioLevelFill = findViewById(R.id.audioLevelFill)
         audioLevelContainer = findViewById(R.id.audioLevelContainer)
         resultsContainer = findViewById(R.id.resultsContainer)
+        paramsHeader = findViewById(R.id.paramsHeader)
+        paramsArrow = findViewById(R.id.paramsArrow)
+        paramsCard = findViewById(R.id.paramsCard)
 
-        // Hide legacy mode chips (no longer used)
-        findViewById<TextView>(R.id.chipBatch).visibility = View.GONE
-        findViewById<TextView>(R.id.chipStreaming).visibility = View.GONE
-        findViewById<LinearLayout>(R.id.engineSelector).visibility = View.GONE
+        // Collapsible parameter panel
+        paramsHeader.setOnClickListener {
+            paramsExpanded = !paramsExpanded
+            if (paramsExpanded) {
+                paramsCard.visibility = View.VISIBLE
+                paramsArrow.text = "▼"
+            } else {
+                paramsCard.visibility = View.GONE
+                paramsArrow.text = "▶"
+            }
+        }
 
         blinkAnimation = AlphaAnimation(0.3f, 1.0f).apply {
             duration = 600
@@ -245,14 +260,29 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                 return
             }
 
+            // Write ASR-optimized custom config BEFORE load() so it gets merged
+            writeAsrCustomConfig()
+
             session.load()
             session.setKeepHistory(false)
             llmSession = session
             modelLoaded = true
 
+            // Load the effective merged config for display (still on IO thread)
+            val mergedConfig = ModelConfig.loadMergedConfig(
+                configPath,
+                ModelConfig.getExtraConfigFile("omni_test")
+            )
+            val modelDirName = File(modelDir).name
+
             Log.i(TAG, "Omni LlmSession loaded OK: $modelDir")
             withContext(Dispatchers.Main) {
-                appendSystemMessage("Loaded: Omni (${File(modelDir).name})")
+                appendSystemMessage("Loaded: Omni ($modelDirName)")
+                if (mergedConfig != null) {
+                    populateParams(mergedConfig, modelDirName)
+                } else {
+                    Log.w(TAG, "Merged config null; skipping param display")
+                }
                 val label = if (omniUseVad) "VAD-segmented" else "BATCH (full audio)"
                 setStatus("Omni $label — tap REC to test")
                 btnRecord.isEnabled = true
@@ -268,6 +298,158 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         chipToggle.setBackgroundResource(R.drawable.bg_mode_chip_selected)
         chipToggle.setTextColor(Color.WHITE)
     }
+
+    // ══════════════════════════════════════════════
+    //  ASR-Optimized Custom Config
+    // ══════════════════════════════════════════════
+
+    /**
+     * Write a custom_config.json that overrides sampling parameters for ASR accuracy.
+     * Called BEFORE session.load() so LlmSession merges it with base config.json.
+     * Only sets ASR-relevant fields; all others are null (omitted by Gson, base values preserved).
+     */
+    private fun writeAsrCustomConfig() {
+        try {
+            val config = ModelConfig(
+                llmModel = null, llmWeight = null, backendType = null,
+                threadNum = 4,                       // CPU threads
+                precision = null, useMmap = null, memory = null,
+                systemPrompt = null, promptCache = null,
+                samplerType = null,                  // let engine use default path
+                mixedSamplers = null,
+                temperature = 0.0f,                  // no randomness
+                topP = 1.0f,                         // no nucleus cutoff
+                topK = null, minP = null, tfsZ = null, typical = null,
+                penalty = 1.0f,                      // no repetition penalty
+                nGram = null, nGramFactor = null,
+                maxNewTokens = 128,                  // per-segment cap
+                assistantPromptTemplate = null, penaltySampler = null,
+                jinja = null, visualModel = null,
+                diffusionMemoryMode = null, diffusionSteps = null,
+                imageWidth = null, imageHeight = null, diffusionSeed = null,
+                cfgPrompt = null, gridSize = null
+            )
+            val customConfigPath = ModelConfig.getExtraConfigFile("omni_test")
+            ModelConfig.saveConfig(customConfigPath, config)
+            Log.i(TAG, "ASR custom config written: $customConfigPath")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to write ASR custom config", e)
+        }
+    }
+
+    // ══════════════════════════════════════════════
+    //  Model Parameter Display
+    // ══════════════════════════════════════════════
+
+    private fun populateParams(mergedConfig: ModelConfig, modelDirName: String) {
+        try {
+            paramsCard.removeAllViews()
+            paramsCard.visibility = View.VISIBLE
+            paramsArrow.text = "▼"
+            paramsExpanded = true
+
+            // ── Section: Model Info ──
+            addParamSection("Model")
+            addParamRow("Model", modelDirName)
+            addParamRow("Backend", mergedConfig.backendType ?: "—")
+            addParamRow("Precision", mergedConfig.precision ?: "—")
+            mergedConfig.threadNum?.let {
+                if (it > 0) addParamRow("Threads", it.toString())
+            }
+
+            // ── Section: Sampler ──
+            addParamSection("Sampling")
+            mergedConfig.samplerType?.let {
+                if (it.isNotBlank()) addParamRow("Sampler", it)
+            }
+            mergedConfig.mixedSamplers?.let {
+                if (it.isNotEmpty()) addParamRow("Mixed", it.joinToString(", "))
+            }
+            mergedConfig.temperature?.let { addParamRow("Temperature", formatValue(it)) }
+            mergedConfig.topP?.let { addParamRow("Top-P", formatValue(it)) }
+            mergedConfig.topK?.let { addParamRow("Top-K", it.toString()) }
+            mergedConfig.minP?.let { addParamRow("Min-P", formatValue(it)) }
+            mergedConfig.tfsZ?.let { addParamRow("TFS-Z", formatValue(it)) }
+            mergedConfig.typical?.let { addParamRow("Typical", formatValue(it)) }
+
+            // ── Section: Penalty ──
+            val hasPenalty = mergedConfig.penalty != null || mergedConfig.penaltySampler != null
+            if (hasPenalty) {
+                addParamSection("Penalty")
+                mergedConfig.penalty?.let { addParamRow("Repetition", formatValue(it)) }
+                mergedConfig.penaltySampler?.let {
+                    if (it.isNotBlank()) addParamRow("Type", it)
+                }
+                mergedConfig.nGram?.let { addParamRow("N-Gram", it.toString()) }
+                mergedConfig.nGramFactor?.let { addParamRow("N-Gram Factor", formatValue(it)) }
+            }
+
+            // ── Section: Generation ──
+            addParamSection("Generation")
+            mergedConfig.maxNewTokens?.let { addParamRow("Max Tokens", it.toString()) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to populate params", e)
+        }
+    }
+
+    private fun addParamSection(title: String) {
+        paramsCard.addView(TextView(this).apply {
+            text = title.uppercase()
+            setTextColor(Color.parseColor("#5E5E72"))
+            textSize = 10f
+            setTypeface(typeface, Typeface.BOLD)
+            letterSpacing = 0.08f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = if (paramsCard.childCount > 0) dp(12) else 0
+                bottomMargin = dp(6)
+            }
+        })
+    }
+
+    private fun addParamRow(label: String, value: String) {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(2) }
+        }
+
+        row.addView(TextView(this).apply {
+            text = label
+            setTextColor(Color.parseColor("#888899"))
+            textSize = 13f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { width = dp(120) }
+        })
+
+        row.addView(TextView(this).apply {
+            text = value
+            setTextColor(Color.parseColor("#D0D0E0"))
+            textSize = 13f
+            setTypeface(typeface, Typeface.NORMAL)
+        })
+
+        paramsCard.addView(row)
+    }
+
+    private fun formatValue(value: Any): String {
+        return when (value) {
+            is Float -> {
+                val d = value.toDouble()
+                if (d == d.toLong().toDouble()) d.toLong().toString()
+                else String.format("%.4f", d).trimEnd('0').trimEnd('.')
+            }
+            else -> value.toString()
+        }
+    }
+
+    // ══════════════════════════════════════════════
 
     // ══════════════════════════════════════════════
     //  Recording — Entry Points
