@@ -164,6 +164,15 @@ MNN_PUBLIC VARP whisper_fbank(VARP waveform, int sample_rate = 16000, int n_mels
                               int hop_length = 160, int chunk_len = 0);
 
 /**
+ * @brief compute Whisper fbank using kaldi-native-fbank (pixel-level alignment with sherpa-onnx / training pipeline)
+ * @param waveform waveform tensor (float, 1-D, normalized to [-1, 1])
+ * @param sample_rate sample rate (default 16000)
+ * @param n_mels number of mel bins (default 128 for Qwen3-ASR, 80 for standard Whisper)
+ * @return fbank tensor [1, n_mels, T] in NCHW format, already normalized (log10 + clamp + scale)
+ */
+MNN_PUBLIC VARP whisper_fbank_knf(VARP waveform, int sample_rate = 16000, int n_mels = 128);
+
+/**
  * @brief compute conformer fbank from audio (NeMo-style preprocessing)
  * @param waveform waveform tensor
  * @param sample_rate sample rate

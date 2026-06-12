@@ -25,6 +25,14 @@
 #include <windows.h>
 #endif
 
+#ifdef MNN_USE_KALDI_NATIVE_FBANK
+// kaldi-native-fbank headers: the include directory is
+// ${kaldi_native_fbank_SOURCE_DIR}, actual headers are under
+// kaldi-native-fbank/csrc/ within that tree.
+#include "kaldi-native-fbank/csrc/online-feature.h"
+#include "kaldi-native-fbank/csrc/whisper-feature.h"
+#endif
+
 
 namespace MNN {
 namespace AUDIO {
@@ -722,6 +730,112 @@ VARP usm_fbank(VARP waveform, int sample_rate, int n_mels, int n_fft, int hop_le
     log_specgram = _Unsqueeze(log_specgram, {0});
     return log_specgram;
 }
+
+#ifdef MNN_USE_KALDI_NATIVE_FBANK
+
+VARP whisper_fbank_knf(VARP waveform, int sample_rate, int n_mels) {
+    if (waveform == nullptr || waveform->getInfo() == nullptr) {
+        MNN_ERROR("whisper_fbank_knf: null waveform\n");
+        return nullptr;
+    }
+
+    int wav_len = waveform->getInfo()->size;
+    if (wav_len <= 0) {
+        MNN_ERROR("whisper_fbank_knf: empty waveform\n");
+        return nullptr;
+    }
+
+    const float* wave_data = waveform->readMap<float>();
+
+    MNN_PRINT("whisper_fbank_knf: using kaldi-native-fbank (preemphasis=0.97, htk_mel, hann_window, snip_edges)\n");
+
+    // Configure kaldi-native-fbank with Whisper-standard parameters
+    // These match the exact training pipeline used by Qwen3-ASR / sherpa-onnx
+    knf::WhisperFeatureOptions opts;
+    opts.frame_opts.samp_freq       = sample_rate;
+    opts.frame_opts.frame_length_ms = 25;          // 400 samples @ 16kHz
+    opts.frame_opts.frame_shift_ms  = 10;          // 160 samples @ 16kHz
+    opts.frame_opts.dither          = 0.0;         // no dither for ASR
+    opts.frame_opts.preemph_coeff   = 0.97;        // preemphasis (CRITICAL for accuracy)
+    opts.frame_opts.remove_dc_offset = true;       // DC removal
+    opts.frame_opts.window_type     = "hann";      // Hann window
+    opts.frame_opts.snip_edges      = true;        // match Whisper training
+    opts.dim = n_mels;                             // 128 for Qwen3-ASR, 80 for standard Whisper
+
+    knf::OnlineWhisperFbank fbank(opts);
+    fbank.AcceptWaveform(sample_rate, wave_data, wav_len);
+    fbank.InputFinished();
+
+    int32_t num_frames = fbank.NumFramesReady();
+    if (num_frames <= 0) {
+        MNN_ERROR("whisper_fbank_knf: no frames produced (input too short?)\n");
+        return nullptr;
+    }
+
+    // Collect frames: [num_frames, n_mels] row-major
+    std::vector<float> features(static_cast<size_t>(num_frames) * n_mels);
+    for (int32_t i = 0; i < num_frames; ++i) {
+        const float* frame = fbank.GetFrame(i);
+        std::copy(frame, frame + n_mels,
+                  features.begin() + static_cast<size_t>(i) * n_mels);
+    }
+
+    // ── Whisper post-normalization ──
+    // Equivalent to sherpa-onnx's NormalizeWhisperFeatures() in math.cc
+    //   log_spec = torch.clamp(features, min=1e-10).log10()
+    //   log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
+    //   mel = (log_spec + 4.0) / 4.0
+    {
+        const float kLogFloor = 1e-10f;
+        const float kLog10 = 1.0f / std::log(10.0f);
+
+        float max_val = -std::numeric_limits<float>::infinity();
+        size_t total = features.size();
+
+        // Pass 1: log10 and find max
+        for (size_t i = 0; i < total; ++i) {
+            float v = features[i];
+            if (v < kLogFloor) v = kLogFloor;
+            v = std::log(v) * kLog10;  // natural log → log10
+            features[i] = v;
+            if (v > max_val) max_val = v;
+        }
+
+        float threshold = max_val - 8.0f;
+
+        // Pass 2: clamp and scale
+        for (size_t i = 0; i < total; ++i) {
+            float v = features[i];
+            if (v < threshold) v = threshold;
+            features[i] = (v + 4.0f) / 4.0f;
+        }
+    }
+
+    // Build MNN tensor: [1, n_mels, T] in NCHW format
+    // NCHW layout: data[b * C*H*W + c * H*W + h * W + w]
+    // For shape [1, n_mels, 1, T]: data[c * T + t]
+    auto result = _Input({1, n_mels, num_frames}, NCHW, halide_type_of<float>());
+    float* dst = result->writeMap<float>();
+    for (int32_t t = 0; t < num_frames; ++t) {
+        for (int32_t m = 0; m < n_mels; ++m) {
+            dst[m * num_frames + t] = features[static_cast<size_t>(t) * n_mels + m];
+        }
+    }
+
+    return result;
+}
+
+#else  // !MNN_USE_KALDI_NATIVE_FBANK
+
+VARP whisper_fbank_knf(VARP waveform, int sample_rate, int n_mels) {
+    // Fallback: use the built-in whisper_fbank when kaldi-native-fbank is not available.
+    // Note: this fallback lacks preemphasis and uses slaney mel scale,
+    // which will cause reduced ASR accuracy compared to the knf path.
+    MNN_PRINT("whisper_fbank_knf: kaldi-native-fbank not available, falling back to whisper_fbank\n");
+    return whisper_fbank(waveform, sample_rate, n_mels);
+}
+
+#endif // MNN_USE_KALDI_NATIVE_FBANK
 
 } // namespace AUDIO
 } // namespace MNN

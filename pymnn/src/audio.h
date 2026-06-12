@@ -90,6 +90,16 @@ static PyObject *PyMNNAUDIO_whisper_fbank(PyObject *self, PyObject *args) {
     PyMNN_ERROR("whisper_fbank require args: (Var, |int, int, int, int, int)");
 }
 
+static PyObject *PyMNNAUDIO_whisper_fbank_knf(PyObject *self, PyObject *args) {
+    PyObject *waveform = nullptr;
+    int sample_rate = 16000, n_mels = 128;
+    if (PyArg_ParseTuple(args, "O|ii", &waveform, &sample_rate, &n_mels) &&
+        isVar(waveform)) {
+        return toPyObj(AUDIO::whisper_fbank_knf(toVar(waveform), sample_rate, n_mels));
+    }
+    PyMNN_ERROR("whisper_fbank_knf require args: (Var, |int, int)");
+}
+
 static PyMethodDef PyMNNAUDIO_methods[] = {
     register_methods(AUDIO,
         load, "load",
@@ -100,6 +110,7 @@ static PyMethodDef PyMNNAUDIO_methods[] = {
         spectrogram, "spectrogram",
         mel_spectrogram, "mel_spectrogram",
         fbank, "fbank",
-        whisper_fbank, "whisper_fbank"
+        whisper_fbank, "whisper_fbank",
+        whisper_fbank_knf, "whisper_fbank_knf"
     )
 };
