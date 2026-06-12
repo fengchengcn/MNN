@@ -869,15 +869,22 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
     Timer _t;
     VARP input_features;
     auto audio_type = mConfig->audio_type();
+    ALOGI("Omni fbank: audio_type=%s, calling whisper_fbank_knf", audio_type.c_str());
     if (audio_type == "conformer") {
         input_features = MNN::AUDIO::conformer_fbank(waveform);
     } else if (audio_type == "usm") {
         input_features = MNN::AUDIO::usm_fbank(waveform);
     } else if (audio_type == "qwen3_asr") {
-        // Qwen3-ASR uses standard Whisper-style Mel filterbank
-        input_features = MNN::AUDIO::whisper_fbank(waveform);
+        // Qwen3-ASR: use kaldi-native-fbank for pixel-level alignment
+        // with the training pipeline (sherpa-onnx compatible).
+        // Automatically falls back to whisper_fbank if knf is not available.
+        input_features = MNN::AUDIO::whisper_fbank_knf(waveform);
     } else {
-        input_features = MNN::AUDIO::whisper_fbank(waveform);
+        input_features = MNN::AUDIO::whisper_fbank_knf(waveform);
+    }
+    if (input_features.get() != nullptr && input_features->getInfo() != nullptr) {
+        auto fi = input_features->getInfo();
+        ALOGI("Omni fbank output: [%d,%d,%d]", fi->dim[0], fi->dim[1], fi->dim[2]);
     }
     if (input_features == nullptr || input_features->getInfo() == nullptr) {
         MNN_PRINT("Omni audio fbank failed\n");

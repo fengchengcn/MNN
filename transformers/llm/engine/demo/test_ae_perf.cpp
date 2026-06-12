@@ -46,7 +46,7 @@ int main(int argc, char* argv[]) {
     auto lr = MNN::AUDIO::load(wav, 16000);
     auto wf = lr.first;
     if (!wf.get()) { std::cerr << "FAIL load\n"; return 1; }
-    auto feat = MNN::AUDIO::whisper_fbank(wf);
+    auto feat = MNN::AUDIO::whisper_fbank_knf(wf);
     if (!feat.get() || !feat->getInfo()) { std::cerr << "FAIL fbank\n"; return 1; }
     { auto info = feat->getInfo(); auto p = feat->readMap<float>();
       auto f = _Input(info->dim, NCHW, halide_type_of<float>());

@@ -21,7 +21,7 @@ int main() {
     auto wf = lr.first;
     
     // Extract fbank
-    auto feat = MNN::AUDIO::whisper_fbank(wf);
+    auto feat = MNN::AUDIO::whisper_fbank_knf(wf);
     { auto info = feat->getInfo(); auto p = feat->readMap<float>();
       auto f = _Input(info->dim, NCHW, halide_type_of<float>());
       memcpy(f->writeMap<float>(), p, info->size * sizeof(float)); feat = f; }
