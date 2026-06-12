@@ -129,7 +129,7 @@ int main(int argc, char* argv[]) {
     auto embed_tbl = load_embed(dir + "/embeddings_bf16.bin");
     if (embed_tbl.get() == nullptr) { std::cerr << "FAIL\n"; return 1; }
 
-    // ======= 3.5. Create ASR sampler (Penalty + Greedy, shared config) =======
+    // ======= 3.5. Create ASR sampler (Pure Greedy, matches generation_config.json) =======
     std::shared_ptr<MNN::Transformer::LlmContext> sampler_ctx;
     auto sampler = MNN::Transformer::createAsrSampler(sampler_ctx);
 
@@ -141,7 +141,7 @@ int main(int argc, char* argv[]) {
     if (wf.get() == nullptr) { std::cerr << "FAIL\n"; return 1; }
     int nsamples = wf->getInfo()->size;
 
-    auto feat = MNN::AUDIO::whisper_fbank(wf);
+    auto feat = MNN::AUDIO::whisper_fbank_knf(wf);
     if (feat.get() == nullptr || feat->getInfo() == nullptr) { std::cerr << "whisper_fbank FAIL\n"; return 1; }
     // Materialize fbank
     { auto info = feat->getInfo(); auto p = feat->readMap<float>();

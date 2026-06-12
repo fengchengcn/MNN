@@ -372,11 +372,9 @@ class LlmExporter(torch.nn.Module):
                     'audio_start': 151669,
                     'audio_end': 151670,
                     'system_prompt': 'Transcribe speech to text.',
-                    # ASR decoding: Penalty + Greedy (deterministic, prevents repetition loops)
-                    'sampler_type': 'penalty',
-                    'penalty': 1.15,
-                    'penalty_sampler': 'greedy',
-                    'repetition_penalty': 1.15,
+                    # ASR decoding: Pure greedy (do_sample=false, temperature≈0)
+                    # Matches original model's generation_config.json
+                    'sampler_type': 'greedy',
                     # Override base-template sampling params for deterministic ASR
                     'temperature': 0.0,
                     'top_k': 1,

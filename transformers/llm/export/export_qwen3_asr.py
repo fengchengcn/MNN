@@ -970,10 +970,9 @@ def main():
         'llm_weight': 'llm.mnn.weight' if args.quant_bit < 16 else '',
         'embedding': 'embeddings_bf16.bin',
         'tie_embeddings': True,
-        # ASR decoding: Penalty + Greedy (deterministic, prevents repetition loops)
-        'sampler_type': 'penalty',
-        'penalty': 1.15,
-        'penalty_sampler': 'greedy',
+        # ASR decoding: Pure greedy (do_sample=false, temperature≈0)
+        # Matches original model's generation_config.json
+        'sampler_type': 'greedy',
         'max_new_tokens': 100,
         # Task anchor: tells the decoder to transcribe, not chat (domain-neutral)
         'system_prompt': 'Transcribe speech to text.',

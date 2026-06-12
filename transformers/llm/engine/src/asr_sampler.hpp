@@ -1,5 +1,5 @@
 // ASR Sampler Configuration — shared across all Qwen3-ASR inference paths
-// Provides a MNN Sampler pre-configured for deterministic ASR (penalty + greedy).
+// Provides a MNN Sampler pre-configured for deterministic ASR (pure greedy).
 //
 // Usage:
 //   // Option A: Read sampler params from config.json (recommended)
@@ -25,15 +25,13 @@
 namespace MNN {
 namespace Transformer {
 
-// ASR-optimized sampler defaults (Penalty + Greedy).
+// ASR-optimized sampler defaults (Pure Greedy).
 // Used as fallback when no config.json is provided.
 // ASR is a deterministic task — one correct transcription per audio input.
-// Greedy selection is preferred over temperature-based sampling for accuracy.
-// Repetition penalty (1.15) prevents the decoder from looping on repeated tokens.
+// Pure greedy (argmax) for accuracy, matching the model's generation_config.json
+// (do_sample=false, temperature≈0).
 constexpr const char* ASR_SAMPLER_DEFAULTS_JSON = R"({
-    "sampler_type": "penalty",
-    "penalty": 1.15,
-    "penalty_sampler": "greedy",
+    "sampler_type": "greedy",
     "max_new_tokens": 256,
     "max_all_tokens": 2048
 })";
