@@ -1,14 +1,14 @@
 ---
-date: 2026-06-11
+date: 2026-06-14
 status: active
 tags: [qwen3-asr, progress, milestone, index]
 category: plan
 aliases: [项目进度, Progress, Master Index]
-related: [[llmexport-migration]], [[omni-streaming]], [[root-cause-analysis]], [[android-memory]], [[omni-parameters]]
+related: [[llmexport-migration]], [[omni-streaming]], [[root-cause-analysis]], [[android-memory]], [[omni-parameters]], [[analysis/fbank-numerical-analysis]]
 ---
 # Qwen3-ASR → MNN 项目状态
 
-> 最后更新：2026-06-11 | 状态：**Omni 引擎迁移完成，旧引擎已冻结**
+> 最后更新：2026-06-14 | 状态：**AEC/NS 精度根因确认并修复，识别质量对齐 sherpa-onnx**
 
 ## 当前状态总览
 
@@ -54,8 +54,20 @@ Qwen3-ASR-0.6B → MNN 迁移: ✅ 完成
 | 06-09 | 系统提示词更新 + AudioEffect 泄漏修复 + RMS 统一 |
 | 06-10 | Omni 引擎模型导出成功（INT8, 814MB），x86 验证通过 |
 | 06-10 | Android Omni 集成完成（三模式自动检测：Omni > Old > Sherpa） |
-| 06-11 | Phase 2.6 VAD 引导扩展窗口实机验证，FP16+greedy 模型发布 |
-| 06-11 | 旧引擎 Qwen3AsrEngine 移除，仅保留 Omni |
+| 06-14 | **AEC/NS 精度根因确认**：Android `AcousticEchoCanceler` + `NoiseSuppressor` 是识别精度最大杀手。移除后 MNN 精度对齐 sherpa-onnx。详见 [[analysis/fbank-numerical-analysis]] §0 |
+
+### 12. AEC + NoiseSuppressor 是精度最大杀手（2026-06-14，🔴 P0）
+
+- **现象**: MNN ASR 识别精度显著差于 sherpa-onnx，即使 fbank 已通过 kaldi-native-fbank 对齐
+- **根因**: `Qwen3AsrTestActivity.initAudioRecord()` 开启了 `AcousticEchoCanceler` + `NoiseSuppressor`。这些 Android 硬件 DSP 音效为**语音通话**优化（窄带），用于 ASR（全频带）会导致：
+  1. 高频辅音 (`/s/`, `/f/`, `/sh/`) 被噪声抑制误删 → 音素识别错误
+  2. 动态范围被 AEC 压缩 → FBank formant 跟踪失效
+  3. 非线性 DSP 谐波 → 引入训练数据中不存在的频谱特征
+  4. 不同手机的 DSP 质量差异大 → 精度不可预测
+- **修复**: 移除 AEC/NS 初始化代码，与 sherpa-onnx 的 `AudioRecorder.kt` 完全对齐：raw MIC → PCM → Float → fbank，无任何硬件音效。
+- **实机验证**: BATCH 模式 + 无 AEC/NS 后识别质量大幅提升
+- **教训**: ASR 的音频链路必须与训练 pipeline 完全一致。任何"增强"（降噪、回声消除、AGC）都是偏差，不是优化。sherpa-onnx 的 `AudioRecorder.kt` 没有任何预处理是正确的参考实现。
+- **代码位置**: `Qwen3AsrTestActivity.kt:initAudioRecord()` — AEC/NS 于 2026-06-14 移除
 
 ## GPU 后端实测结论
 
@@ -146,13 +158,16 @@ CPU + 4 线程 + FP16 是最优配置。
 - **现象**: AEC/NS 对象创建后引用被丢弃
 - **修复**: 3 个 Kotlin 文件补上显式 `release()` + `null` 清理
 
-## 降噪架构（三层）
+## 降噪架构（二层，AEC/NS 已移除）
+
+> **2026-06-14 更新**: Layer 2 (AEC/NS) 已从 ASR 路径移除。识别精度测试证实 AEC/NS 是最大精度杀手。
+> 详见 Pitfall #12 和 [[analysis/fbank-numerical-analysis]] §0。
 
 ```
-Layer 1: 硬件 DSP (VOICE_COMMUNICATION 音频源) → 高通/MTK 自带 AEC+NS+AGC
-Layer 2: Android AudioEffect API → AcousticEchoCanceler + NoiseSuppressor
+Layer 1: AudioSource.MIC → 无硬件 DSP（与 VOICE_COMMUNICATION 不同，MIC 不激活 AGC/AEC/NS）
+Layer 2: ~~Android AudioEffect API~~ → ❌ 已移除（AcousticEchoCanceler + NoiseSuppressor，2026-06-14）
 Layer 3: Silero VAD (神经网络) → silero_vad.onnx 通过 MNN Interpreter 推理
-C++ 引擎: whisper_fbank() — 无额外处理
+C++ 引擎: whisper_fbank_knf() — kaldi-native-fbank，preemphasis=0.97, HTK mel
 ```
 
 > Silero VAD 已取代早期 Phase 2.5 的 RMS 能量 VAD。Silero VAD 是 LSTM 模型（V4/V5），

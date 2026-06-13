@@ -38,7 +38,7 @@ aliases: [MOC, 目录, 导航, Home]
 | 文档 | 说明 | 状态 |
 |------|------|------|
 | [[analysis/root-cause-analysis]] | 识别精度根因分析 | 🔄 active |
-| [[analysis/fbank-numerical-analysis]] | FBank 特征提取数值差异分析 | 🔄 active |
+| [[analysis/fbank-numerical-analysis]] | FBank 特征提取数值差异 + AEC/NS 根因分析 | 🔄 active |
 | [[analysis/android-memory]] | Android 真机内存 & GPU 实测 | ✅ completed |
 | [[analysis/memory-model]] | Omni vs 旧引擎内存模型理论分析 | ✅ completed |
 | [[analysis/omni-parameters]] | Omni 推理参数配置 & greedy 采样 | 🔄 active |
@@ -101,4 +101,5 @@ aliases: [MOC, 目录, 导航, Home]
 06-11  WP1-WP6 完成，旧引擎移除
 06-12  FBank 数值差异深度分析
 06-13  模型目录整理 + 导出规范 + FP16 导出
+06-14  **AEC/NS 移除 — 精度最大杀手确认并修复**
 ```

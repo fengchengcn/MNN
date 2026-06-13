@@ -1,14 +1,14 @@
 ---
-date: 2026-06-12
+date: 2026-06-14
 status: active
 tags: [qwen3-asr, fbank, accuracy, numerical-analysis]
 category: analysis
 aliases: [FBank数值分析, FBank Numerical Analysis]
-related: [[root-cause-analysis]], [[scripts/compare_pipeline_v2]]
+related: [[root-cause-analysis]], [[progress]], [[scripts/compare_pipeline_v2]]
 ---
 # Qwen3-ASR Accuracy Gap Analysis: MNN vs sherpa-onnx
 
-**Date**: 2026-06-12
+**Date**: 2026-06-14 (updated)
 **Models**: Qwen3-ASR-0.6B (Whisper-style encoder-decoder ASR)
 **Comparison**: MNN omni inference vs sherpa-onnx ONNX Runtime inference
 
@@ -16,11 +16,57 @@ related: [[root-cause-analysis]], [[scripts/compare_pipeline_v2]]
 
 ## Summary
 
-The MNN Qwen3-ASR deployment exhibits poor recognition accuracy compared to sherpa-onnx. After detailed code analysis, the root causes are:
+The MNN Qwen3-ASR deployment exhibited significantly worse recognition accuracy than sherpa-onnx. After systematic investigation and real-device A/B testing, the impact factors are ranked:
 
-1. **Frontend (P0):** Feature extraction numerical misalignment — preemphasis missing, wrong mel scale
-2. **Frontend (P1):** STFT/Window/Padding implementation differences
-3. **Backend (P2):** Minor — both use similar greedy AR decoding; decoding is NOT the primary cause
+1. **🔴 Audio Pipeline (P0 — BIGGEST IMPACT):** Android `AcousticEchoCanceler` + `NoiseSuppressor` hardware effects distort speech before it reaches the model. Removing them (matching sherpa-onnx's raw MIC passthrough) yields the single largest accuracy improvement. See [[progress]] Pitfall #12.
+2. **🟡 Frontend (P1):** FBank numerical alignment — preemphasis/mel-scale/STFT differences between `whisper_fbank` fallback and kaldi-native-fbank. Mitigated by `whisper_fbank_knf()` with `MNN_USE_KALDI_NATIVE_FBANK`.
+3. **🟢 Backend (P2):** Minor — both use similar greedy AR decoding; decoding is NOT the primary cause.
+
+> **Key insight (2026-06-14)**: The FBank analysis below was written before the AEC/NS impact was quantified. On real Android devices, hardware audio effects are the **dominant** accuracy killer — more impactful than fbank numerical differences combined. See §0 for details.
+
+---
+
+## 0. Audio Pipeline: AEC/NS Hardware Effects (🔴 P0 — DOMINANT FACTOR)
+
+> **Verified 2026-06-14** via A/B test on real device. Removing AEC/NS alone brought MNN accuracy close to sherpa-onnx.
+
+### The Difference
+
+| Property | sherpa-onnx | MNN (before fix) | MNN (after fix) |
+|----------|-------------|------------------|-----------------|
+| `AudioSource` | `MIC` | `MIC` | `MIC` |
+| `AcousticEchoCanceler` | **None** | **Enabled** | **None** ✅ |
+| `NoiseSuppressor` | **None** | **Enabled** | **None** ✅ |
+| Hardware AGC | None (MIC source) | None (MIC source) | None (MIC source) |
+
+### Why AEC/NS Destroy ASR Accuracy
+
+Android's `AudioEffect` API (`AcousticEchoCanceler`, `NoiseSuppressor`) wraps vendor-specific DSP algorithms (Qualcomm Hexagon, MediaTek Tensilica, etc.). These are tuned for **voice calls** (narrowband, 8-16kHz), not **ASR** (fullband, 16kHz+).
+
+The effects introduce:
+1. **Spectral distortion**: Aggressive noise suppression removes high-frequency consonants (`/s/`, `/f/`, `/sh/`, `/t/`) that are critical for phoneme discrimination
+2. **Dynamic range compression**: AEC squashes the energy envelope, which FBank relies on for formant tracking
+3. **Nonlinear artifacts**: DSP algorithms introduce harmonics and intermodulation products not present in natural speech
+4. **Device-dependent quality**: Low-end phones have worse DSP implementations, making accuracy unpredictable
+
+### Code Fix
+
+```kotlin
+// Qwen3AsrTestActivity.kt — removed from initAudioRecord():
+// aec = AcousticEchoCanceler.create(...)    ← DELETED
+// noiseSuppressor = NoiseSuppressor.create(...)  ← DELETED
+
+// Now: raw MIC → PCM Short → Float → fbank (same as sherpa-onnx)
+```
+
+### Verification Method
+
+1. BATCH mode (no VAD) + no AEC/NS vs sherpa-onnx BATCH mode
+2. Same audio source, same recording, same utterance
+3. Result: accuracy gap largely closed
+
+**Code pointers**: `Qwen3AsrTestActivity.kt:initAudioRecord()` — AEC/NS code removed 2026-06-14.
+`AudioRecorder.kt` (sherpa-onnx) — no AEC/NS, confirming this is the reference implementation.
 
 ---
 
@@ -173,16 +219,27 @@ Both use autoregressive greedy decoding. The decoding strategy is NOT the cause 
 
 ---
 
-## 4. Fix Priority
+## 4. Fix Priority (Updated 2026-06-14)
 
-| Priority | Issue | Impact | Effort |
-|----------|-------|--------|--------|
-| **P0** | Missing preemphasis (0.97) | High — all high-freq consonants affected | Low |
-| **P0** | Wrong mel scale (Slaney → HTK) | High — all frequency bins shifted | Low |
-| **P1** | Mel norm mismatch | Medium | Low |
-| **P1** | Center padding (REFLECT → CONSTANT) | Medium — boundary frames affected | Low |
-| **P2** | Last frame removal | Low-Medium | Low |
-| **P2** | STFT numerical precision | Low | High |
+| Priority | Issue | Impact | Effort | Status |
+|----------|-------|--------|--------|--------|
+| **P0** | **AEC + NoiseSuppressor** | 🔴 **DOMINANT** — single largest accuracy killer on Android | Low | ✅ **FIXED** |
+| **P1** | Missing preemphasis (0.97) | High — all high-freq consonants affected | Low | ✅ Fixed via `whisper_fbank_knf` (knf path) |
+| **P1** | Wrong mel scale (Slaney → HTK) | High — all frequency bins shifted | Low | ✅ Fixed via `whisper_fbank_knf` (knf path) |
+| **P2** | Mel norm mismatch | Medium | Low | ✅ Fixed via `whisper_fbank_knf` (knf path) |
+| **P2** | Center padding (REFLECT → CONSTANT) | Medium — boundary frames affected | Low | ✅ Fixed via `whisper_fbank_knf` (knf path) |
+| **P3** | Last frame removal | Low-Medium | Low | ✅ Fixed via `whisper_fbank_knf` (knf path) |
+| **P3** | STFT numerical precision | Low | High | ⚠️ Acceptable (knf uses kissfft) |
+
+> **Note**: P1-P3 issues only manifest when `whisper_fbank_knf()` falls back to `whisper_fbank()` (i.e., `MNN_USE_KALDI_NATIVE_FBANK` not defined). On the Android build (`project/android/build_64/`), `MNN_USE_KALDI_NATIVE_FBANK` IS defined, so these are mitigated. The P0 AEC/NS issue was the remaining gap — now fixed.
+
+### Remaining Accuracy Factors (Post-Fix)
+
+| Factor | Likelihood | Notes |
+|--------|:----------:|-------|
+| MNN `precision: "low"` for INT8 decode | 🟡 Medium | Try `precision: "normal"` |
+| RMS normalization in omni.cpp | 🟡 Low-Medium | Adds gain not in training pipeline |
+| Model conversion artifacts (audio.mnn vs ONNX) | 🟢 Low | Validated in early analysis |
 
 ---
 

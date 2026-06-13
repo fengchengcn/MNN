@@ -1,24 +1,25 @@
 ---
-date: 2026-06-11
+date: 2026-06-14
 status: active
 tags: [qwen3-asr, accuracy, analysis, fbank]
 category: analysis
 aliases: [精度根因分析, Root Cause Analysis]
-related: [[fbank-numerical-analysis]], [[omni-parameters]]
+related: [[fbank-numerical-analysis]], [[omni-parameters]], [[progress]]
 ---
 # Qwen3-ASR 识别精度差异分析
 
-> 日期：2026-06-11 | 状态：**根因定位完成，Omni 迁移后部分缓解**
+> 日期：2026-06-14（更新）| 状态：**主因确认 — AEC/NS 硬件音效**
 >
 > 问题：SherpaOnnx 框架的 Qwen3-ASR 识别精度很高，但 MNN 早期导出在罕见词上表现差。
 
-## 最终结论
+## 最终结论（2026-06-14 更新）
 
-经过系统实验逐一排除后，**根因定位为模型导出/转换质量差异**：
+经过系统实验逐一排除后，**精度差异主因排名**：
 
-- SherpaOnnx 使用 INT8 量化的第三方 ONNX 导出（Wasser1462/Qwen3-ASR-onnx）
-- MNN 早期 FP16 导出反而精度不如 SherpaOnnx INT8 → **排除了量化误差是主因**
-- **解决方向**: 迁移到 llmexport.py 导出路径（已完成），配合 greedy sampling
+1. **🔴 AEC + NoiseSuppressor 硬件音效（影响最大）**：Android `AcousticEchoCanceler` + `NoiseSuppressor` 在 vendor DSP 上的实现在许多手机上会严重扭曲语音频谱。去掉后（与 sherpa-onnx 一致：raw MIC 直通）识别质量大幅提升。详见 [[progress]] Pitfall #12。
+2. **🟡 模型导出/转换质量差异**：SherpaOnnx 使用 INT8 量化的第三方 ONNX 导出；MNN 使用 llmexport.py 导出路径。FBank 通过 `whisper_fbank_knf()` (kaldi-native-fbank) 已对齐。
+3. **🟢 Sampling 参数**：ASR 必须用 greedy (temp=0, top_k=1)。
+4. **🟢 FBank 数值差异**：kaldi-native-fbank 集成后已消除。
 
 ## 已排除的假设
 
