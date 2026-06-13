@@ -28,6 +28,7 @@ import androidx.lifecycle.lifecycleScope
 import com.alibaba.mnnllm.android.llm.ChatService
 import com.alibaba.mnnllm.android.llm.GenerateProgressListener
 import com.alibaba.mnnllm.android.llm.LlmSession
+import com.alibaba.mnnllm.android.llm.AudioPreprocessor
 import com.alibaba.mnnllm.android.modelsettings.ModelConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -89,6 +90,16 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     // ── Silero VAD (neural voice activity detection) ──
     private var vad: Vad? = null
     private val vadWindowSize = 512  // 32ms at 16kHz
+    // WebRTC-style AGC: normalizes mic distance before VAD
+    private val audioPreprocessor = AudioPreprocessor()
+    // Locked-in gain: computed once from the first second of audio, then
+    // applied uniformly to ALL chunks. This preserves intra-utterance
+    // dynamics (same gain for every sample in a sentence) while giving
+    // VAD a consistent level — same principle as BATCH mode.
+    private var lockedGain = 1.0f
+    private var gainLocked = false
+    private var preGainChunkCount = 0
+    private var preGainRmsAccum = 0f
 
     // ── Omni VAD mode segment state ──
     private var omniSegmentCount = 0
@@ -496,6 +507,10 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         omniSegmentCount = 0
         omniAllResults.clear()
         omniLiveCardId = -1
+        lockedGain = 1.0f
+        gainLocked = false
+        preGainChunkCount = 0
+        preGainRmsAccum = 0f
 
         if (omniUseVad) {
             initTestVad()
@@ -556,6 +571,52 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                 }
             } else {
                 // ── Silero VAD-driven segment management ──
+                //
+                // LOCKED-GAIN approach (same principle as BATCH mode):
+                //  1. Collect the first ~1s of audio to estimate ambient level.
+                //  2. Lock in one constant gain for the entire recording.
+                //  3. Apply that SAME gain to every chunk.
+                //
+                // This preserves intra-utterance dynamics — the energy contour
+                // within a sentence stays natural because every sample gets
+                // the same multiplier. Per-chunk gain was distorting relative
+                // frame energies, which hurts fbank feature extraction.
+                val chunkRms = sqrt(sumSq / ret) / 32768.0f
+                if (!gainLocked) {
+                    preGainChunkCount++
+                    preGainRmsAccum += chunkRms
+                    // Log every pre-gain chunk so we can verify the estimation window
+                    Log.d(TAG, "PRE-GAIN chunk #$preGainChunkCount: chunkRMS=%.4f accAvg=%.4f".format(
+                        chunkRms, preGainRmsAccum / preGainChunkCount))
+                    if (preGainChunkCount >= 10) {  // ~1s of audio
+                        val avgRms = preGainRmsAccum / preGainChunkCount
+                        lockedGain = if (avgRms > 0.0008f) {
+                            (0.15f / avgRms).coerceIn(1f, 10f)
+                        } else 1f
+                        gainLocked = true
+                        Log.i(TAG, "🔒 GAIN LOCKED: avgRMS=%.6f → gain=%.2fx (target=0.15)".format(avgRms, lockedGain))
+                    }
+                }
+                if (gainLocked && lockedGain > 1.05f) {
+                    // Verify: log first 3 chunks after lock to confirm gain is applied
+                    if (preGainChunkCount <= 13) {
+                        var rmsBefore = 0f
+                        for (i in 0 until ret) {
+                            val s = floatBuf[i]
+                            rmsBefore += s * s
+                        }
+                        rmsBefore = sqrt(rmsBefore / ret)
+                        for (i in 0 until ret) floatBuf[i] *= lockedGain
+                        var rmsAfter = 0f
+                        for (i in 0 until ret) rmsAfter += floatBuf[i] * floatBuf[i]
+                        rmsAfter = sqrt(rmsAfter / ret)
+                        Log.i(TAG, "🔊 GAIN APPLIED chunk #$preGainChunkCount: rms %.4f → %.4f (gain=%.2fx)".format(
+                            rmsBefore, rmsAfter, lockedGain))
+                    } else {
+                        for (i in 0 until ret) floatBuf[i] *= lockedGain
+                    }
+                }
+
                 vad?.acceptWaveform(floatBuf)
 
                 if (vad?.isSpeechDetected() == true) {
@@ -599,6 +660,9 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             omniAudioBuffer.clear()
             omniSegmentCount = 1
 
+            Log.i(TAG, "📦 BATCH MODE: ${snapshot.size} samples (%.1fs) — NO gain applied (raw audio)".format(
+                snapshot.size / SAMPLE_RATE.toFloat()))
+
             if (snapshot.isNotEmpty()) {
                 runOnUiThread {
                     btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
@@ -616,6 +680,8 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         }
 
         // ── VAD mode: flush in-progress speech, then close channel ──
+        Log.i(TAG, "🔒 VAD RECORDING END — lockedGain=%.2fx gainLocked=%b preGainChunks=%d".format(
+            lockedGain, gainLocked, preGainChunkCount))
         vad?.flush()
         while (vad?.empty() == false) {
             val segment = vad!!.front()
@@ -634,6 +700,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         }
         try { vad?.release() } catch (_: Exception) {}
         vad = null
+        // AudioPreprocessor reserved for future use (not active in current pipeline)
 
         segmentChannel.close()
         try { runBlocking { segmentConsumerJob?.join() } } catch (_: Exception) {}
@@ -749,6 +816,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
         try { vad?.release() } catch (_: Exception) {}
         vad = null
+        // AudioPreprocessor reserved for future use (not active in current pipeline)
         omniLiveCardId = -1
 
         btnRecord.text = "录音"
@@ -929,6 +997,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         stopAudioHardware()
         try { vad?.release() } catch (_: Exception) {}
         vad = null
+        // AudioPreprocessor reserved for future use (not active in current pipeline)
         try { llmSession?.release() } catch (_: Exception) {}
         llmSession = null
     }

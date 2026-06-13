@@ -37,6 +37,8 @@ add_library(${CMAKE_PROJECT_NAME} SHARED
         video/video_processor.cpp
         # Silero VAD JNI (self-contained, uses MNN Express directly)
         silero_vad_jni.cpp
+        # WebRTC-style AGC + HPF + Noise Gate for ASR audio preprocessing
+        audio_preprocessor.cpp
 )
 
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE GIT_COMMIT_ID="${GIT_COMMIT_ID_VALUE}" LLM_SUPPORT_AUDIO)

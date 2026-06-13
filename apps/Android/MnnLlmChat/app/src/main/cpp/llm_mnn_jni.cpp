@@ -16,6 +16,7 @@
 #include "llm_stream_buffer.hpp"
 #include "utf8_stream_processor.hpp"
 #include "llm_session.h"
+#include "audio_preprocessor.h"
 
 using MNN::Transformer::Llm;
 using json = nlohmann::json;
@@ -761,6 +762,53 @@ Java_com_alibaba_mnnllm_android_llm_LlmSession_runBenchmarkNative(
     
     jstring errorMessage = result.success ? nullptr : env->NewStringUTF(result.error_message.c_str());
     return env->NewObject(resultClass, resultCtor, testInstance, (jboolean)result.success, errorMessage);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AudioPreprocessor JNI — WebRTC-style AGC + HPF + Noise Gate
+// ═══════════════════════════════════════════════════════════════
+
+JNIEXPORT jlong JNICALL
+Java_com_alibaba_mnnllm_android_llm_AudioPreprocessor_nativeCreate(
+        JNIEnv* env, jobject /*thiz*/) {
+    auto* preprocessor = new AudioPreprocessor();
+    return reinterpret_cast<jlong>(preprocessor);
+}
+
+JNIEXPORT void JNICALL
+Java_com_alibaba_mnnllm_android_llm_AudioPreprocessor_nativeProcess(
+        JNIEnv* env, jobject /*thiz*/, jlong ptr, jfloatArray samples) {
+    auto* pp = reinterpret_cast<AudioPreprocessor*>(ptr);
+    if (pp == nullptr) return;
+
+    jsize len = env->GetArrayLength(samples);
+    jfloat* buf = env->GetFloatArrayElements(samples, nullptr);
+    if (buf == nullptr) return;
+
+    pp->process(buf, len);
+
+    // Release back (0 = copy back + free)
+    env->ReleaseFloatArrayElements(samples, buf, 0);
+}
+
+JNIEXPORT void JNICALL
+Java_com_alibaba_mnnllm_android_llm_AudioPreprocessor_nativeReset(
+        JNIEnv* /*env*/, jobject /*thiz*/, jlong ptr) {
+    auto* pp = reinterpret_cast<AudioPreprocessor*>(ptr);
+    if (pp != nullptr) pp->reset();
+}
+
+JNIEXPORT void JNICALL
+Java_com_alibaba_mnnllm_android_llm_AudioPreprocessor_nativeRelease(
+        JNIEnv* /*env*/, jobject /*thiz*/, jlong ptr) {
+    delete reinterpret_cast<AudioPreprocessor*>(ptr);
+}
+
+JNIEXPORT jfloat JNICALL
+Java_com_alibaba_mnnllm_android_llm_AudioPreprocessor_nativeGetGain(
+        JNIEnv* /*env*/, jobject /*thiz*/, jlong ptr) {
+    auto* pp = reinterpret_cast<AudioPreprocessor*>(ptr);
+    return pp != nullptr ? pp->current_gain() : 1.0f;
 }
 
 } // extern "C"
