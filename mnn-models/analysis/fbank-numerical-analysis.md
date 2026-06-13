@@ -1,3 +1,11 @@
+---
+date: 2026-06-12
+status: active
+tags: [qwen3-asr, fbank, accuracy, numerical-analysis]
+category: analysis
+aliases: [FBank数值分析, FBank Numerical Analysis]
+related: [[root-cause-analysis]], [[scripts/compare_pipeline_v2]]
+---
 # Qwen3-ASR Accuracy Gap Analysis: MNN vs sherpa-onnx
 
 **Date**: 2026-06-12

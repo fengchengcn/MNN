@@ -1,3 +1,11 @@
+---
+date: 2026-06-04
+status: completed
+tags: [qwen3-asr, research, mnn, migration]
+category: plan
+aliases: [初步调研, Preliminary Research]
+related: [[llmexport-migration]], [[progress]]
+---
 # Qwen3-ASR-0.6B MNN 迁移：初步调研摘要
 
 > 日期：2026-06-04 | 状态：**已完成，仅供历史参考**

@@ -1,3 +1,11 @@
+---
+date: 2026-06-08
+status: archived
+tags: [qwen3-asr, streaming, legacy, deprecated]
+category: archive
+aliases: [旧引擎流式方案, Legacy Streaming]
+related: [[archive/android-integration-legacy]], [[omni-streaming]]
+---
 # Qwen3-ASR 旧引擎流式优化（LEGACY）
 
 > ⚠️ **此文档描述旧引擎** (`qwen3_asr_engine.cpp`) 的流式优化。

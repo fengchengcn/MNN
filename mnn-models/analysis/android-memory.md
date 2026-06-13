@@ -1,3 +1,11 @@
+---
+date: 2026-06-11
+status: completed
+tags: [qwen3-asr, android, memory, gpu, performance]
+category: analysis
+aliases: [Android内存分析, Android Memory]
+related: [[memory-model]], [[progress]]
+---
 # Qwen3-ASR Android 运行时内存与推理性能分析
 
 > **日期:** 2026-06-11 | **状态:** 实机测试完成

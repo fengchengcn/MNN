@@ -1,3 +1,11 @@
+---
+date: 2026-06-10
+status: completed
+tags: [qwen3-asr, memory, omni, theory]
+category: analysis
+aliases: [内存模型分析, Memory Model]
+related: [[android-memory]], [[llmexport-migration]]
+---
 # Qwen3-ASR 模型运行时内存分析：旧路径 vs Omni 新路径
 
 > 创建：2026-06-10 | **状态：理论分析，待 Omni 实机验证**

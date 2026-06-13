@@ -1,3 +1,11 @@
+---
+date: 2026-06-08
+status: archived
+tags: [qwen3-asr, android, legacy, deprecated]
+category: archive
+aliases: [旧引擎Android集成, Legacy Android Integration]
+related: [[archive/streaming-legacy]], [[llmexport-migration]]
+---
 # Qwen3-ASR Android Integration (LEGACY — Old Engine)
 
 > ⚠️ **This document describes the OLD engine path** (`qwen3_asr_engine.cpp` + JNI).

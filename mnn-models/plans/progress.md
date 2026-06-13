@@ -1,3 +1,11 @@
+---
+date: 2026-06-11
+status: active
+tags: [qwen3-asr, progress, milestone, index]
+category: plan
+aliases: [项目进度, Progress, Master Index]
+related: [[llmexport-migration]], [[omni-streaming]], [[root-cause-analysis]], [[android-memory]], [[omni-parameters]]
+---
 # Qwen3-ASR → MNN 项目状态
 
 > 最后更新：2026-06-11 | 状态：**Omni 引擎迁移完成，旧引擎已冻结**

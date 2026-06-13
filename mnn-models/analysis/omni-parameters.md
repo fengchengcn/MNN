@@ -1,3 +1,11 @@
+---
+date: 2026-06-10
+status: active
+tags: [qwen3-asr, omni, parameters, sampler]
+category: analysis
+aliases: [Omni参数配置, Omni Parameters]
+related: [[omni-streaming]], [[root-cause-analysis]]
+---
 # Qwen3-ASR Omni 模式推理参数
 
 > 创建：2026-06-10 | 更新：2026-06-11（greedy 采样已确认为 ASR 最优配置）

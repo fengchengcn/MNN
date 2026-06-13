@@ -1,3 +1,11 @@
+---
+date: 2026-06-11
+status: active
+tags: [qwen3-asr, accuracy, analysis, fbank]
+category: analysis
+aliases: [精度根因分析, Root Cause Analysis]
+related: [[fbank-numerical-analysis]], [[omni-parameters]]
+---
 # Qwen3-ASR 识别精度差异分析
 
 > 日期：2026-06-11 | 状态：**根因定位完成，Omni 迁移后部分缓解**

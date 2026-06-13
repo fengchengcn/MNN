@@ -1,3 +1,11 @@
+---
+date: 2026-06-10
+status: active
+tags: [qwen3-asr, omni, streaming, vad]
+category: plan
+aliases: [Omni流式方案, Streaming Plan]
+related: [[omni-parameters]], [[progress]], [[llmexport-migration]]
+---
 # Qwen3-ASR Omni 模式流式实现方案
 
 > 创建：2026-06-10 | 最后更新：2026-06-11

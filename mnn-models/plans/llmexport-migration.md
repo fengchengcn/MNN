@@ -1,3 +1,11 @@
+---
+date: 2026-06-09
+status: completed
+tags: [qwen3-asr, llmexport, migration, omni]
+category: plan
+aliases: [llmexport迁移计划, Migration Plan]
+related: [[omni-streaming]], [[progress]], [[preliminary-research]]
+---
 # Qwen3-ASR → llmexport.py 迁移计划
 
 > 创建：2026-06-09 | 完成：2026-06-11
