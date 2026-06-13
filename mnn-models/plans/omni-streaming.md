@@ -98,29 +98,57 @@ AudioRecord(100ms chunks) → Silero VAD → 语音段累积
 
 ## 五、Phase 2.6：VAD 引导扩展窗口 ✅
 
+> 最后更新：2026-06-13（补充实际实现细节 & 踩坑修复）
+
 ### 核心设计
 
 - **VAD**: Silero VAD（LSTM 神经网络，`silero_vad.onnx` → MNN Interpreter，`silero_vad_jni.cpp` → `Vad.kt`）
 - **扩展窗口**: 每次推理发送 `[0..current]` 全部累积音频
-- **并发**: `Channel<SegmentTask>` 单 consumer 串行，消除增量+FINAL 竞态
+- **并发**: `Channel.UNLIMITED` + 单 consumer 协程串行，`sendCumulativeTask()` 调用 `trySend` 不阻塞录音线程
 
-### Silero VAD 配置
+### 累积滑动窗口实现（2026-06-13）
+
+Android 端 `Qwen3AsrTestActivity` 中的实际实现：
+
+```
+AudioRecord(100ms chunks) → Silero VAD → 语音段检测
+  → accumulatedSegments.add(segment)  // 累积，非独立分发
+  → 段间插入 0.4s 零填充静音
+  → sendCumulativeTask(): 拼接全部累积段 → trySend 到 channel
+  → consumer 串行处理，每次推理用全部累积音频
+```
+
+**句间断句**（2026-06-13 新增）：
+- 通过 wall-clock 段间间隔区分句内/句间停顿
+- 间隔 < 1.5s：同一句子，继续累积，自动纠错
+- 间隔 ≥ 1.5s：句间边界 → `flushCurrentSentence()` 发最终推理，清空 buffer 开始新句
+
+### Silero VAD 配置（实机使用值）
 
 | 参数 | 值 | 说明 |
 |------|:------|------|
 | `threshold` | 0.5 | 语音概率阈值 |
-| `minSpeechDuration` | 0.25s | 最短语音长度 |
-| `minSilenceDuration` | 0.25s | 停顿判定阈值 |
-| `maxSpeechDuration` | 5.0s | 最大语音时长安全网 |
+| `minSpeechDuration` | 0.15s | 最短语音长度 |
+| `minSilenceDuration` | 0.4s | 停顿判定阈值 |
+| `maxSpeechDuration` | 15.0s | 最大语音时长安全网 |
 | `windowSize` | 512 (32ms@16kHz) | 推理窗口 |
 
-### 流程控制参数
+### 关键参数
 
 | 参数 | 值 | 说明 |
 |------|:------|------|
-| 首次增量 | 语音开始后 **1.5s** | |
-| 后续增量间隔 | **3s** | |
-| 最大语音时长 | **8s** | 安全网，超时自动 FINAL |
+| 段间静音间隔 | 0.4s | 累积时段间插入的零填充（匹配 VAD minSilenceDuration） |
+| 句间边界 | **1.5s** | wall-clock 段间间隔阈值，超过则断句 |
+| 录制循环周期 | 100ms | `CHUNK_INTERVAL_MS` |
+| Locked-gain | 固定增益 | 前 1s 估算 ambient RMS → 锁定增益 → 全段统一应用 |
+
+### 踩坑记录（2026-06-13 修复）
+
+| # | Bug | 根因 | 修复 |
+|---|-----|------|------|
+| 1 | **重复输出**：同一句子显示两次 | 句边界 flush 发 final 任务，但最后 interim 已覆盖全部累积音频 | `lastInferenceSegmentCount` 跟踪上次推理时段数，flush 时段数未增加 → 跳过 final |
+| 2 | **最后一句不输出** | flush 时 drain channel 排空所有任务（含当前句子），然后跳过 final → 整句丢失 | 去掉 channel drain，consumer 按序处理 |
+| 3 | **句子/轮次标注错乱** | `sentenceIndex`/`cumulativeRound` 共享变量，consumer 读取时已被后续 flush 修改 | `SegmentTask` 构建时捕获 `sentIndex`/`sentRound`，consumer 读快照值 |
 
 ### config.json 采样修正
 
@@ -146,16 +174,17 @@ ASR 是确定性任务，必须用 greedy：
 |------|:---|:---|:---|
 | 语音检测 | 无 | RMS VAD | **Silero VAD** |
 | 推理窗口 | 扩展 ✅ | 分段独立 ❌ | 扩展 ✅ |
-| 首次结果 | ~6-8s | 段结束 | **~1.5s** |
+| 首次结果 | ~6-8s | 段结束 | 每段累积后 |
 | 最终准确率 | 高 | **低（上下文断裂）** | **高** |
 | 罕见/术语 | 好 | **差 ~30%** | **好 ~95%** |
 | 并发安全 | 竞态 | 单次 | **Channel 串行** |
+| 句间断句 | 无 | 无 | **1.5s wall-clock 间隔** |
 
 ### 已知限制
 
 1. **Full-Attention AE 全量重算**: 每次增量重跑全量 fbank+AE。≤8s 段可接受（Kirin 9000: ~400-800ms AE）
-2. **无跨段上下文**: 段间独立推理，与 Phase 2.5 相同
-3. **Timer 每次重建**: 生产环境建议改用 `ScheduledExecutorService`
+2. **无跨句上下文**: 句间独立推理（1.5s 间隔后的新句从零开始）
+3. **Channel.UNLIMITED**: 不排队列积压，但同一句子多次 interim 推理均有意义（越来越完整）
 
 ---
 
