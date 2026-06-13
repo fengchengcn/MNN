@@ -238,7 +238,10 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
         localDir.listFiles()?.forEach { subdir ->
             if (!subdir.isDirectory) return@forEach
-            val audioMnn = File(subdir, "audio.mnn")
+            // Support both old (audio.mnn) and new (conv_frontend.mnn) model layouts
+            val audioMnn = File(subdir, "conv_frontend.mnn").let {
+                if (it.exists()) it else File(subdir, "audio.mnn")
+            }
             val configJson = File(subdir, "config.json")
             if (audioMnn.exists() && configJson.exists()) {
                 try {
@@ -285,7 +288,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     setStatus("错误: 未找到 Omni ASR 模型")
                     appendSystemMessage("请将模型放置到 /data/local/tmp/mnn_models/<模型目录>/")
-                    appendSystemMessage("需要: audio.mnn + config.json (is_audio=true)")
+                    appendSystemMessage("需要: conv_frontend.mnn (或 audio.mnn) + config.json (is_audio=true)")
                     btnRecord.isEnabled = false
                 }
                 return
