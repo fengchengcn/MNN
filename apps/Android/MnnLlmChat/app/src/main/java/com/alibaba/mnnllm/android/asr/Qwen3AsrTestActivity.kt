@@ -7,8 +7,6 @@ import android.graphics.Typeface
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.NoiseSuppressor
 import android.os.Bundle
 import android.util.Log
 import android.util.TypedValue
@@ -74,8 +72,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     private var omniModelDir: String? = null
     private var modelLoaded = false
     private var audioRecord: AudioRecord? = null
-    private var aec: AcousticEchoCanceler? = null
-    private var noiseSuppressor: NoiseSuppressor? = null
+    // AEC/NS removed — matching sherpa-onnx: raw MIC audio, no hardware effects
     private val isRecording = AtomicBoolean(false)
     private var recordingThread: Thread? = null
     private var recordingSessionId = 0
@@ -1119,34 +1116,24 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     // ══════════════════════════════════════════════
 
     private fun initAudioRecord() {
+        // Use MIC (raw) instead of VOICE_COMMUNICATION.
+        // VOICE_COMMUNICATION applies hardware AGC + noise suppression + echo
+        // cancellation that crush dynamic range and distort speech for ASR.
+        // sherpa-onnx uses MIC — raw mic data, no processing. Match that.
         val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            MediaRecorder.AudioSource.MIC,
             SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
             minBuf * 2
         )
-        try {
-            if (AcousticEchoCanceler.isAvailable()) {
-                aec = AcousticEchoCanceler.create(audioRecord!!.audioSessionId)
-                aec?.enabled = true
-            }
-        } catch (_: Exception) {}
-        try {
-            if (NoiseSuppressor.isAvailable()) {
-                noiseSuppressor = NoiseSuppressor.create(audioRecord!!.audioSessionId)
-                noiseSuppressor?.enabled = true
-            }
-        } catch (_: Exception) {}
+        // AEC/NS removed — raw MIC passthrough, matching sherpa-onnx
     }
 
     private fun stopAudioHardware() {
-        try { aec?.release() } catch (_: Exception) {}
-        aec = null
-        try { noiseSuppressor?.release() } catch (_: Exception) {}
-        noiseSuppressor = null
+        // AEC/NS references removed
         try {
             audioRecord?.stop()
             audioRecord?.release()
