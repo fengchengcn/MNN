@@ -92,8 +92,11 @@ set_target_properties(MNN_Diffusion PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/li
 add_library(MNN_Express SHARED IMPORTED)
 set_target_properties(MNN_Express PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libMNN_Express.so")
 
-# NOTE: libMNNAudio.so is now merged into libMNN.so — all audio symbols in MNN
-# Link your native library with the `.so` file
+add_library(MNNOpenCV SHARED IMPORTED)
+set_target_properties(MNNOpenCV PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libMNNOpenCV.so")
+
+add_library(MNNAudio SHARED IMPORTED)
+set_target_properties(MNNAudio PROPERTIES IMPORTED_LOCATION "${LIB_PATH}/libMNNAudio.so")
 
 # Specifies libraries CMake should link to your target library. You
 # can link libraries from various origins, such as libraries defined in this
@@ -105,8 +108,10 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
         MNN_CL
         MNN_Vulkan
         MNN_LLM
-        MNN_Diffusion  # 加上这个，Diffusion::load() 报错就会消失
+        MNN_Diffusion
         MNN_Express
+        MNNOpenCV
+        MNNAudio
         mediandk
         atomic
         m
