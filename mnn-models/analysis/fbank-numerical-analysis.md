@@ -92,7 +92,9 @@ raw PCM audio
   → text output
 ```
 
-> **Key insight**: MNN's `audio.mnn` covers sherpa-onnx's `conv_frontend.onnx` + `encoder.onnx` combined, and MNN's internal LLM decoder covers sherpa-onnx's `decoder.onnx`. The decoder stage is architecturally similar. **The accuracy gap originates entirely from the feature extraction step BEFORE the model.**
+> **Key insight**: MNN's `audio.mnn` covers sherpa-onnx's `conv_frontend.onnx` + `encoder.onnx` combined, and MNN's internal LLM decoder covers sherpa-onnx's `decoder.onnx`. The decoder stage is architecturally similar.
+
+> **⚠️ 2026-06-14 更新**：进一步实验发现，即使 FBank 完全对齐（使用 kaldi-native-fbank），MNN AE 和 sherpa-onnx AE 的输出仍然完全不同（cosim ~0.30，65 vs 53 frames）。根因是 **conv_frontend 图结构不等价**：同一份 HF checkpoint 权重，sherpa-onnx 通过图追踪保留了原始模型的 Pad→Conv2d×3→Slice 操作链（subsampling ~6.5×），而 MNN llmexport.py 的手写 `forward()` 缺失了 Pad 和 Slice（纯 stride subsampling 8×）。详见 [[root-cause-analysis]] §"Sherpa-onnx AE vs MNN AE 对比"。
 
 ---
 
@@ -237,9 +239,32 @@ Both use autoregressive greedy decoding. The decoding strategy is NOT the cause 
 
 | Factor | Likelihood | Notes |
 |--------|:----------:|-------|
-| MNN `precision: "low"` for INT8 decode | 🟡 Medium | Try `precision: "normal"` |
-| RMS normalization in omni.cpp | 🟡 Low-Medium | Adds gain not in training pipeline |
-| Model conversion artifacts (audio.mnn vs ONNX) | 🟢 Low | Validated in early analysis |
+| MNN `precision: "low"` for INT8 decode | 🟢 Low | Device already uses `precision: "high"` (FP32) |
+| RMS normalization in omni.cpp | 🟢 Low | Verified necessary; disabling causes total failure |
+| Model conversion artifacts (audio.mnn vs ONNX) | 🟢 Low | Desktop AE experiment: cosim > 0.998, 5/5 MATCH |
+| **Decoder 模型差异 (llm.mnn vs llm.onnx)** | 🟡 **已验证存在** | Desktop 同输入对比：first token 5/5 match，但数值 cosim ~0.97，系统性缩放差 ~4-5× |
+
+### 2026-06-14 Desktop Comparison: AE Isolation
+
+**Experiment**: Isolate audio encoder vs decoder contribution to accuracy gap.
+
+**Method**: Compute FBank from audio → Run through MNN `audio.mnn` and ONNX `audio_encoder.onnx` separately → Feed BOTH outputs into ONNX `llm.onnx` Decoder → Compare first token.
+
+**Result**: 5/5 audio files MATCH. MNN AE output near-identical to ONNX AE (cosim > 0.998), and first token identical when both feed the same ONNX decoder.
+
+| Audio | AE cosim | Dec cosim | First token | Verdict |
+|-------|:--------:|:---------:|:-----------:|:-------:|
+| 0121.wav | 0.9989 | 0.9999 | 11528 | ✅ MATCH |
+| 0123.wav | 0.9994 | 0.9999 | 11528 | ✅ MATCH |
+| 0125.wav | 0.9993 | 0.9999 | 11528 | ✅ MATCH |
+| 0127.wav | 0.9993 | 1.0000 | 11528 | ✅ MATCH |
+| 0129.wav | 0.9988 | 0.9998 | 11528 | ✅ MATCH |
+
+**Conclusion**: Audio encoder is NOT the error source. Accuracy gap originates from the MNN Decoder (`llm.mnn`) export quality.
+
+**Related**: [[root-cause-analysis]] for desktop experiment details and INT8 vs FP16 output comparison.
+
+> ⚠️ **注意**：桌面端 5 样本 INT8/FP16 对比无 ground truth，无法判断孰优孰劣。手机实测 FP16 效果更好，以手机为准。
 
 ---
 
