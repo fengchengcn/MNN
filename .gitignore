@@ -1,4 +1,23 @@
-# MNN Model directories (large files, managed outside git)
+# ── macOS ──
+.DS_Store
+**/.DS_Store
+
+# ── MNN Model directories (large files, managed outside git) ──
 mnn-models/Qwen3-ASR-0.6B-Omni-INT8/
 mnn-models/Qwen3-ASR-0.6B-Omni-FP16/
 mnn-models/Qwen3-ASR-0.6B/
+
+# ── C++ Build ──
+build/
+project/android/build_64/
+
+# ── Android Build ──
+apps/Android/MnnLlmChat/.gradle/
+apps/Android/MnnLlmChat/app/src/main/jniLibs/
+apps/Android/MnnLlmChat/local.properties
+apps/frameworks/mnn_tts/android/.cxx/
+apps/frameworks/mnn_tts/android/build/
+apps/frameworks/model_downloader/android/build/
+
+# ── Export ──
+transformers/llm/export/.export.log
