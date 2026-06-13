@@ -108,10 +108,39 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     private var segmentStartTime = 0L
     private var omniLiveCardId = -1
 
+    // ── Cumulative sliding-window inference (VAD mode) ──
+    // Design:
+    //   VAD segments accumulate within a sentence. After each new segment,
+    //   the FULL accumulated buffer is sent for inference → progressive
+    //   results with auto-correction (later context disambiguates earlier).
+    //
+    //   When the wall-clock gap between VAD segments exceeds 3s, that's a
+    //   sentence boundary. The current sentence is flushed (final inference),
+    //   and a fresh accumulation starts for the next sentence.
+    //
+    //   Using Channel.UNLIMITED (not CONFLATED) so sentence boundaries work:
+    //   when flushing a sentence, we drain stale interim tasks, send the
+    //   final task, then start fresh for the next sentence.
+    private val accumulatedSegments = mutableListOf<FloatArray>()  // segments in current sentence
+    private var totalSpeechSamples = 0        // total speech samples in current sentence
+    private var cumulativeRound = 0           // inference round within current sentence
+    private var sentenceIndex = 0             // which sentence we're on
+    private var lastSegmentWallTime = 0L      // System.currentTimeMillis() of last VAD segment
+    private val SENTENCE_BOUNDARY_GAP_MS = 1500L  // 1.5s gap → new sentence
+
     // ── Serial segment processing ──
-    private data class SegmentTask(val samples: FloatArray, val isFinal: Boolean)
+    private data class SegmentTask(
+        val samples: FloatArray,
+        val isFinal: Boolean,
+        val sentIndex: Int,   // sentenceIndex at send time (captured, not read live)
+        val sentRound: Int    // cumulativeRound at send time (captured, not read live)
+    )
     private lateinit var segmentChannel: Channel<SegmentTask>
     private var segmentConsumerJob: Job? = null
+
+    // Track how many segments were included in the last inference,
+    // so flushCurrentSentence() can skip redundant final tasks.
+    private var lastInferenceSegmentCount = 0
 
     // ── Omni sub-mode: VAD vs BATCH ──
     private var omniUseVad = true
@@ -507,6 +536,13 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         omniSegmentCount = 0
         omniAllResults.clear()
         omniLiveCardId = -1
+        // Reset cumulative sliding-window state
+        synchronized(accumulatedSegments) { accumulatedSegments.clear() }
+        totalSpeechSamples = 0
+        cumulativeRound = 0
+        sentenceIndex = 0
+        lastSegmentWallTime = 0L
+        lastInferenceSegmentCount = 0
         lockedGain = 1.0f
         gainLocked = false
         preGainChunkCount = 0
@@ -581,25 +617,30 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                 // within a sentence stays natural because every sample gets
                 // the same multiplier. Per-chunk gain was distorting relative
                 // frame energies, which hurts fbank feature extraction.
+                // Target RMS = 0.5 (-6dBFS) matches omni.cpp's target so C++
+                // normalization is a no-op — only one gain stage for both modes.
                 val chunkRms = sqrt(sumSq / ret) / 32768.0f
-                if (!gainLocked) {
-                    preGainChunkCount++
-                    preGainRmsAccum += chunkRms
-                    // Log every pre-gain chunk so we can verify the estimation window
-                    Log.d(TAG, "PRE-GAIN chunk #$preGainChunkCount: chunkRMS=%.4f accAvg=%.4f".format(
-                        chunkRms, preGainRmsAccum / preGainChunkCount))
-                    if (preGainChunkCount >= 10) {  // ~1s of audio
-                        val avgRms = preGainRmsAccum / preGainChunkCount
-                        lockedGain = if (avgRms > 0.0008f) {
-                            (0.15f / avgRms).coerceIn(1f, 10f)
-                        } else 1f
-                        gainLocked = true
-                        Log.i(TAG, "🔒 GAIN LOCKED: avgRMS=%.6f → gain=%.2fx (target=0.15)".format(avgRms, lockedGain))
-                    }
+                // ── Running gain estimate: apply from the very FIRST chunk ──
+                // Using a running average prevents the "blind first second" bug where
+                // speech at the recording start goes to VAD unamplified. The gain
+                // converges over ~1s, then locks to preserve intra-utterance dynamics.
+                preGainChunkCount++
+                preGainRmsAccum += chunkRms
+                val avgRms = preGainRmsAccum / preGainChunkCount
+                lockedGain = if (avgRms > 0.0008f) {
+                    (0.5f / avgRms).coerceIn(1f, 10f)  // target -6dBFS, matches omni.cpp
+                } else 1f
+                if (preGainChunkCount == 10 && !gainLocked) {
+                    gainLocked = true
+                    Log.i(TAG, "🔒 GAIN LOCKED: avgRMS=%.6f → gain=%.2fx (target=-6dBFS)".format(avgRms, lockedGain))
                 }
-                if (gainLocked && lockedGain > 1.05f) {
-                    // Verify: log first 3 chunks after lock to confirm gain is applied
-                    if (preGainChunkCount <= 13) {
+                if (!gainLocked) {
+                    Log.d(TAG, "PRE-GAIN chunk #$preGainChunkCount: chunkRMS=%.4f avgRMS=%.4f gain=%.2fx".format(
+                        chunkRms, avgRms, lockedGain))
+                }
+                // Apply gain immediately — even during pre-gain window
+                if (lockedGain > 1.05f) {
+                    if (!gainLocked || preGainChunkCount <= 13) {
                         var rmsBefore = 0f
                         for (i in 0 until ret) {
                             val s = floatBuf[i]
@@ -610,7 +651,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                         var rmsAfter = 0f
                         for (i in 0 until ret) rmsAfter += floatBuf[i] * floatBuf[i]
                         rmsAfter = sqrt(rmsAfter / ret)
-                        Log.i(TAG, "🔊 GAIN APPLIED chunk #$preGainChunkCount: rms %.4f → %.4f (gain=%.2fx)".format(
+                        Log.i(TAG, "🔊 GAIN chunk #$preGainChunkCount: rms %.4f → %.4f (gain=%.2fx)".format(
                             rmsBefore, rmsAfter, lockedGain))
                     } else {
                         for (i in 0 until ret) floatBuf[i] *= lockedGain
@@ -629,17 +670,33 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                     val segment = vad!!.front()
                     if (segment.samples.size >= SAMPLE_RATE * 0.15f) {
                         omniSegmentCount++
-                        segmentStartTime = System.currentTimeMillis()
-                        Log.i(TAG, "VAD segment #$omniSegmentCount: ${segment.samples.size} samples " +
-                                "(${"%.1f".format(segment.samples.size / SAMPLE_RATE.toFloat())}s)")
+                        val segDur = segment.samples.size / SAMPLE_RATE.toFloat()
+                        val now = System.currentTimeMillis()
+                        val gap = if (lastSegmentWallTime > 0) now - lastSegmentWallTime else 0L
+                        lastSegmentWallTime = now
 
-                        runOnUiThread {
-                            btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
-                            btnRecord.text = "..."
-                            btnRecord.isEnabled = false
-                            setStatus("第 $omniSegmentCount 段 — 转写中...")
+                        // ── Sentence boundary detection ──
+                        // If >=3s since the last speech segment, this is a new sentence.
+                        // Flush the current sentence (final inference) and start fresh.
+                        if (gap >= SENTENCE_BOUNDARY_GAP_MS && accumulatedSegments.isNotEmpty()) {
+                            Log.i(TAG, "⏸ Sentence boundary: ${"%.1f".format(gap / 1000f)}s gap → flush sentence #$sentenceIndex")
+                            flushCurrentSentence()
                         }
-                        segmentChannel.trySend(SegmentTask(segment.samples.copyOf(), isFinal = true))
+
+                        // Accumulate into the current sentence buffer
+                        synchronized(accumulatedSegments) {
+                            accumulatedSegments.add(segment.samples.copyOf())
+                            totalSpeechSamples += segment.samples.size
+                        }
+
+                        val speechTotal = totalSpeechSamples / SAMPLE_RATE.toFloat()
+                        Log.i(TAG, "VAD segment #$omniSegmentCount: ${"%.1f".format(segDur)}s → sentence #$sentenceIndex (${"%.1f".format(speechTotal)}s total)")
+                        runOnUiThread {
+                            setStatus("句#$sentenceIndex 第 $omniSegmentCount 段 — 累积中 (${"%.1f".format(speechTotal)}s)")
+                        }
+
+                        // Send cumulative audio (all segments in current sentence)
+                        sendCumulativeTask(isFinal = false)
                     }
                     vad!!.pop()
                 }
@@ -670,7 +727,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                     btnRecord.isEnabled = false
                     setStatus("整段解码 ${snapshot.size} 样本 (%.1fs)...".format(snapshot.size / SAMPLE_RATE.toFloat()))
                 }
-                segmentChannel.trySend(SegmentTask(snapshot, isFinal = true))
+                segmentChannel.trySend(SegmentTask(snapshot, isFinal = true, sentIndex = 0, sentRound = 1))
             }
 
             segmentChannel.close()
@@ -679,7 +736,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             return
         }
 
-        // ── VAD mode: flush in-progress speech, then close channel ──
+        // ── VAD mode: flush in-progress speech, finalize current sentence ──
         Log.i(TAG, "🔒 VAD RECORDING END — lockedGain=%.2fx gainLocked=%b preGainChunks=%d".format(
             lockedGain, gainLocked, preGainChunkCount))
         vad?.flush()
@@ -687,20 +744,23 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             val segment = vad!!.front()
             if (segment.samples.size >= SAMPLE_RATE * 0.15f) {
                 omniSegmentCount++
-                Log.i(TAG, "VAD flush segment #$omniSegmentCount: ${segment.samples.size} samples")
-                runOnUiThread {
-                    btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
-                    btnRecord.text = "..."
-                    btnRecord.isEnabled = false
-                    setStatus("最后一段 #$omniSegmentCount...")
+                Log.i(TAG, "VAD flush segment #$omniSegmentCount: ${segment.samples.size} samples — accumulate")
+                // Note: no sentence boundary check here — flush segments belong to the
+                // current sentence (the user stopped recording, not a long pause)
+                synchronized(accumulatedSegments) {
+                    accumulatedSegments.add(segment.samples.copyOf())
+                    totalSpeechSamples += segment.samples.size
                 }
-                segmentChannel.trySend(SegmentTask(segment.samples.copyOf(), isFinal = true))
             }
             vad!!.pop()
         }
         try { vad?.release() } catch (_: Exception) {}
         vad = null
         // AudioPreprocessor reserved for future use (not active in current pipeline)
+
+        // Drain any stale interim tasks, then send final inference for the
+        // current sentence (if any speech was accumulated)
+        flushCurrentSentence()
 
         segmentChannel.close()
         try { runBlocking { segmentConsumerJob?.join() } } catch (_: Exception) {}
@@ -715,7 +775,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         try {
             val config = getVadModelConfig(0)!!
             config.sileroVadModelConfig.threshold = 0.5f
-            config.sileroVadModelConfig.minSilenceDuration = 0.4f
+            config.sileroVadModelConfig.minSilenceDuration = 0.25f
             config.sileroVadModelConfig.minSpeechDuration = 0.15f
             config.sileroVadModelConfig.maxSpeechDuration = 15.0f
             config.sileroVadModelConfig.windowSize = vadWindowSize
@@ -743,6 +803,79 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         }
     }
 
+    // ── Cumulative inference helpers ──
+
+    /** Send the current accumulated audio for inference.
+     *  @param isFinal true for sentence-final inference (last result for this sentence) */
+    private fun sendCumulativeTask(isFinal: Boolean) {
+        val task = buildCumulativeTask(isFinal, sentenceIndex, cumulativeRound + 1)
+        if (task != null) {
+            cumulativeRound++
+            lastInferenceSegmentCount = accumulatedSegments.size
+            segmentStartTime = System.currentTimeMillis()
+            val dur = task.samples.size / SAMPLE_RATE.toFloat()
+            val label = if (isFinal) "最终" else "累积"
+            Log.i(TAG, "📤 $label task sent#$sentenceIndex round #$cumulativeRound: ${"%.1f".format(dur)}s → channel")
+            runOnUiThread {
+                btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
+                btnRecord.text = "..."
+                btnRecord.isEnabled = false
+                setStatus("句#$sentenceIndex ${label}推理 #$cumulativeRound (${"%.1f".format(dur)}s)...")
+            }
+            segmentChannel.trySend(task)
+        }
+    }
+
+    /** Called when a sentence boundary is detected (≥1.5s pause) or recording ends.
+     *  Sends final inference ONLY if new segments were added since the last interim
+     *  task, then clears accumulation for the next sentence.
+     *
+     *  NOTE: we do NOT drain the channel. Draining can accidentally remove tasks
+     *  from the next sentence (sent after sentenceIndex was incremented on a
+     *  previous flush). The consumer processes tasks in order; if a final task
+     *  skips (no new audio), the last interim result is already the complete one. */
+    private fun flushCurrentSentence() {
+        if (accumulatedSegments.isEmpty()) return
+
+        val segCount = accumulatedSegments.size
+        // Only send final if new segments arrived since last interim inference.
+        // Otherwise the last interim already has the complete result.
+        if (segCount > lastInferenceSegmentCount) {
+            sendCumulativeTask(isFinal = true)
+        } else {
+            Log.i(TAG, "  ⏭ Sentence #$sentenceIndex: skipped redundant final (no new segments since last inference)")
+        }
+
+        Log.i(TAG, "  ✅ Sentence #$sentenceIndex flushed (${"%.1f".format(totalSpeechSamples / SAMPLE_RATE.toFloat())}s speech, $cumulativeRound rounds)")
+
+        // Start fresh for the next sentence
+        synchronized(accumulatedSegments) { accumulatedSegments.clear() }
+        totalSpeechSamples = 0
+        cumulativeRound = 0
+        lastInferenceSegmentCount = 0
+        sentenceIndex++
+    }
+
+    /** Concatenate all accumulated VAD segments directly into one FloatArray.
+     *  No synthetic silence gaps are inserted — zero-padding creates unnatural
+     *  constant -1.0 fbank features that the conformer encoder has never seen
+     *  during training, which degrades recognition accuracy. */
+    private fun buildCumulativeTask(isFinal: Boolean, sentIndex: Int, sentRound: Int): SegmentTask? {
+        val segments = synchronized(accumulatedSegments) { accumulatedSegments.toList() }
+        if (segments.isEmpty()) return null
+
+        val speechTotal = segments.sumOf { it.size }
+        val concatenated = FloatArray(speechTotal)
+        var offset = 0
+        for (seg in segments) {
+            System.arraycopy(seg, 0, concatenated, offset, seg.size)
+            offset += seg.size
+        }
+        return SegmentTask(concatenated, isFinal, sentIndex, sentRound)
+    }
+
+    // ── Segment consumer ──
+
     private suspend fun processSegmentSync(task: SegmentTask) {
         if (llmSession == null) {
             Log.w(TAG, "processSegmentSync: LlmSession is null, skipping")
@@ -750,11 +883,14 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         }
 
         val samples = task.samples
-        val segNum = omniSegmentCount
+        val sent = task.sentIndex   // captured at send time — not affected by later flushes
+        val round = task.sentRound  // captured at send time
         val segStart = segmentStartTime
         val audioTag = "<audio>stream</audio>"
-        Log.i(TAG, "processSegment #$segNum [FINAL]: $audioTag, ${samples.size} samples " +
-                "(${"%.1f".format(samples.size / SAMPLE_RATE.toFloat())}s audio)")
+        val audioDur = samples.size / SAMPLE_RATE.toFloat()
+        val isFinal = task.isFinal
+        Log.i(TAG, "processSegment sent#$sent round #$round [${if (isFinal) "FINAL" else "INTERIM"}]: " +
+                "${"%.1f".format(audioDur)}s cumulative audio")
 
         try {
             llmSession?.setAudioData(samples, SAMPLE_RATE)
@@ -769,7 +905,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
             val response = fullText
             val parsed = extractAsrText(response)
-            Log.i(TAG, "processSegment #$segNum result: $response")
+            Log.i(TAG, "processSegment sent#$sent round #$round result: $response")
 
             withContext(Dispatchers.Main) {
                 if (parsed.isNotBlank()) {
@@ -777,14 +913,21 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                     omniAllResults.append(parsed).append("\n")
                 }
                 val duration = (System.currentTimeMillis() - segStart) / 1000f
-                val audioDur = samples.size / SAMPLE_RATE.toFloat()
-                appendSystemMessage("第 $segNum 段完成 — %.1fs 音频, %.1fs 推理".format(audioDur, duration))
+                if (isFinal) {
+                    appendSystemMessage("✅ 句#$sent 完成 — ${"%.1f".format(audioDur)}s (${"%.1f".format(duration)}s 推理)")
+                } else {
+                    appendSystemMessage("📝 句#$sent 累积 ${"%.1f".format(audioDur)}s → #$round (${"%.1f".format(duration)}s)")
+                }
 
                 if (isRecording.get()) {
                     btnRecord.isEnabled = true
                     btnRecord.text = "停止"
                     btnRecord.setBackgroundResource(R.drawable.bg_rec_button_active)
-                    setStatus("第 $segNum 段完成 — 继续监听...")
+                    if (isFinal) {
+                        setStatus("句#$sent 完成 — 监听中...")
+                    } else {
+                        setStatus("句#$sent 累积推理 #$round 完成 — 继续监听...")
+                    }
                 }
             }
         } catch (e: Exception) {
