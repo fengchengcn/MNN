@@ -29,6 +29,7 @@ aliases: [MOC, 目录, 导航, Home]
 | [[plans/preliminary-research]] | 初步调研（2026-06-04） | ✅ completed |
 | [[plans/llmexport-migration]] | llmexport.py 迁移计划（WP1-WP6） | ✅ completed |
 | [[plans/omni-streaming]] | Omni 流式推理方案（Phase 1-3） | 🔄 active |
+| [[plans/sherpa-ae-mnn-integration]] | Sherpa AE MNN 集成方案（conv_frontend + encoder） | ✅ implemented |
 | [[plans/progress]] | 项目总进度 & 里程碑 & 踩坑记录 | 🔄 active |
 
 ---
@@ -42,6 +43,7 @@ aliases: [MOC, 目录, 导航, Home]
 | [[analysis/android-memory]] | Android 真机内存 & GPU 实测 | ✅ completed |
 | [[analysis/memory-model]] | Omni vs 旧引擎内存模型理论分析 | ✅ completed |
 | [[analysis/omni-parameters]] | Omni 推理参数配置 & greedy 采样 | 🔄 active |
+| [[analysis/export-pipeline-analysis]] | 导出链路分析：双模型 AE vs llmexport 正道 | 🔄 active |
 
 ---
 
@@ -73,6 +75,7 @@ aliases: [MOC, 目录, 导航, Home]
 | `scripts/compare_pipeline_v2.py` | FBank→AE→Decoder 全链路四组合对比 |
 | `scripts/test_ae_end_to_end.py` | ONNX AE 端到端验证（产出参考输出） |
 | `scripts/test_full_pipeline.py` | 最完整：动态编译 C++ 做全链路对比 |
+| `/tmp/run_comparison.py` | **2026-06-14 桌面端 AE 隔离实验**（macOS 适配版） |
 
 ---
 
@@ -102,4 +105,10 @@ aliases: [MOC, 目录, 导航, Home]
 06-12  FBank 数值差异深度分析
 06-13  模型目录整理 + 导出规范 + FP16 导出
 06-14  **AEC/NS 移除 — 精度最大杀手确认并修复**
+06-14  桌面端 AE 隔离实验：MNN AE ≈ ONNX AE（cosim > 0.998）
+06-14  **🔴 根因：AE 架构不等价**（sherpa-onnx vs llmexport.py）
+06-14  **方案三：MNNConvert 双模型 AE（conv_frontend.mnn + encoder.mnn）**
+06-14  Step 3+4 验证通过：Express API 串联 cosim=1.0/0.997，Decoder first token 完全一致
+06-14  **双模型 AE 实机部署完成**：手机 logcat 确认端到端运行，AE 耗时 ~1.4s
+06-14  **发现官方 modeling 代码**：`github.com/QwenLM/Qwen3-ASR` 含完整 `modeling_qwen3_asr.py`，手写版漏掉 Chunk/Pad/Slice/Window。详见 [[analysis/export-pipeline-analysis]]
 ```
