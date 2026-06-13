@@ -932,34 +932,30 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
     }
     // pMeta isolation handled by per-RTM RuntimeAttr::mPMeta; no reset needed.
     VARP audio_embedding;
-    if (mAudioModule->getInfo()->inputNames.size() > 1) {
+    int nInputs = mAudioModule->getInfo()->inputNames.size();
+    ALOGI("Omni ATTENTION: audio_type=%s nInputs=%d fbank_dim=[%d,%d,%d]",
+          audio_type.c_str(), nInputs,
+          input_features->getInfo()->dim[0], input_features->getInfo()->dim[1], input_features->getInfo()->dim[2]);
+    if (nInputs > 1) {
         int seqlen = UP_DIV(input_features->getInfo()->dim[2], 2);
-        constexpr int n_window = 100;
-        std::vector<int> cu_seqlens;
-        int curseq = 0;
-        while (curseq < seqlen) {
-            cu_seqlens.push_back(curseq);
-            curseq += n_window;
-        }
-        if (seqlen % n_window != 0) {
-            cu_seqlens.push_back(seqlen);
-        }
+        // Full bidirectional attention mask: all zeros means every frame
+        // can attend to every other frame. This preserves Qwen3-ASR's
+        // auto-correction ability (e.g., using later context to disambiguate
+        // earlier words). The previous block-diagonal windowed mask (n_window=100)
+        // restricted cross-window attention and broke this capability.
+        // Memory cost: seqlen² × 4 B. For typical 10 s audio seqlen≈600 → 1.4 MB,
+        // well within mobile limits.
         VARP attention_mask = _Input({1, seqlen, seqlen}, NCHW, halide_type_of<float>());
         auto ptr = attention_mask->writeMap<float>();
-        for (int i = 0; i < seqlen; i++) {
-            for (int j = 0; j < seqlen; j++) {
-                ptr[seqlen * i + j] = std::numeric_limits<float>::lowest();
-            }
-        }
-        for (size_t i = 1; i < cu_seqlens.size(); ++i) {
-            for (int j = cu_seqlens[i - 1]; j < cu_seqlens[i]; ++j) {
-                for (int k = cu_seqlens[i - 1]; k < cu_seqlens[i]; ++k) {
-                    ptr[seqlen * j + k] = 0;
-                }
-            }
-        }
+        std::fill(ptr, ptr + seqlen * seqlen, 0.0f);
+        // ── VERIFY: confirm full-bidirectional mask is active ──
+        ALOGI("Omni ATTENTION: full bidirectional mask [%d x %d] — check sample: [0,0]=%.1f [0,%d]=%.1f [%d,0]=%.1f",
+              seqlen, seqlen, ptr[0], seqlen-1, ptr[seqlen-1], seqlen-1, ptr[(seqlen-1)*seqlen]);
         audio_embedding = mAudioModule->onForward({input_features, attention_mask})[0];
+        ALOGI("Omni ATTENTION: audio_embedding shape [%d, %d, %d]",
+              audio_embedding->getInfo()->dim[0], audio_embedding->getInfo()->dim[1], audio_embedding->getInfo()->dim[2]);
     } else {
+        ALOGI("Omni ATTENTION: single-input path (no attention mask) — audio_type=%s", audio_type.c_str());
         if (audio_type != "conformer" && input_features->getInfo()->dim[2] > 3000) {
             // Qwen2-Audio just support audio time <= 30s
             input_features = _Slice(input_features, _var<int>({0, 0, 0}, {3}), _var<int>({-1, -1, 3000}, {3}));
