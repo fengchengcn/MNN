@@ -89,6 +89,15 @@ One-line English summary with a `[Module:Type]` prefix. Module: `LLM`, `CPU`, `M
 
 Example: `[LLM:Feature] Add streaming support`
 
+## Subproject CLAUDE.md Files
+
+> When working in a subdirectory, read its `CLAUDE.md` first for local conventions.
+
+| Directory | CLAUDE.md | Scope |
+|-----------|-----------|-------|
+| `mnn-models/` | `mnn-models/CLAUDE.md` | Model export, naming conventions, document organization, Android deployment |
+| `apps/Android/MnnLlmChat/` | `apps/Android/MnnLlmChat/CLAUDE.md` | Android app architecture, model loading flow, JNI bridge, ASR test activity |
+
 ## Skills
 
 For the following tasks, **read the Skill entry file first** and execute step by step. Each step must pass its tests before proceeding.
