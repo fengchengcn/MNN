@@ -6,6 +6,8 @@
 mnn-models/Qwen3-ASR-0.6B-Omni-INT8/
 mnn-models/Qwen3-ASR-0.6B-Omni-FP16/
 mnn-models/Qwen3-ASR-0.6B/
+mnn-models/Qwen3-ASR-1.7B-Omni-INT8/
+mnn-models/Qwen3-ASR-1.7B/
 
 # ── C++ Build ──
 build/
@@ -15,9 +17,12 @@ project/android/build_64/
 apps/Android/MnnLlmChat/.gradle/
 apps/Android/MnnLlmChat/app/src/main/jniLibs/
 apps/Android/MnnLlmChat/local.properties
+apps/Android/**/.gradle/
+apps/frameworks/**/.gradle/
 apps/frameworks/mnn_tts/android/.cxx/
 apps/frameworks/mnn_tts/android/build/
 apps/frameworks/model_downloader/android/build/
+project/android/.gradle/
 
 # ── Export ──
 transformers/llm/export/.export.log
