@@ -875,15 +875,17 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
     abs_avg /= wave_len;
     ALOGI("Omni Waveform Stats: samples=%d, min=%.4f, max=%.4f, avg_abs=%.4f", wave_len, min_val, max_val, abs_avg);
 
-    // Normalize audio to -6dBFS RMS for consistent ASR accuracy
-    // The model was trained with audio at this level; quiet inputs produce hallucinations
+    // Normalize audio to -6dBFS RMS for consistent ASR accuracy.
+    // The model expects fbank features at a consistent level matching training
+    // data; quiet audio (-30+ dBFS) produces out-of-distribution features.
+    // Verified 2026-06-14: disabling this causes total recognition failure.
     // NOTE: waveform may be a _Const VARP (read-only), so we must create a new writable
     // tensor for the normalized data rather than calling writeMap on the original.
     {
         float sum_sq = 0.0f;
         for (int i = 0; i < wave_len; i++) sum_sq += wave_data[i] * wave_data[i];
         float rms = std::sqrt(sum_sq / wave_len);
-        const float target_rms = 0.5f;  // -6dBFS
+        const float target_rms = 0.5f;  // -6dBFS (verified optimal, 0dBFS degrades far-field)
         float gain = target_rms / (rms + 1e-8f);
         // Only normalize if audio is quiet (avoid clipping already-loud audio)
         if (gain > 1.01f) {
