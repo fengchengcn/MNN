@@ -149,12 +149,21 @@ bool Omni::load() {
         }
     }
     if (mConfig->is_audio()) {
-        mAudioModule.reset(Module::load({}, {}, mConfig->audio_model().c_str(), mProcessorRuntimeManager, &module_config));
+        auto audio_model_path = mConfig->audio_model();
+        ALOGI("Omni::load loading audio model: %s", audio_model_path.c_str());
+        MNN_PRINT("Omni::load loading audio model: %s\n", audio_model_path.c_str());
+        mAudioModule.reset(Module::load({}, {}, audio_model_path.c_str(), mProcessorRuntimeManager, &module_config));
         if (nullptr == mAudioModule.get()) {
+            ALOGE("Omni::load FAILED to load audio model: %s", audio_model_path.c_str());
+            MNN_PRINT("Omni::load FAILED to load audio model: %s\n", audio_model_path.c_str());
             return false;
         }
+        ALOGI("Omni::load audio model loaded successfully");
+        MNN_PRINT("Omni::load audio model loaded successfully\n");
     }
     mContext->status = LlmStatus::RUNNING;  // Set status to RUNNING after successful load
+    ALOGI("Omni::load completed successfully");
+    MNN_PRINT("Omni::load completed successfully\n");
     return true;
 }
 
@@ -865,6 +874,28 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
     }
     abs_avg /= wave_len;
     ALOGI("Omni Waveform Stats: samples=%d, min=%.4f, max=%.4f, avg_abs=%.4f", wave_len, min_val, max_val, abs_avg);
+
+    // Normalize audio to -6dBFS RMS for consistent ASR accuracy
+    // The model was trained with audio at this level; quiet inputs produce hallucinations
+    // NOTE: waveform may be a _Const VARP (read-only), so we must create a new writable
+    // tensor for the normalized data rather than calling writeMap on the original.
+    {
+        float sum_sq = 0.0f;
+        for (int i = 0; i < wave_len; i++) sum_sq += wave_data[i] * wave_data[i];
+        float rms = std::sqrt(sum_sq / wave_len);
+        const float target_rms = 0.5f;  // -6dBFS
+        float gain = target_rms / (rms + 1e-8f);
+        // Only normalize if audio is quiet (avoid clipping already-loud audio)
+        if (gain > 1.01f) {
+            auto info = waveform->getInfo();
+            auto normalized = _Input(info->dim, info->order, info->type);
+            float* dst = normalized->writeMap<float>();
+            for (int i = 0; i < wave_len; i++) dst[i] = wave_data[i] * gain;
+            waveform = normalized;  // replace with normalized copy
+            ALOGI("Omni Audio Normalized: RMS %.2f dBFS -> %.2f dBFS (gain %.1fx)",
+                  20*std::log10(rms), 20*std::log10(rms*gain), gain);
+        }
+    }
 
     Timer _t;
     VARP input_features;

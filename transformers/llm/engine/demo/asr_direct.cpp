@@ -141,6 +141,20 @@ int main(int argc, char* argv[]) {
     if (wf.get() == nullptr) { std::cerr << "FAIL\n"; return 1; }
     int nsamples = wf->getInfo()->size;
 
+    // Normalize audio to -6dBFS RMS for consistent ASR accuracy
+    // The model was trained with audio at this level; quiet inputs produce hallucinations
+    {
+        float* wf_data = wf->writeMap<float>();
+        float sum_sq = 0.0f;
+        for (int i = 0; i < nsamples; i++) sum_sq += wf_data[i] * wf_data[i];
+        float rms = std::sqrt(sum_sq / nsamples);
+        const float target_rms = 0.5f;  // -6dBFS
+        float gain = target_rms / (rms + 1e-8f);
+        for (int i = 0; i < nsamples; i++) wf_data[i] *= gain;
+        std::cout << "  Audio normalized: RMS " << (20*std::log10(rms))
+                  << " -> " << (20*std::log10(rms*gain)) << " dBFS (gain " << gain << "x)" << std::endl;
+    }
+
     auto feat = MNN::AUDIO::whisper_fbank_knf(wf);
     if (feat.get() == nullptr || feat->getInfo() == nullptr) { std::cerr << "whisper_fbank FAIL\n"; return 1; }
     // Materialize fbank
@@ -164,14 +178,17 @@ int main(int argc, char* argv[]) {
               << (nsamples / 16000.0) << "s audio, ~" << (nsamples / 160 / 8) << " expected)" << std::endl;
 
     // Build token sequence from the Qwen3-ASR chat template
-    std::vector<int> prefix_tokens = {151644, 8948, 198, 151645, 198,  // system header
-                                      151644, 872, 198};               // user header
-    std::vector<int> suffix_tokens = {151670,                          // audio_end
-                                      151645, 198,                     // <|im_end|>\n
-                                      151644, 77091, 198};             // assistant header
+    // Encodes: <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<|audio_start|>
+    std::vector<int> prefix_tokens = {151644, 8948, 198,     // <|im_start|>system\n
+                                      2610, 525, 264, 10950, 17847, 13, // You are a helpful assistant.
+                                      151645, 198,           // <|im_end|>\n
+                                      151644, 872, 198,      // <|im_start|>user\n
+                                      AUDIO_START};           // <|audio_start|>
+    std::vector<int> suffix_tokens = {AUDIO_END,              // <|audio_end|>
+                                      151645, 198,            // <|im_end|>\n
+                                      151644, 77091, 198};    // <|im_start|>assistant\n
     std::vector<int> tokens;
     tokens.insert(tokens.end(), prefix_tokens.begin(), prefix_tokens.end());
-    tokens.push_back(AUDIO_START);
     tokens.insert(tokens.end(), T, AUDIO_PAD);
     tokens.insert(tokens.end(), suffix_tokens.begin(), suffix_tokens.end());
 

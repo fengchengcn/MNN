@@ -9,6 +9,7 @@
 #include <fstream>
 #include <vector>
 #include <cstring>
+#include <cmath>
 
 using namespace MNN::Express;
 
