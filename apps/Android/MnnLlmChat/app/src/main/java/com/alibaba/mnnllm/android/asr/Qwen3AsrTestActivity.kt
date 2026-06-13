@@ -34,6 +34,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
@@ -153,16 +154,16 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         // Load native lib
         try {
             System.loadLibrary("mnnllmapp")
-            appendSystemMessage("Native library loaded OK")
+            appendSystemMessage("原生库加载成功")
         } catch (e: UnsatisfiedLinkError) {
-            setStatus("FATAL: Library load failed")
-            appendSystemMessage("System.loadLibrary(\"mnnllmapp\") failed: ${e.message}")
+            setStatus("致命错误: 原生库加载失败")
+            appendSystemMessage("System.loadLibrary(\"mnnllmapp\") 失败: ${e.message}")
             btnRecord.isEnabled = false
             return
         }
 
         // Init engine
-        setStatus("Initializing Omni engine...")
+        setStatus("正在初始化 Omni 引擎...")
         btnRecord.isEnabled = false
         updateToggleChip()
         lifecycleScope.launch(Dispatchers.IO) { initEngine() }
@@ -172,8 +173,8 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             if (!isRecording.get()) {
                 omniUseVad = !omniUseVad
                 updateToggleChip()
-                val label = if (omniUseVad) "VAD-segmented" else "BATCH (full audio)"
-                setStatus("Omni $label — tap REC to test")
+                val label = if (omniUseVad) "VAD分段" else "整段模式"
+                setStatus("Omni $label — 点击录音按钮开始")
             }
         }
         btnRecord.setOnClickListener {
@@ -192,15 +193,13 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
     /**
      * Scan /data/local/tmp/mnn_models/ for Omni-compatible models.
-     * Omni: audio.mnn + config.json with is_audio=true (FP16 preferred over INT8).
+     * Returns list of (absolutePath, displayName) sorted by display name.
      */
-    private fun findBestOmniModel(): String? {
+    private fun findOmniModelCandidates(): List<Pair<String, String>> {
         val localDir = File("/data/local/tmp/mnn_models")
-        if (!localDir.exists() || !localDir.isDirectory) return null
+        if (!localDir.exists() || !localDir.isDirectory) return emptyList()
 
-        data class Candidate(val dir: String, val score: Int)
-
-        val candidates = mutableListOf<Candidate>()
+        val candidates = mutableListOf<Pair<String, String>>()
 
         localDir.listFiles()?.forEach { subdir ->
             if (!subdir.isDirectory) return@forEach
@@ -210,31 +209,57 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                 try {
                     val config = JSONObject(configJson.readText())
                     if (config.optBoolean("is_audio", false)) {
-                        val name = subdir.name.uppercase()
-                        val score = when {
-                            name.contains("FP16") -> 2
-                            name.contains("INT8") -> 1
-                            else -> 0
-                        }
-                        candidates.add(Candidate(subdir.absolutePath, score))
+                        candidates.add(Pair(subdir.absolutePath, subdir.name))
                     }
                 } catch (_: Exception) {}
             }
         }
 
-        val best = candidates.maxByOrNull { it.score } ?: return null
-        Log.i(TAG, "Found Omni model: ${best.dir} (score=${best.score})")
-        return best.dir
+        candidates.sortBy { it.second }
+        Log.i(TAG, "Found ${candidates.size} Omni model(s): ${candidates.map { it.second }}")
+        return candidates
+    }
+
+    /**
+     * Show model selection dialog and await user choice.
+     * Auto-selects if only one candidate; shows dialog if multiple.
+     */
+    private suspend fun pickOmniModel(candidates: List<Pair<String, String>>): String? {
+        if (candidates.size == 1) return candidates[0].first
+        val deferred = CompletableDeferred<String?>()
+        val activity = this
+        withContext(Dispatchers.Main) {
+            val names = candidates.map { it.second }.toTypedArray()
+            com.google.android.material.dialog.MaterialAlertDialogBuilder(activity)
+                .setTitle("选择模型精度")
+                .setItems(names) { _, which ->
+                    deferred.complete(candidates[which].first)
+                }
+                .setOnCancelListener {
+                    deferred.complete(null)
+                }
+                .show()
+        }
+        return deferred.await()
     }
 
     private suspend fun initEngine() {
         try {
-            val modelDir = findBestOmniModel()
+            val candidates = findOmniModelCandidates()
+            if (candidates.isEmpty()) {
+                withContext(Dispatchers.Main) {
+                    setStatus("错误: 未找到 Omni ASR 模型")
+                    appendSystemMessage("请将模型放置到 /data/local/tmp/mnn_models/<模型目录>/")
+                    appendSystemMessage("需要: audio.mnn + config.json (is_audio=true)")
+                    btnRecord.isEnabled = false
+                }
+                return
+            }
+
+            val modelDir = pickOmniModel(candidates)
             if (modelDir == null) {
                 withContext(Dispatchers.Main) {
-                    setStatus("ERROR: No Omni ASR model found")
-                    appendSystemMessage("Place model at /data/local/tmp/mnn_models/<model>/")
-                    appendSystemMessage("Required: audio.mnn + config.json with is_audio=true")
+                    setStatus("已取消模型选择")
                     btnRecord.isEnabled = false
                 }
                 return
@@ -254,8 +279,8 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             if (session == null) {
                 Log.e(TAG, "Omni LlmSession creation returned null")
                 withContext(Dispatchers.Main) {
-                    setStatus("ERROR: Failed to create LlmSession")
-                    appendSystemMessage("Check config.json and model files at $modelDir")
+                    setStatus("错误: 创建 LlmSession 失败")
+                    appendSystemMessage("请检查 $modelDir 下的 config.json 和模型文件")
                 }
                 return
             }
@@ -277,19 +302,19 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
             Log.i(TAG, "Omni LlmSession loaded OK: $modelDir")
             withContext(Dispatchers.Main) {
-                appendSystemMessage("Loaded: Omni ($modelDirName)")
+                appendSystemMessage("已加载: Omni ($modelDirName)")
                 if (mergedConfig != null) {
                     populateParams(mergedConfig, modelDirName)
                 } else {
                     Log.w(TAG, "Merged config null; skipping param display")
                 }
-                val label = if (omniUseVad) "VAD-segmented" else "BATCH (full audio)"
-                setStatus("Omni $label — tap REC to test")
+                val label = if (omniUseVad) "VAD分段" else "整段模式"
+                setStatus("Omni $label — 点击录音按钮开始")
                 btnRecord.isEnabled = true
             }
         } catch (e: Exception) {
             Log.e(TAG, "Engine init error", e)
-            withContext(Dispatchers.Main) { setStatus("ERROR: ${e.message}") }
+            withContext(Dispatchers.Main) { setStatus("错误: ${e.message}") }
         }
     }
 
@@ -344,28 +369,28 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     private fun populateParams(mergedConfig: ModelConfig, modelDirName: String) {
         try {
             paramsCard.removeAllViews()
-            paramsCard.visibility = View.VISIBLE
-            paramsArrow.text = "▼"
-            paramsExpanded = true
+            paramsCard.visibility = View.GONE
+            paramsArrow.text = "▶"
+            paramsExpanded = false
 
             // ── Section: Model Info ──
-            addParamSection("Model")
-            addParamRow("Model", modelDirName)
-            addParamRow("Backend", mergedConfig.backendType ?: "—")
-            addParamRow("Precision", mergedConfig.precision ?: "—")
+            addParamSection("模型信息")
+            addParamRow("模型", modelDirName)
+            addParamRow("后端", mergedConfig.backendType ?: "—")
+            addParamRow("精度", mergedConfig.precision ?: "—")
             mergedConfig.threadNum?.let {
-                if (it > 0) addParamRow("Threads", it.toString())
+                if (it > 0) addParamRow("线程数", it.toString())
             }
 
             // ── Section: Sampler ──
-            addParamSection("Sampling")
+            addParamSection("采样参数")
             mergedConfig.samplerType?.let {
-                if (it.isNotBlank()) addParamRow("Sampler", it)
+                if (it.isNotBlank()) addParamRow("采样器", it)
             }
             mergedConfig.mixedSamplers?.let {
-                if (it.isNotEmpty()) addParamRow("Mixed", it.joinToString(", "))
+                if (it.isNotEmpty()) addParamRow("混合", it.joinToString(", "))
             }
-            mergedConfig.temperature?.let { addParamRow("Temperature", formatValue(it)) }
+            mergedConfig.temperature?.let { addParamRow("温度", formatValue(it)) }
             mergedConfig.topP?.let { addParamRow("Top-P", formatValue(it)) }
             mergedConfig.topK?.let { addParamRow("Top-K", it.toString()) }
             mergedConfig.minP?.let { addParamRow("Min-P", formatValue(it)) }
@@ -375,18 +400,18 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
             // ── Section: Penalty ──
             val hasPenalty = mergedConfig.penalty != null || mergedConfig.penaltySampler != null
             if (hasPenalty) {
-                addParamSection("Penalty")
-                mergedConfig.penalty?.let { addParamRow("Repetition", formatValue(it)) }
+                addParamSection("惩罚参数")
+                mergedConfig.penalty?.let { addParamRow("重复惩罚", formatValue(it)) }
                 mergedConfig.penaltySampler?.let {
-                    if (it.isNotBlank()) addParamRow("Type", it)
+                    if (it.isNotBlank()) addParamRow("类型", it)
                 }
                 mergedConfig.nGram?.let { addParamRow("N-Gram", it.toString()) }
-                mergedConfig.nGramFactor?.let { addParamRow("N-Gram Factor", formatValue(it)) }
+                mergedConfig.nGramFactor?.let { addParamRow("N-Gram 系数", formatValue(it)) }
             }
 
             // ── Section: Generation ──
-            addParamSection("Generation")
-            mergedConfig.maxNewTokens?.let { addParamRow("Max Tokens", it.toString()) }
+            addParamSection("生成参数")
+            mergedConfig.maxNewTokens?.let { addParamRow("最大 Token 数", it.toString()) }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to populate params", e)
         }
@@ -465,7 +490,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         speechDetected = false
         currentRms = 0f
 
-        btnRecord.text = "STOP"
+        btnRecord.text = "停止"
         btnRecord.setBackgroundResource(R.drawable.bg_rec_button_active)
 
         omniSegmentCount = 0
@@ -474,9 +499,9 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
         if (omniUseVad) {
             initTestVad()
-            setStatus("● Recording — VAD listening...")
+            setStatus("● 录音中 — VAD 监听中...")
         } else {
-            setStatus("● Recording (BATCH) — tap STOP when done")
+            setStatus("● 录音中 (整段模式) — 完成后点击停止")
         }
 
         // Init audio
@@ -535,7 +560,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
                 if (vad?.isSpeechDetected() == true) {
                     runOnUiThread {
-                        setStatus("● Segment #${omniSegmentCount + 1} — speaking...")
+                        setStatus("● 第 ${omniSegmentCount + 1} 段 — 说话中...")
                     }
                 }
 
@@ -551,7 +576,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                             btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
                             btnRecord.text = "..."
                             btnRecord.isEnabled = false
-                            setStatus("Segment #$omniSegmentCount — transcribing...")
+                            setStatus("第 $omniSegmentCount 段 — 转写中...")
                         }
                         segmentChannel.trySend(SegmentTask(segment.samples.copyOf(), isFinal = true))
                     }
@@ -579,7 +604,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                     btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
                     btnRecord.text = "..."
                     btnRecord.isEnabled = false
-                    setStatus("BATCH decoding ${snapshot.size} samples (%.1fs)...".format(snapshot.size / SAMPLE_RATE.toFloat()))
+                    setStatus("整段解码 ${snapshot.size} 样本 (%.1fs)...".format(snapshot.size / SAMPLE_RATE.toFloat()))
                 }
                 segmentChannel.trySend(SegmentTask(snapshot, isFinal = true))
             }
@@ -601,7 +626,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                     btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
                     btnRecord.text = "..."
                     btnRecord.isEnabled = false
-                    setStatus("Final segment #$omniSegmentCount...")
+                    setStatus("最后一段 #$omniSegmentCount...")
                 }
                 segmentChannel.trySend(SegmentTask(segment.samples.copyOf(), isFinal = true))
             }
@@ -686,19 +711,19 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                 }
                 val duration = (System.currentTimeMillis() - segStart) / 1000f
                 val audioDur = samples.size / SAMPLE_RATE.toFloat()
-                appendSystemMessage("Segment #$segNum OK — %.1fs audio, %.1fs inference".format(audioDur, duration))
+                appendSystemMessage("第 $segNum 段完成 — %.1fs 音频, %.1fs 推理".format(audioDur, duration))
 
                 if (isRecording.get()) {
                     btnRecord.isEnabled = true
-                    btnRecord.text = "STOP"
+                    btnRecord.text = "停止"
                     btnRecord.setBackgroundResource(R.drawable.bg_rec_button_active)
-                    setStatus("Segment #$segNum done — listening...")
+                    setStatus("第 $segNum 段完成 — 继续监听...")
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "processSegment error", e)
             withContext(Dispatchers.Main) {
-                appendSystemMessage("OMNI ERROR: ${e.message}")
+                appendSystemMessage("OMNI 错误: ${e.message}")
             }
         }
     }
@@ -726,15 +751,15 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         vad = null
         omniLiveCardId = -1
 
-        btnRecord.text = "REC"
+        btnRecord.text = "录音"
         btnRecord.setBackgroundResource(R.drawable.bg_rec_button_idle)
         btnRecord.isEnabled = true
         audioLevelContainer.visibility = View.GONE
         tvStatus.clearAnimation()
 
-        val label = if (omniUseVad) "VAD" else "BATCH"
-        val segInfo = if (omniSegmentCount > 0) " (${omniSegmentCount} segments)" else ""
-        setStatus("Omni $label — tap REC to test$segInfo")
+        val label = if (omniUseVad) "VAD" else "整段"
+        val segInfo = if (omniSegmentCount > 0) " (${omniSegmentCount} 段)" else ""
+        setStatus("Omni $label — 点击录音按钮开始$segInfo")
     }
 
     private fun setStatus(text: String) {
