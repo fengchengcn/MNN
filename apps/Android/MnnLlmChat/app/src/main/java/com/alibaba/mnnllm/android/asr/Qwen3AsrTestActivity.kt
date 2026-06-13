@@ -77,13 +77,12 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     private var aec: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
     private val isRecording = AtomicBoolean(false)
-    private val stoppedByUser = AtomicBoolean(false)
     private var recordingThread: Thread? = null
+    private var recordingSessionId = 0
     private var resultCardCount = 0
     private val timeFormatter = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
     // ── Omni state ──
-    @Volatile private var speechDetected = false
     @Volatile private var currentRms = 0f
     private val omniAudioBuffer = mutableListOf<Float>()  // BATCH mode: accumulate PCM float samples
 
@@ -106,7 +105,6 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     private var omniAllResults = StringBuilder()
     private var idleReturned = false
     private var segmentStartTime = 0L
-    private var omniLiveCardId = -1
 
     // ── Cumulative sliding-window inference (VAD mode) ──
     // Design:
@@ -521,13 +519,29 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     // ══════════════════════════════════════════════
 
     private fun startRecording() {
-        if (isRecording.get() || !modelLoaded) return
+        if (!modelLoaded) return
+
+        // If already recording, stop first — this is a stop-then-start toggle.
+        // Also ensures any previous recording's cleanup is fully done before
+        // we create new channel / thread / VAD instances.
+        if (isRecording.get()) {
+            isRecording.set(false)
+            recordingThread?.join(1000)
+            segmentConsumerJob?.cancel()
+        } else {
+            // Ensure previous recording is fully cleaned up.
+            // The old recordingThread may still be in VAD cleanup (flush, channel.close, etc.)
+            // even though isRecording is already false. Wait for it to finish.
+            recordingThread?.join(1000)
+            segmentConsumerJob?.cancel()
+        }
+
+        // Bump session ID so any stale cleanup from old thread is ignored
+        recordingSessionId++
 
         omniAudioBuffer.clear()
         idleReturned = false
         isRecording.set(true)
-        stoppedByUser.set(false)
-        speechDetected = false
         currentRms = 0f
 
         btnRecord.text = "停止"
@@ -535,7 +549,6 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
         omniSegmentCount = 0
         omniAllResults.clear()
-        omniLiveCardId = -1
         // Reset cumulative sliding-window state
         synchronized(accumulatedSegments) { accumulatedSegments.clear() }
         totalSpeechSamples = 0
@@ -580,6 +593,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     // ══════════════════════════════════════════════
 
     private fun recordingLoop(chunkSize: Int) {
+        val mySessionId = recordingSessionId  // capture — stale cleanup must be a no-op
         val shortBuf = ShortArray(chunkSize)
         var totalChunks = 0
 
@@ -713,6 +727,8 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
         if (!omniUseVad) {
             // ── BATCH mode: send entire recording as one segment ──
+            if (recordingSessionId != mySessionId) return  // stale session — bail out
+
             val snapshot = synchronized(omniAudioBuffer) { omniAudioBuffer.toFloatArray() }
             omniAudioBuffer.clear()
             omniSegmentCount = 1
@@ -732,11 +748,18 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
             segmentChannel.close()
             try { runBlocking { segmentConsumerJob?.join() } } catch (_: Exception) {}
-            runOnUiThread { returnToIdle() }
+            runOnUiThread { returnToIdle(mySessionId) }
             return
         }
 
         // ── VAD mode: flush in-progress speech, finalize current sentence ──
+        if (recordingSessionId != mySessionId) return  // stale session — bail out
+
+        // Capture channel + consumer references locally so we never accidentally
+        // close / join the next session's instances (segmentChannel is a var).
+        val myChannel = segmentChannel
+        val myConsumer = segmentConsumerJob
+
         Log.i(TAG, "🔒 VAD RECORDING END — lockedGain=%.2fx gainLocked=%b preGainChunks=%d".format(
             lockedGain, gainLocked, preGainChunkCount))
         vad?.flush()
@@ -762,9 +785,9 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         // current sentence (if any speech was accumulated)
         flushCurrentSentence()
 
-        segmentChannel.close()
-        try { runBlocking { segmentConsumerJob?.join() } } catch (_: Exception) {}
-        runOnUiThread { returnToIdle() }
+        myChannel.close()
+        try { runBlocking { myConsumer?.join() } } catch (_: Exception) {}
+        runOnUiThread { returnToIdle(mySessionId) }
     }
 
     // ══════════════════════════════════════════════
@@ -951,8 +974,12 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
     //  UI State Management
     // ══════════════════════════════════════════════
 
-    private fun returnToIdle() {
-        if (idleReturned) return
+    private fun returnToIdle(sessionId: Int) {
+        // Guard against stale callbacks from a previous recording session.
+        // When the user quickly stops and starts, the old recordingThread may
+        // still call returnToIdle() after the new session has already started.
+        // Without this check the button would revert to idle mid-recording.
+        if (idleReturned || recordingSessionId != sessionId) return
         idleReturned = true
 
         llmSession?.reset()
@@ -960,7 +987,6 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         try { vad?.release() } catch (_: Exception) {}
         vad = null
         // AudioPreprocessor reserved for future use (not active in current pipeline)
-        omniLiveCardId = -1
 
         btnRecord.text = "录音"
         btnRecord.setBackgroundResource(R.drawable.bg_rec_button_idle)
@@ -1074,6 +1100,18 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         tvEmptyResults.visibility = View.VISIBLE
         btnClear.visibility = View.GONE
         resultCardCount = 0
+        omniAllResults.clear()
+
+        // If recording in VAD mode, also reset the ongoing speech accumulation
+        // so the user gets a clean slate. Without this, old segments continue
+        // accumulating and produce stale results right after clearing.
+        if (isRecording.get() && omniUseVad) {
+            synchronized(accumulatedSegments) { accumulatedSegments.clear() }
+            totalSpeechSamples = 0
+            cumulativeRound = 0
+            lastInferenceSegmentCount = 0
+            omniSegmentCount = 0
+        }
     }
 
     // ══════════════════════════════════════════════
@@ -1124,7 +1162,11 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
         super.onStop()
         tvStatus.clearAnimation()
         if (isRecording.get()) {
-            stoppedByUser.set(true)
+            // Signal the recording loop to stop, then immediately release the
+            // mic so we don't keep recording in the background. The recording
+            // loop's cleanup path (VAD flush, final inference, channel close)
+            // still runs; stopAudioHardware() is null-safe and the loop calls
+            // it again as a no-op.
             isRecording.set(false)
             stopAudioHardware()
         }
@@ -1132,7 +1174,6 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        stoppedByUser.set(true)
         isRecording.set(false)
         tvStatus.clearAnimation()
         recordingThread?.join(500)
