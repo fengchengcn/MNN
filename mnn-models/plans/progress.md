@@ -114,6 +114,29 @@ CPU + 4 线程 + FP16 是最优配置。
 - **教训**: VAD 控制生命周期 + 扩展窗口保留全量上下文，两者缺一不可
 - **修复**: Phase 2.6 恢复扩展窗口，VAD 仅作生命周期控制
 
+### 11. 累积滑动窗口实现（2026-06-13，Qwen3AsrTestActivity）
+
+**问题**: Phase 2.6 的"VAD 引导扩展窗口"在 Android 端实际上未正确实现。
+`Qwen3AsrTestActivity` 中 VAD 模式将每段音频独立发给 `processSegmentSync()` 推理，
+每段各自过一遍 AudioEncoder + TextDecoder，段间无任何上下文共享。
+
+**正确实现**:
+- VAD 检测语音段 → 拼入 `accumulatedSegments` 累积 buffer
+- 段间插入 0.4s 零填充静音（匹配 VAD `minSilenceDuration`）
+- 每新增一段，构建全部累积音频，发一次推理（累积滑动窗口）
+- 结果：2s → 4s → 6s 渐进式结果，每次都有完整上下文，后续推理可自动纠正前文
+
+**句间断句**: 通过 wall-clock 段间间隔区分句内/句间停顿
+- 间隔 < 1.5s：同一句子，继续累积
+- 间隔 ≥ 1.5s：句间边界 → `flushCurrentSentence()` 发最终推理，新句从零开始
+
+**并发模型**: `Channel.UNLIMITED` + 单 consumer 协程串行处理，`sendCumulativeTask()` 调用 `trySend` 不阻塞录音线程。
+
+**关键 Bug 及修复**:
+1. **重复输出**: 句边界 flush 时发了 final 任务，但最后一个 interim 已覆盖全部累积音频。修复：用 `lastInferenceSegmentCount` 跟踪上次推理时段数，flush 时段数未增加 → 跳过 final
+2. **最后一句不输出**: flush 时 drain channel 排空了包括当前句子在内的所有待处理任务，然后因 `lastInferenceSegmentCount` 已更新又跳过 final → 整句丢失。修复：去掉 channel drain
+3. **句子/轮次标注错乱**: `sentenceIndex`/`cumulativeRound` 是共享变量，consumer 读取时已被后续 flush 修改。修复：构建 `SegmentTask` 时捕获 `sentIndex`/`sentRound` 到任务中
+
 ### 9. keepHistory 污染 prompt（Omni 模式）
 - **现象**: 增量推理中 FINAL 结果输出幻觉文本
 - **根因**: `keepHistory=true` 导致每次 `generate()` 追加 `<audio>` tag 到历史
