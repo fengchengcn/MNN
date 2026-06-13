@@ -143,6 +143,10 @@ public:
         return base_dir_ + config_.value("audio_model", "audio.mnn");
     }
 
+    std::string audio_encoder() const {
+        return base_dir_ + config_.value("audio_encoder", "encoder.mnn");
+    }
+
     std::string context_file() const {
         return base_dir_ + config_.value("context_file", "context.json");
     }

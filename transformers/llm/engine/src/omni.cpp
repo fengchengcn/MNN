@@ -160,6 +160,20 @@ bool Omni::load() {
         }
         ALOGI("Omni::load audio model loaded successfully");
         MNN_PRINT("Omni::load audio model loaded successfully\n");
+
+        // Load audio encoder (new: separate encoder model for qwen3_asr architecture)
+        auto audio_encoder_path = mConfig->audio_encoder();
+        ALOGI("Omni::load loading audio encoder: %s", audio_encoder_path.c_str());
+        MNN_PRINT("Omni::load loading audio encoder: %s\n", audio_encoder_path.c_str());
+        mAudioEncoder.reset(Module::load({}, {}, audio_encoder_path.c_str(), mProcessorRuntimeManager, &module_config));
+        if (nullptr == mAudioEncoder.get()) {
+            // Non-fatal: older configs may not have a separate encoder file
+            ALOGI("Omni::load audio encoder not found (non-fatal for single-model audio): %s", audio_encoder_path.c_str());
+            MNN_PRINT("Omni::load audio encoder not found (non-fatal): %s\n", audio_encoder_path.c_str());
+        } else {
+            ALOGI("Omni::load audio encoder loaded successfully");
+            MNN_PRINT("Omni::load audio encoder loaded successfully\n");
+        }
     }
     mContext->status = LlmStatus::RUNNING;  // Set status to RUNNING after successful load
     ALOGI("Omni::load completed successfully");
@@ -934,35 +948,66 @@ std::vector<int> Omni::audioProcess(MNN::Express::VARP waveform) {
     }
     // pMeta isolation handled by per-RTM RuntimeAttr::mPMeta; no reset needed.
     VARP audio_embedding;
-    int nInputs = mAudioModule->getInfo()->inputNames.size();
-    ALOGI("Omni ATTENTION: audio_type=%s nInputs=%d fbank_dim=[%d,%d,%d]",
-          audio_type.c_str(), nInputs,
-          input_features->getInfo()->dim[0], input_features->getInfo()->dim[1], input_features->getInfo()->dim[2]);
-    if (nInputs > 1) {
-        int seqlen = UP_DIV(input_features->getInfo()->dim[2], 2);
-        // Full bidirectional attention mask: all zeros means every frame
-        // can attend to every other frame. This preserves Qwen3-ASR's
-        // auto-correction ability (e.g., using later context to disambiguate
-        // earlier words). The previous block-diagonal windowed mask (n_window=100)
-        // restricted cross-window attention and broke this capability.
-        // Memory cost: seqlen² × 4 B. For typical 10 s audio seqlen≈600 → 1.4 MB,
-        // well within mobile limits.
-        VARP attention_mask = _Input({1, seqlen, seqlen}, NCHW, halide_type_of<float>());
-        auto ptr = attention_mask->writeMap<float>();
-        std::fill(ptr, ptr + seqlen * seqlen, 0.0f);
-        // ── VERIFY: confirm full-bidirectional mask is active ──
-        ALOGI("Omni ATTENTION: full bidirectional mask [%d x %d] — check sample: [0,0]=%.1f [0,%d]=%.1f [%d,0]=%.1f",
-              seqlen, seqlen, ptr[0], seqlen-1, ptr[seqlen-1], seqlen-1, ptr[(seqlen-1)*seqlen]);
-        audio_embedding = mAudioModule->onForward({input_features, attention_mask})[0];
-        ALOGI("Omni ATTENTION: audio_embedding shape [%d, %d, %d]",
+
+    // ── qwen3_asr two-model path: conv_frontend.mnn → encoder.mnn ──
+    if (audio_type == "qwen3_asr" && mAudioEncoder.get() != nullptr) {
+        ALOGI("Omni AE: using two-model path (conv_frontend + encoder)");
+
+        // Step 1: FBank [1, 128, T] → Permute({0,2,1}) → [1, T, 128] for conv_frontend
+        auto ae_input = _Permute(input_features, {0, 2, 1});
+        ALOGI("Omni AE: fbank permuted [%d,%d,%d] → [%d,%d,%d]",
+              input_features->getInfo()->dim[0], input_features->getInfo()->dim[1], input_features->getInfo()->dim[2],
+              ae_input->getInfo()->dim[0], ae_input->getInfo()->dim[1], ae_input->getInfo()->dim[2]);
+
+        // Step 2: conv_frontend (1 input, 1 output)
+        auto conv_output = mAudioModule->forward(ae_input);
+        if (conv_output.get() == nullptr || conv_output->getInfo() == nullptr) {
+            ALOGE("Omni AE: conv_frontend returned null");
+            return std::vector<int>(0);
+        }
+        int enc_seq_len = conv_output->getInfo()->dim[1];
+        int enc_hidden = conv_output->getInfo()->dim[2];
+        ALOGI("Omni AE: conv_frontend output [%d,%d,%d]",
+              conv_output->getInfo()->dim[0], enc_seq_len, enc_hidden);
+
+        // Step 3: Create 1D feature mask [1, enc_seq_len] (1=valid, 0=padding)
+        VARP feature_mask = _Input({1, enc_seq_len}, NCHW, halide_type_of<float>());
+        auto* mask_ptr = feature_mask->writeMap<float>();
+        std::fill(mask_ptr, mask_ptr + enc_seq_len, 1.0f);
+
+        // Step 4: encoder (2 inputs: features [1, T', H] + mask [1, T'])
+        auto enc_outputs = mAudioEncoder->onForward({conv_output, feature_mask});
+        if (enc_outputs.empty() || enc_outputs[0].get() == nullptr) {
+            ALOGE("Omni AE: encoder returned null");
+            return std::vector<int>(0);
+        }
+        audio_embedding = enc_outputs[0];
+        ALOGI("Omni AE: encoder output [%d,%d,%d]",
               audio_embedding->getInfo()->dim[0], audio_embedding->getInfo()->dim[1], audio_embedding->getInfo()->dim[2]);
     } else {
-        ALOGI("Omni ATTENTION: single-input path (no attention mask) — audio_type=%s", audio_type.c_str());
-        if (audio_type != "conformer" && input_features->getInfo()->dim[2] > 3000) {
-            // Qwen2-Audio just support audio time <= 30s
-            input_features = _Slice(input_features, _var<int>({0, 0, 0}, {3}), _var<int>({-1, -1, 3000}, {3}));
+        // ── Legacy single-model path (conformer, usm, or qwen3_asr without encoder) ──
+        int nInputs = mAudioModule->getInfo()->inputNames.size();
+        ALOGI("Omni ATTENTION: audio_type=%s nInputs=%d fbank_dim=[%d,%d,%d]",
+              audio_type.c_str(), nInputs,
+              input_features->getInfo()->dim[0], input_features->getInfo()->dim[1], input_features->getInfo()->dim[2]);
+        if (nInputs > 1) {
+            int seqlen = UP_DIV(input_features->getInfo()->dim[2], 2);
+            VARP attention_mask = _Input({1, seqlen, seqlen}, NCHW, halide_type_of<float>());
+            auto ptr = attention_mask->writeMap<float>();
+            std::fill(ptr, ptr + seqlen * seqlen, 0.0f);
+            ALOGI("Omni ATTENTION: full bidirectional mask [%d x %d] — check sample: [0,0]=%.1f [0,%d]=%.1f [%d,0]=%.1f",
+                  seqlen, seqlen, ptr[0], seqlen-1, ptr[seqlen-1], seqlen-1, ptr[(seqlen-1)*seqlen]);
+            audio_embedding = mAudioModule->onForward({input_features, attention_mask})[0];
+            ALOGI("Omni ATTENTION: audio_embedding shape [%d, %d, %d]",
+                  audio_embedding->getInfo()->dim[0], audio_embedding->getInfo()->dim[1], audio_embedding->getInfo()->dim[2]);
+        } else {
+            ALOGI("Omni ATTENTION: single-input path (no attention mask) — audio_type=%s", audio_type.c_str());
+            if (audio_type != "conformer" && input_features->getInfo()->dim[2] > 3000) {
+                // Qwen2-Audio just support audio time <= 30s
+                input_features = _Slice(input_features, _var<int>({0, 0, 0}, {3}), _var<int>({-1, -1, 3000}, {3}));
+            }
+            audio_embedding = mAudioModule->forward(input_features);
         }
-        audio_embedding = mAudioModule->forward(input_features);
     }
 
     // Permute to [T, 1, H]

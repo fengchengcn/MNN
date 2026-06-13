@@ -149,6 +149,7 @@ public:
     ~Omni() {
         mVisionModule.reset();
         mAudioModule.reset();
+        mAudioEncoder.reset();
     }
     virtual bool load() override;
     virtual std::vector<Express::VARP> forwardRaw(Express::VARP hiddenState, Express::VARP mask, Express::VARP inputPos, Express::VARPS extraArgs) override;
@@ -184,7 +185,7 @@ private:
     std::vector<int> processAudioContent(const std::string& content, const std::map<std::string, PromptAudioPart>& audios);
     void responseInterleaved(const std::vector<int>& input_ids, std::ostream* os, const char* end_with,
                              int max_new_tokens);
-    std::shared_ptr<Module> mVisionModule, mAudioModule;
+    std::shared_ptr<Module> mVisionModule, mAudioModule, mAudioEncoder;
     std::vector<VARP> mExtraArgs, mVisionEmbeddings, mAudioEmbeddings, mDeepStackEmbeddings;
     std::shared_ptr<Talker> mTalker;
     int64_t mThinkerElapsedUs = 0;
