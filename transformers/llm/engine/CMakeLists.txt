@@ -112,6 +112,12 @@ if(MNN_LLM_BUILD_DEMO)
     add_executable(test_ae_perf ${CMAKE_CURRENT_LIST_DIR}/demo/test_ae_perf.cpp)
     target_link_libraries(test_ae_perf ${LLM_DEPS})
 
+    add_executable(test_audio_verify ${CMAKE_CURRENT_LIST_DIR}/demo/test_audio_verify.cpp)
+    target_link_libraries(test_audio_verify ${LLM_DEPS})
+
+    add_executable(test_audio_verify2 ${CMAKE_CURRENT_LIST_DIR}/demo/test_audio_verify2.cpp)
+    target_link_libraries(test_audio_verify2 ${LLM_DEPS})
+
     add_executable(test_direct_fp16 ${CMAKE_CURRENT_LIST_DIR}/demo/test_direct_fp16.cpp)
     target_link_libraries(test_direct_fp16 ${LLM_DEPS})
 
