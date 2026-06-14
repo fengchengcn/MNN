@@ -463,6 +463,10 @@ class Qwen3AsrAudio(Audio):
         self.llm_config['audio_start'] = 151669
         self.llm_config['audio_end'] = 151670
         self.llm_config['attn_scale'] = 0.08838834764831845  # 1/sqrt(128)
+        # Window/chunk config (for future chunking support; simplified forward path uses full-sequence)
+        self.n_window = getattr(self.encoder, 'n_window', 50)
+        self.n_window_infer = getattr(self.encoder, 'n_window_infer', 800)
+        self.conv_chunksize = getattr(self.encoder, 'conv_chunksize', 500)
 
     def forward(self, input_features):
         return self.encoder(input_features)
@@ -537,9 +541,10 @@ class Qwen3AsrAudio(Audio):
                     onnx_model,
                     input_names=['input_features'],
                     output_names=['audio_embeds'],
-                    dynamic_axes={"input_features": {
-                        2: "size"
-                    }})
+                    dynamic_axes={
+                        "input_features": {0: "batch", 2: "time"},
+                        "audio_embeds": {0: "batch", 1: "enc_time"}
+                    })
         return onnx_model
 
 

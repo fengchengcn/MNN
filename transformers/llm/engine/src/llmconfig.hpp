@@ -144,7 +144,7 @@ public:
     }
 
     std::string audio_encoder() const {
-        return base_dir_ + config_.value("audio_encoder", "encoder.mnn");
+        return base_dir_ + config_.value("audio_encoder", "");
     }
 
     std::string context_file() const {

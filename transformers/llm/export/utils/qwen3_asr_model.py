@@ -194,6 +194,11 @@ class AudioEncoder(nn.Module):
     """Whisper-style audio encoder: Conv2d ×3 → Transformer ×N → Projection.
 
     Configurable via kwargs to support different model sizes (0.6B, 1.7B, etc.).
+
+    Uses a simplified forward (no chunking/windowing) which is equivalent to
+    Wasser1462's conv_frontend+encoder combined path for short audio (≤30s).
+    For short audio, a single window covers the full sequence so full-attention
+    is correct. For longer audio, chunking/windowing would need to be added.
     """
 
     def __init__(self, **kwargs):
@@ -204,12 +209,18 @@ class AudioEncoder(nn.Module):
         n_layers = kwargs.get("n_audio_layers", 18)
         conv_hidden = kwargs.get("conv_hidden_size", 480)
         output_dim = kwargs.get("output_dim", 1024)
+        n_window = kwargs.get("n_window", 50)
+        n_window_infer = kwargs.get("n_window_infer", 800)
+        conv_chunksize = kwargs.get("conv_chunksize", 500)
 
         self.d_model = d_model
         self.n_heads = n_heads
         self.ffn = ffn
         self.n_layers = n_layers
         self.conv_hidden = conv_hidden
+        self.n_window = n_window
+        self.n_window_infer = n_window_infer
+        self.conv_chunksize = conv_chunksize
 
         # Convolutional front-end (mel: [B, 128, T] → [B, conv_hidden, 16, T//8])
         self.conv2d1 = nn.Conv2d(1, conv_hidden, kernel_size=3, stride=2, padding=1)
@@ -217,7 +228,7 @@ class AudioEncoder(nn.Module):
         self.conv2d3 = nn.Conv2d(conv_hidden, conv_hidden, kernel_size=3, stride=2, padding=1)
         # Project from conv features to transformer dimension
         # After 3× stride-2: 128 mel bins → 16, so conv_out input = conv_hidden * 16
-        self.conv_out = nn.Linear(conv_hidden * 16, d_model)
+        self.conv_out = nn.Linear(conv_hidden * 16, d_model, bias=False)
         # Positional embeddings (sinusoidal)
         self.register_buffer("embed_positions", self._create_sinusoidal_positions(3000, d_model))
         # Transformer encoder layers
@@ -229,12 +240,18 @@ class AudioEncoder(nn.Module):
 
     @staticmethod
     def _create_sinusoidal_positions(max_len, dim):
-        """Create sinusoidal position embeddings (same as Whisper)."""
-        pe = torch.zeros(max_len, dim)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float) * (-torch.log(torch.tensor(10000.0)) / dim))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+        """Create sinusoidal position embeddings (Whisper-style concatenation).
+
+        Official formula: cat([sin(scaled_time), cos(scaled_time)], dim=-1)
+        Groups all sines in the first half, all cosines in the second half.
+        NOT interleaved (sin,cos,sin,cos...).
+        """
+        if dim % 2 != 0:
+            raise ValueError(f"Sinusoidal position embedding requires even dim, got {dim}")
+        log_timescale_increment = torch.log(torch.tensor(10000.0)) / (dim // 2 - 1)
+        inv_timescales = torch.exp(-log_timescale_increment * torch.arange(dim // 2, dtype=torch.float))
+        scaled_time = torch.arange(max_len, dtype=torch.float).unsqueeze(1) * inv_timescales.unsqueeze(0)
+        pe = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
         return pe
 
     def forward(self, input_features):
@@ -424,6 +441,9 @@ def load_qwen3_asr(model_path, dtype=torch.float32):
         "n_audio_layers": ac.get("num_hidden_layers", 18),
         "conv_hidden_size": ac.get("downsample_hidden_size", 480),
         "output_dim": ac.get("output_dim", text_config["hidden_size"]),
+        "n_window": ac.get("n_window", 50),
+        "n_window_infer": ac.get("n_window_infer", 800),
+        "conv_chunksize": ac.get("conv_chunksize", 500),
     }
 
     model = Qwen3ASRWrapper(text_config, audio_config)

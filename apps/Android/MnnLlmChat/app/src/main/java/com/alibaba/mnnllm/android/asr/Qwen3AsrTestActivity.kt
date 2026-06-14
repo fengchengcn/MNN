@@ -737,6 +737,7 @@ class Qwen3AsrTestActivity : AppCompatActivity() {
                 snapshot.size / SAMPLE_RATE.toFloat()))
 
             if (snapshot.isNotEmpty()) {
+                segmentStartTime = System.currentTimeMillis()  // BATCH mode: set timing reference
                 runOnUiThread {
                     btnRecord.setBackgroundResource(R.drawable.bg_rec_button_processing)
                     btnRecord.text = "..."

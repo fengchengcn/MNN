@@ -2,6 +2,9 @@
 .DS_Store
 **/.DS_Store
 
+# ── Graphify output ──
+graphify-out/
+
 # ── MNN Model directories (large files, managed outside git) ──
 mnn-models/Qwen3-ASR-0.6B-Omni-INT8/
 mnn-models/Qwen3-ASR-0.6B-Omni-FP16/
