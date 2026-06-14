@@ -8,7 +8,7 @@ related: [[llmexport-migration]], [[omni-streaming]], [[root-cause-analysis]], [
 ---
 # Qwen3-ASR → MNN 项目状态
 
-> 最后更新：2026-06-14 | 状态：**双模型 AE 集成完成 — conv_frontend.mnn + encoder.mnn 实机运行中**
+> 最后更新：2026-06-14 | 状态：**单模型 audio.mnn 导出完成 — llmexport.py 正道已恢复，桌面验证通过，手机验证中**
 
 ## 当前状态总览
 
@@ -19,7 +19,7 @@ Qwen3-ASR-0.6B → MNN 迁移: ✅ 完成
 ├── llmexport.py 导出 (WP1-WP6):     ✅ 完成
 ├── Android 集成 (VoiceChatPresenter): ✅ Omni 模式运行中
 ├── 流式推理 (Phase 2.6 VAD+扩展窗口): ✅ 实机验证通过
-└── sherpa AE 集成 (conv_frontend + encoder): ✅ 实机运行中  ← NEW
+└── 单模型 audio.mnn (llmexport.py 正道): ✅ 桌面验证通过，手机验证中  ← 2026-06-14 更新
 ```
 
 ## 模型文件
@@ -37,15 +37,14 @@ Qwen3-ASR-0.6B → MNN 迁移: ✅ 完成
 
 | 文件 | 大小 | 说明 |
 |------|------|------|
-| `conv_frontend.mnn` | 42 MB | **NEW** CNN subsampling（MNNConvert 转自 sherpa-onnx） |
-| `encoder.mnn` | 176 MB | **NEW** 18×Transformer INT8（MNNConvert 转自 sherpa-onnx） |
+| `audio.mnn` | 337 KB | **单模型 AE**（llmexport.py 正道导出，替换了第三方双模型） |
+| `audio.mnn.weight` | 210 MB | AE 权重（INT8） |
 | `llm.mnn` + `.weight` | 494 KB + 604 MB / 1.1 GB | Decoder（INT8 / FP16），29×FusedAttention |
-| `config.json` | ~1 KB | 含 `is_audio`, `audio_type`, `audio_model`, `audio_encoder` |
+| `config.json` | ~1 KB | `audio_model: "audio.mnn"`，**无** `audio_encoder`（单模型路径） |
 | `tokenizer.txt` / `.mtok` | ~3 MB | BPE tokenizer |
 
-> **2026-06-14 架构升级**：用 MNNConvert 转换的 `conv_frontend.mnn` + `encoder.mnn` 替换了 llmexport.py 手写的 `audio.mnn`。
-> 旧 `audio.mnn` (337K) + `audio.mnn.weight` (210 MB) 已备份。新 AE 与 sherpa-onnx **完全架构等价**（conv_frontend cosim=1.0, encoder cosim=0.997），Decoder first token **完全一致**。
-> 详见 [[sherpa-ae-mnn-integration]]。
+> **2026-06-14 架构升级（更正后）**：`llmexport.py` 自控全链路导出的单文件 `audio.mnn` 替换了第三方 Wasser1462 的 `conv_frontend.mnn` + `encoder.mnn`。
+> 旧双模型文件（42MB + 176MB）已重命名为 `.old`，验证通过后可删除。详见 [[analysis/root-cause-analysis#更正说明]] 和 [[analysis/export-pipeline-analysis]]。
 
 ## 关键里程碑
 
@@ -64,12 +63,18 @@ Qwen3-ASR-0.6B → MNN 迁移: ✅ 完成
 | 06-14 | **INT8 vs FP16 桌面端输出对比**：4 配置 × 5 音频全链路测试，不同权重格式各有输出差异，无 ground truth 无法判断孰优孰劣（手机实测 FP16 更好） |
 | 06-14 | **桌面对比实验：AE 隔离**：MNN AE → ONNX Dec vs ONNX AE → ONNX Dec，5/5 first token MATCH，AE 不是误差源 |
 | 06-14 | **桌面对比实验：Decoder 同输入对比**：MNN llm.mnn vs ONNX llm.onnx，first token 5/5 match，但存在系统性数值缩放差异（cosim ~0.97，logit 差 ~4-5×） |
-| 06-14 | **🔴 根因确认：AE 架构不等价**：sherpa-onnx conv_frontend+encoder vs MNN audio.mnn，cosim ~0.30，subsampling ratio 不同（6.5× vs 8×）。同一份 HF 权重（max diff=0），但 sherpa-onnx 通过图追踪保留了原模型的 Pad→Conv→Slice 链，MNN llmexport 手写 forward() 缺失 Pad/Slice → 图结构不对齐。详见 [[root-cause-analysis]] |
+| 06-14 | **🔴 根因确认：AE 架构不等价** ~~sherpa-onnx conv_frontend+encoder vs MNN audio.mnn，cosim ~0.30，subsampling ratio 不同（6.5× vs 8×）。同一份 HF 权重（max diff=0），但 sherpa-onnx 通过图追踪保留了原模型的 Pad→Conv→Slice 链，MNN llmexport 手写 forward() 缺失 Pad/Slice → 图结构不对齐。详见 [[root-cause-analysis]]~~ **🔄 已更正（见下方 06-14 更正条目）** |
 | 06-14 | **方案三验证通过**：MNNConvert 转换 sherpa conv_frontend.onnx + encoder.int8.onnx → MNN 格式成功。conv_frontend cosim=1.0，encoder cosim=0.997。MNNConvert 忠实保留了 130 节点动态图（Shape/Gather/Pad/Transpose/Conv/Slice） |
 | 06-14 | **Step 3 完成：Express API 双模型串联验证** — conv_frontend.mnn + encoder.mnn 通过 Module::onForward (NCHW) 链式调用，cosim 与 Session API 完全一致（1.0 / 0.997）。原 test_mnn_models.cpp 失败是因为链接旧版 MNN 库 |
 | 06-14 | **Step 4 完成：端到端 First Token 对比** — 同一 FBank → MNN AE → ONNX Decoder vs ONNX AE → ONNX Decoder。first token 完全一致（15 vs 15），top-5 交集 5/5，logit cosim=1.0。尽管长序列 (T=300) 时 AE cosim 降至 0.989，Decoder cross-attention 完全补偿 |
 | 06-14 | **双模型 AE 实机部署完成** — 代码改动 ~45 行（omni.cpp/hpp + llmconfig.hpp + Qwen3AsrTestActivity.kt + config.json）。手机 logcat 确认新路径生效：fbank → Permute({0,2,1}) → conv_frontend.mnn → encoder.mnn → decoder，AE 耗时 ~1.4s。向后兼容：encoder.mnn 缺失时自动回退旧路径 |
 | 06-14 | **发现官方 modeling 代码**：`github.com/QwenLM/Qwen3-ASR` 含完整 `modeling_qwen3_asr.py`（80 行 forward），手写版漏掉 Chunk/Pad/Slice/Window。当前双模型 AE 来自第三方 ONNX → MNNConvert。正道是修复 llmexport.py → 单文件 audio.mnn，全链路自控。详见 [[analysis/export-pipeline-analysis]] |
+| 06-14 | **🔄 根因更正：推翻"架构不等价"** — cosim ~0.30 的真凶是两个代码 bug（`conv_out` random bias + PE interleaved 公式），不是 Chunk/Pad/Slice 缺失。修复后 cosim = 0.993（同帧数），PyTorch vs ONNX max diff = 2.36e-6。Chunk/Pad/Slice 是官方长音频内存优化，ONNX 不可 trace，对短音频（≤30s）无需。详见 [[analysis/root-cause-analysis#更正说明]] |
+| 06-14 | **单模型 audio.mnn 导出完成** — llmexport.py 导出单文件 audio.mnn (337KB) + audio.mnn.weight (210MB)，含完整的 Conv2d×3 → Transformer×18 → Project。配置：`audio_model: "audio.mnn"`，无 `audio_encoder` → 单模型路径 |
+| 06-14 | **llmconfig.hpp 默认值修复** — `audio_encoder()` 默认值 `"encoder.mnn"` → `""`，防止 config.json 无 `audio_encoder` 字段时误加载旧 encoder.mnn 走双模型路径导致 SIGSEGV |
+| 06-14 | **桌面端验证通过** — MNN audio.mnn vs Wasser1462 cosim 0.993 (T=100)，first frame cosim 0.98+。手机同步完成，待实机 ASR 测试 |
+| 06-14 | **手机实机测试** — 短音频（≤10s）识别正常；长音频（≥16s）出现语音幻觉（FP16/INT8 均复现）。根因：非分块连续 conv 与训练时分块 conv 不一致，多 chunk 时中间表示偏离训练分布。缓解：VAD 模式天然切短段 ⭕ ；根本修复需完整 Chunk/Pad/Slice 移植（ONNX 不可 trace，可能需双模型方案） |
+| 06-14 | **0.6B-FP16 + 1.7B-INT8 重新导出** — 应用 bias=False + PE concat 修复，旧文件清理 ~453 MB。三个模型目录全部更新为 llmexport.py 正道单模型 |
 
 ### 12. AEC + NoiseSuppressor 是精度最大杀手（2026-06-14，🔴 P0）
 

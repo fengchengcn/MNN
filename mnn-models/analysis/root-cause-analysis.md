@@ -8,18 +8,23 @@ related: [[fbank-numerical-analysis]], [[omni-parameters]], [[progress]]
 ---
 # Qwen3-ASR 识别精度差异分析
 
-> 日期：2026-06-14（更新）| 状态：**已修复 — 双模型 AE 集成完成**
+> 日期：2026-06-14（更正）| 状态：**单模型 audio.mnn 导出完成**
 >
-> 问题：SherpaOnnx 框架的 Qwen3-ASR 识别精度很高，但 MNN 早期导出在罕见词上表现差。
+> 问题：MNN 早期 llmexport.py 手写的 `audio.mnn` 精度远低于预期。
 >
-> **解决方案**：用 MNNConvert 转换 sherpa-onnx 的 `conv_frontend.onnx` + `encoder.int8.onnx` 替换 llmexport.py 手写的 `audio.mnn`，实现与 sherpa-onnx **完全架构等价**。详见 [[sherpa-ae-mnn-integration]]。
+> **2026-06-14 更正**：原 §2 "AE 架构不等价" 的分析被推翻。cosim ~0.30 的**真正根因是两个代码 bug**：
+> 1. `conv_out` 使用 `bias=True`（应为 `False`，safetensors 无 bias → 随机值未覆盖）
+> 2. Sinusoidal 位置编码使用 interleaved 顺序（应为 concat 顺序）
+> 
+> 修复后 PyTorch vs ONNX max diff = 2.36e-6，MNN vs Wasser1462 cosim = 0.993（同帧数）。
+> 之前归因于 Chunk/Pad/Slice 的分析是错误的——这些操作是官方代码的长音频内存优化，对短音频（≤30s）数学等价，不可 trace 也不是精度差异的原因。
 
 ## 最终结论（2026-06-14 更新）
 
 经过系统实验逐一排除后，**精度差异主因排名**：
 
 1. **🔴 AEC + NoiseSuppressor 硬件音效（影响最大，已修复）**：Android `AcousticEchoCanceler` + `NoiseSuppressor` 在 vendor DSP 上的实现在许多手机上会严重扭曲语音频谱。去掉后（与 sherpa-onnx 一致：raw MIC 直通）识别质量大幅提升。详见 [[progress]] Pitfall #12。
-2. **🔴 Audio Encoder 模型架构不等价（根因，确认）**：2026-06-14 桌面对比实验确认，MNN `audio.mnn` 和 sherpa-onnx `conv_frontend.onnx` + `encoder.int8.onnx` 在相同 fbank 输入下**输出完全不同**（cosim ~0.30，远低于 llmexport ONNX AE vs MNN AE 的 0.998），且时间维度 subsampling ratio 不同（MNN 8× vs sherpa 6.5×）。两个 AE 不是等价的模型架构，这是 MNN 精度追不上 sherpa-onnx 的根因。
+2. **🔴→🟢 Audio Encoder 代码 bug（已更正，已修复）**：MNN `audio.mnn` 和 sherpa-onnx AE 输出 cosim ~0.30 的**真正原因**：`conv_out` 多余随机 bias（`bias=True` → 896 个随机值） + 位置编码公式错误（interleaved 应为 concat，max diff=2.0/位置）。修复后 cosim 提升至 0.993（同帧数）。这两个 bug 在之前的分析中被错误归因为"架构不等价 / Chunk/Pad/Slice 缺失"，参见下文 §更正说明。
 3. **🟢 推理精度 (FP16)**：手机端已使用 `precision: "high"` (FP32)，排除此因素。
 4. **🟢 FBank 数值差异**：kaldi-native-fbank 集成后已消除。
 5. **🟢 Sampling 参数**：ASR 已配置 greedy (temp=0, top_k=1)。
@@ -159,7 +164,39 @@ unsqueeze(1) → Conv2d×3 (k=3, s=2, p=1) → permute+reshape → conv_out
 
 **总结**：同一份模型权重 + 不同精度的导出代码路径 → 图结构不等价 → 数值不一致。不是模型本身有差异，是导出代码对原始 forward() 的复现保真度不同。
 
-### 深入追踪：远超 Pad/Slice 的维度差异（2026-06-14）
+## 🔄 更正说明（2026-06-14）：推翻"架构不等价"假设
+
+> **以下 § 根因解释 和 § 深入追踪 的原始分析已在上方"最终结论"中被更正。保留原文作为记录，但结论已被推翻。修订后内容见 [[analysis/export-pipeline-analysis#实施结果]] 和本篇 §1-2 更正事项。**
+
+### 真正根因：两个代码 bug，不是架构缺失
+
+cosim ~0.30 的唯一原因是 `qwen3_asr_model.py` 中的两个实现错误（已修复，见 [[analysis/export-pipeline-analysis#实施结果]]）：
+
+| Bug | 位置 | 影响 |
+|-----|------|------|
+| `conv_out` 多余 random bias | `qwen3_asr_model.py:220` | 896 个随机浮点值，每次加载结果不同 |
+| 位置编码 interleaved（应为 concat） | `qwen3_asr_model.py:231-241` | 每个位置 max diff = 2.0，所有 Transformer 层语义扭曲 |
+
+**修复后验证数据**：
+
+| 指标 | 修复前 | 修复后 |
+|------|:------:|:------:|
+| MNN audio.mnn vs Wasser1462 (同帧数 T=100) | cosim 0.30 | **cosim 0.993** |
+| PyTorch vs ONNX (max diff) | 未测 | **2.36e-6** |
+| 帧数 (T=500) | 53 | 63 |
+
+### 为什么 Chunk/Pad/Slice/Window 不是原因
+
+原分析认为"缺少 Chunk/Pad/Slice"导致架构差异。实际上：
+
+1. **官方代码的 Chunk 是内存优化**，不是精度优化。单 chunk 内 conv 计算与全序列连续 conv 结果相同。
+2. **ONNX trace 不了 Chunk/Pad/Slice**（`torch.split`、`pad_sequence`、boolean mask 索引都是动态 op），Wasser1462 拆成双模型正是为了规避此限制。
+3. **短音频（≤30s）简化版等价于完整版**：全序列在单窗口内（≤800 enc 帧），无需分窗。
+4. 原分析中将帧数差异（65 vs 53）归因于架构。实际帧数差异来自 chunk 边界的边界效应，且修复 bug 后帧数已接近（63 vs 65 at T=500）。
+
+### 原始分析（2026-06-14，已被更正 —— 保留作为记录）
+
+
 
 尝试仅通过 Pad 对齐帧数后，cosim 仍然只有 ~0.38。进一步分析发现 sherpa conv_frontend 的 ONNX 图远比预期复杂（共 130 个节点），包含：
 

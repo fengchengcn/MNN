@@ -282,6 +282,15 @@ new_model = {
 - `embed(input_ids, ...)`: 将音频嵌入替换到输入中
 - `export(onnx_path)`: 导出 ONNX
 
+> **🚨 音频编码器的 ONNX 导出陷阱**：部分音频编码器（如 Qwen3-ASR）的 HF forward() 包含不可 trace 的动态操作（`torch.split`、`nn.utils.rnn.pad_sequence`、boolean mask 索引 `tensor[mask]`、动态 for-loop 生成 `cu_seqlens`）。这些操作在 `torch.onnx.export()` 中会失败或产生错误的图。
+>
+> **简化策略**：对于短音频（≤30s，≤3000 mel 帧），可以使用简化 forward：
+> - 跳过 Chunking → 直接 Conv2d×3 作用于全序列（卷积是局部的，无 padding 影响）
+> - 跳过 Windowing → 使用全序列 attention（短音频不超过单窗口 `n_window_infer` 覆盖范围）
+> - 结果与完整 chunked forward 等价
+>
+> **但如果必须支持长音频**（如 >30s），则需要考虑双模型拆分（参考 Wasser1462 的 conv_frontend + encoder 策略），或实现 ONNX 友好的 chunking（使用固定大小切片 + `torch.cat`）。
+
 ### 5.3.4 音频模型测试
 
 ```bash

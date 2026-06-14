@@ -471,3 +471,39 @@ elif model_type == 'lfm2_audio':
 - 非标准加载的模型**权重路径可能不同**于标准 HF 模型，需要通过 `print(original_model)` 或 `state_dict().keys()` 确认实际路径
 - 嵌套的 config 结构可能需要在 `config.py` 的 `from_pretrained` 中手动提取子配置
 - 某些包的注意力实现默认使用 `flash_attention_2`，CPU 上需要手动切换为 `sdpa` 或 `eager`
+
+---
+
+## 15. Qwen3-ASR 类模型的嵌套 config 陷阱
+
+### 问题描述
+
+Qwen3-ASR 的 `config.json` 使用三层嵌套结构（`thinker_config.text_config` + `thinker_config.audio_config`），而标准 HF 模型的 config 最多只有两层嵌套（如 `text_config` / `vision_config`）。
+
+```
+config.json:
+├── thinker_config
+│   ├── text_config      ← hidden_size, num_attention_heads 等
+│   └── audio_config     ← n_window, d_model, output_dim 等
+├── model_type: "qwen3_asr"
+└── ...
+```
+
+model_mapper 中的 config 映射需要穿透三层：
+```python
+config = {
+    'hidden_size': 'thinker_config.text_config.hidden_size',  # 三层！
+    'audio_type': 'thinker_config.text_config.attention_type',
+}
+```
+
+同时，权重 key 前缀为 `thinker.`：
+```
+thinker.lm_head.weight
+thinker.model.layers.0.self_attn.q_proj.weight
+thinker.audio_tower.conv2d1.weight
+```
+
+### 解决方案
+
+在 `model.py` 的 `from_pretrained` 中添加特殊加载分支，使用自定义的 `load_qwen3_asr()` 直接从 safetensors 加载并组装自定义模型类。model_mapper 中的 config 映射使用完整的 `thinker_config.text_config.` 前缀。

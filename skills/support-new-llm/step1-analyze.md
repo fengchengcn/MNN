@@ -224,6 +224,8 @@ ls <transformers_path>/models/<model_name>/
 
 > **如果 transformers 库中没有该模型的源码**（比如是 trust_remote_code 模型），则在模型目录中查找 `modeling_*.py`。
 
+> **🚨 如果模型仓库（HF/ModelScope）只有 config.json + 权重，没有 modeling_*.py**：不要直接从权重反推模型结构！先搜索项目是否有独立的官方代码仓库。例如 Qwen3-ASR 的权重在 `Qwen/Qwen3-ASR-0.6B`（无代码），但官方 modeling 代码在 `github.com/QwenLM/Qwen3-ASR`。从权重反推必然遗漏关键逻辑（chunking、windowing、特殊 mask 等），后续 debug 成本极高。
+
 ### 回答 5 个关键问题
 
 **阅读 `modeling_*.py`，逐一回答以下问题：**
