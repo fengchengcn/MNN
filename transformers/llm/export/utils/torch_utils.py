@@ -122,14 +122,14 @@ def quant(weight, quant_bit, quant_block, symmetric, awq, hqq):
         alphas.append(alpha)
     return torch.cat(q_weights), torch.cat(alphas)
 
-def onnx_export(model, inputs, onnx_model, input_names, output_names, dynamic_axes=None):
+def onnx_export(model, inputs, onnx_model, input_names, output_names, dynamic_axes=None, opset_version=15):
     export_kwargs = {
         'input_names': input_names,
         'output_names': output_names,
         'dynamic_axes': dynamic_axes,
         'do_constant_folding': True,
         'verbose': False,
-        'opset_version': 15
+        'opset_version': opset_version
     }
 
     # Disable torch dynamo for ONNX export in PyTorch >= 2.4.0

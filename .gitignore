@@ -29,3 +29,15 @@ project/android/.gradle/
 
 # ── Export ──
 transformers/llm/export/.export.log
+
+# ── Export logs ──
+.export.log
+apps/Android/MnnLlmChat/.export.log
+
+# ── Python build artifacts ──
+__pycache__/
+**/__pycache__/
+*.egg-info/
+**/*.egg-info/
+pymnn/pip_package/.export.log
+pymnn_build/

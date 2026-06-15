@@ -1,5 +1,5 @@
 ---
-date: 2026-06-13
+date: 2026-06-15
 status: active
 tags: [moc, index, qwen3-asr]
 category: index
@@ -17,8 +17,8 @@ aliases: [MOC, 目录, 导航, Home]
 | 目录 | 引擎 | 量化 | 大小 | 状态 |
 |------|------|------|------|------|
 | [[Qwen3-ASR-0.6B]] | — | — | 1.8G | 原始 HF 模型 |
-| [[Qwen3-ASR-0.6B-Omni-INT8]] | Omni | INT8 | 826M | ✅ 生产部署 |
-| [[Qwen3-ASR-0.6B-Omni-FP16]] | Omni | FP16 | 1.5G | 🧪 精度测试 |
+| [[Qwen3-ASR-0.6B-Omni-INT8]] | Omni (双模型) | INT8 | 819M | ✅ 生产部署，PE 修复，长音频正常 |
+| [[Qwen3-ASR-0.6B-Omni-FP16]] | Omni (双模型) | FP16 | 1.5G | 🧪 精度测试 |
 
 ---
 
@@ -29,7 +29,9 @@ aliases: [MOC, 目录, 导航, Home]
 | [[plans/preliminary-research]] | 初步调研（2026-06-04） | ✅ completed |
 | [[plans/llmexport-migration]] | llmexport.py 迁移计划（WP1-WP6） | ✅ completed |
 | [[plans/omni-streaming]] | Omni 流式推理方案（Phase 1-3） | 🔄 active |
-| [[plans/sherpa-ae-mnn-integration]] | Sherpa AE MNN 集成方案（conv_frontend + encoder） | ✅ implemented |
+| [[plans/sherpa-ae-mnn-integration]] | Sherpa AE MNN 集成方案（MNNConvert 转换第三方 ONNX → MNN） | 🗄️ superseded（已被 llmexport.py 自控替代） |
+| [[plans/replicate-onnx-export-plan]] | **自控双模型导出**（llmexport.py → conv_frontend.mnn + encoder.mnn） | ✅ completed |
+| [[plans/dual-model-export-plan]] | Fold-into-Batch 双模型方案（需 C++ 改动） | 🗄️ superseded（被照抄 ONNX 方案替代） |
 | [[plans/progress]] | 项目总进度 & 里程碑 & 踩坑记录 | 🔄 active |
 
 ---
@@ -38,12 +40,13 @@ aliases: [MOC, 目录, 导航, Home]
 
 | 文档 | 说明 | 状态 |
 |------|------|------|
-| [[analysis/root-cause-analysis]] | 识别精度根因分析 | 🔄 active |
+| [[analysis/accuracy-debugging-journey]] | **精度调试全历程**（5 层归因 + 2 次错误归因纠正） | ✅ completed |
+| [[analysis/root-cause-analysis]] | 识别精度根因分析（含 PE 模式根因） | ✅ 三根因全部定位修复 |
 | [[analysis/fbank-numerical-analysis]] | FBank 特征提取数值差异 + AEC/NS 根因分析 | 🔄 active |
 | [[analysis/android-memory]] | Android 真机内存 & GPU 实测 | ✅ completed |
 | [[analysis/memory-model]] | Omni vs 旧引擎内存模型理论分析 | ✅ completed |
 | [[analysis/omni-parameters]] | Omni 推理参数配置 & greedy 采样 | 🔄 active |
-| [[analysis/export-pipeline-analysis]] | 导出链路分析：双模型 AE vs llmexport 正道 | 🔄 active |
+| [[analysis/export-pipeline-analysis]] | 导出链路分析：从手写简化版到双模型自控 | ✅ 结论已更新（PE 根因） |
 
 ---
 
@@ -111,4 +114,6 @@ aliases: [MOC, 目录, 导航, Home]
 06-14  Step 3+4 验证通过：Express API 串联 cosim=1.0/0.997，Decoder first token 完全一致
 06-14  **双模型 AE 实机部署完成**：手机 logcat 确认端到端运行，AE 耗时 ~1.4s
 06-14  **发现官方 modeling 代码**：`github.com/QwenLM/Qwen3-ASR` 含完整 `modeling_qwen3_asr.py`，手写版漏掉 Chunk/Pad/Slice/Window。详见 [[analysis/export-pipeline-analysis]]
+06-15  **🔴 根因定位：PE 模式错误** — 训练时 PE 按 chunk 重复 0..12；双模型 encoder 连续递增。Wasser1462 encoder 通过 Mod 算子实现重复 PE
+06-15  **✅ PE 修复完成** — 长音频幻觉消失。双模型方案正式完成，llmexport.py 自控全链路。详见 [[plans/replicate-onnx-export-plan]]
 ```

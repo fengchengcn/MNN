@@ -1,14 +1,14 @@
 ---
-date: 2026-06-14
+date: 2026-06-15
 status: active
 tags: [qwen3-asr, progress, milestone, index]
 category: plan
 aliases: [项目进度, Progress, Master Index]
-related: [[llmexport-migration]], [[omni-streaming]], [[root-cause-analysis]], [[android-memory]], [[omni-parameters]], [[analysis/fbank-numerical-analysis]]
+related: [[llmexport-migration]], [[omni-streaming]], [[root-cause-analysis]], [[android-memory]], [[omni-parameters]], [[analysis/fbank-numerical-analysis]], [[replicate-onnx-export-plan]]
 ---
 # Qwen3-ASR → MNN 项目状态
 
-> 最后更新：2026-06-14 | 状态：**单模型 audio.mnn 导出完成 — llmexport.py 正道已恢复，桌面验证通过，手机验证中**
+> 最后更新：2026-06-15 | 状态：**双模型 AE 导出完成 — PE 重复模式修复，长音频幻觉已解决 ✓**
 
 ## 当前状态总览
 
@@ -19,7 +19,8 @@ Qwen3-ASR-0.6B → MNN 迁移: ✅ 完成
 ├── llmexport.py 导出 (WP1-WP6):     ✅ 完成
 ├── Android 集成 (VoiceChatPresenter): ✅ Omni 模式运行中
 ├── 流式推理 (Phase 2.6 VAD+扩展窗口): ✅ 实机验证通过
-└── 单模型 audio.mnn (llmexport.py 正道): ✅ 桌面验证通过，手机验证中  ← 2026-06-14 更新
+├── 双模型 AE (conv_frontend+encoder): ✅ 长音频幻觉已修复  ← 2026-06-15 更新
+└── 单模型 audio.mnn:                 📦 已被双模型替代
 ```
 
 ## 模型文件
@@ -37,14 +38,15 @@ Qwen3-ASR-0.6B → MNN 迁移: ✅ 完成
 
 | 文件 | 大小 | 说明 |
 |------|------|------|
-| `audio.mnn` | 337 KB | **单模型 AE**（llmexport.py 正道导出，替换了第三方双模型） |
-| `audio.mnn.weight` | 210 MB | AE 权重（INT8） |
-| `llm.mnn` + `.weight` | 494 KB + 604 MB / 1.1 GB | Decoder（INT8 / FP16），29×FusedAttention |
-| `config.json` | ~1 KB | `audio_model: "audio.mnn"`，**无** `audio_encoder`（单模型路径） |
+| `conv_frontend.mnn` | 14 KB | **双模型 conv frontend**（chunk=100, fold-into-batch） |
+| `conv_frontend.mnn.weight` | 11 MB | conv frontend 权重（INT8） |
+| `encoder.mnn` | 335 KB | **双模型 encoder**（repeating PE 0..12 per chunk） |
+| `encoder.mnn.weight` | 189 MB | encoder 权重（INT8） |
+| `llm.mnn` + `.weight` | 494 KB + 604 MB | Decoder（INT8），29×FusedAttention |
+| `config.json` | ~1 KB | `audio_model: "conv_frontend.mnn"`, `audio_encoder: "encoder.mnn"` |
 | `tokenizer.txt` / `.mtok` | ~3 MB | BPE tokenizer |
 
-> **2026-06-14 架构升级（更正后）**：`llmexport.py` 自控全链路导出的单文件 `audio.mnn` 替换了第三方 Wasser1462 的 `conv_frontend.mnn` + `encoder.mnn`。
-> 旧双模型文件（42MB + 176MB）已重命名为 `.old`，验证通过后可删除。详见 [[analysis/root-cause-analysis#更正说明]] 和 [[analysis/export-pipeline-analysis]]。
+> **2026-06-15 PE 修复**：encoder PE 从连续递增改为按 chunk 重复 0..12，与训练一致。修复了长音频（≥16s）幻觉问题。详见 [[replicate-onnx-export-plan#实施结果（2026-06-15-完成）]]
 
 ## 关键里程碑
 
@@ -73,8 +75,12 @@ Qwen3-ASR-0.6B → MNN 迁移: ✅ 完成
 | 06-14 | **单模型 audio.mnn 导出完成** — llmexport.py 导出单文件 audio.mnn (337KB) + audio.mnn.weight (210MB)，含完整的 Conv2d×3 → Transformer×18 → Project。配置：`audio_model: "audio.mnn"`，无 `audio_encoder` → 单模型路径 |
 | 06-14 | **llmconfig.hpp 默认值修复** — `audio_encoder()` 默认值 `"encoder.mnn"` → `""`，防止 config.json 无 `audio_encoder` 字段时误加载旧 encoder.mnn 走双模型路径导致 SIGSEGV |
 | 06-14 | **桌面端验证通过** — MNN audio.mnn vs Wasser1462 cosim 0.993 (T=100)，first frame cosim 0.98+。手机同步完成，待实机 ASR 测试 |
-| 06-14 | **手机实机测试** — 短音频（≤10s）识别正常；长音频（≥16s）出现语音幻觉（FP16/INT8 均复现）。根因：非分块连续 conv 与训练时分块 conv 不一致，多 chunk 时中间表示偏离训练分布。缓解：VAD 模式天然切短段 ⭕ ；根本修复需完整 Chunk/Pad/Slice 移植（ONNX 不可 trace，可能需双模型方案） |
+| 06-14 | **手机实机测试** — 短音频（≤10s）识别正常；长音频（≥16s）出现语音幻觉（FP16/INT8 均复现）。**当时猜测根因**：非分块连续 conv 与训练时分块 conv 不一致。缓解：VAD 模式天然切短段 ⭕ 。**（06-15 更正：真正根因是 PE 模式错误，见下方 06-15 条目）** |
 | 06-14 | **0.6B-FP16 + 1.7B-INT8 重新导出** — 应用 bias=False + PE concat 修复，旧文件清理 ~453 MB。三个模型目录全部更新为 llmexport.py 正道单模型 |
+| 06-15 | **🔴 根因定位：Positional Encoding 模式错误** — 训练时 PE 按 chunk 重复 0..12；双模型 encoder 连续递增 0..seq_len-1。长音频 PE 外推 15×+ → 注意力崩溃 → 幻觉。Wasser1462 encoder ONNX 通过 Mod 算子实现重复 PE |
+| 06-15 | **A/B 测试确认** — 逐层替换 Wasser1462 ONNX 文件，定位问题在 encoder PE（非 conv_frontend）。完整 Wasser1462 双模型通过长音频测试，排除 decoder/C++ 路径问题 |
+| 06-15 | **PE 修复 + chunk_size=100 + 无 ghost frame Slice** — encoder.forward() 改为 `repeat(PE[0:13], N)[:seq_len]`，完美复刻训练时的按 chunk 重置 PE 模式。chunk_size 确认 100（非 500），保留 partial chunk 全量输出帧 |
+| 06-15 | **✅ 长音频修复验证通过** — 手机实机测试，≥16s 长音频识别正常，幻觉消失。双模型方案正式完成。详见 [[replicate-onnx-export-plan]] |
 
 ### 12. AEC + NoiseSuppressor 是精度最大杀手（2026-06-14，🔴 P0）
 
@@ -193,7 +199,10 @@ C++ 引擎: whisper_fbank_knf() — kaldi-native-fbank，preemphasis=0.97, HTK m
 > Silero VAD 已取代早期 Phase 2.5 的 RMS 能量 VAD。Silero VAD 是 LSTM 模型（V4/V5），
 > 通过 `silero_vad_jni.cpp` → `Vad.kt` 集成，提供比 RMS 门限更准确的语音活动检测。
 
-## Sherpa AE 双模型集成（2026-06-14，🔴 P0 完成）
+## Sherpa AE 双模型集成（2026-06-14 部署，2026-06-15 llmexport.py 自控替代）
+
+> **更新 2026-06-15**：Wasser1462 ONNX 文件（conv_frontend.onnx + encoder.int8.onnx）仅用于调试对照，
+> 正式部署使用 llmexport.py 自控导出的双模型。PE 修复后自研模型与 Wasser1462 精度一致。
 
 ### 架构
 

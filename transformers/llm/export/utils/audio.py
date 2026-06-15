@@ -456,20 +456,24 @@ class Qwen3AsrAudio(Audio):
         self.quant_bit = 8  # default: INT8, will be overridden by export_audio() if args.quant_bit >= 16
 
     def load(self):
-        self.encoder = self.audio.float()
+        from .qwen3_asr_model import split_audio_encoder
+        import os
+        self.ae_frontend, self.ae_encoder = split_audio_encoder(self.audio)
         self.llm_config['is_audio'] = True
         self.llm_config['audio_type'] = 'qwen3_asr'
         self.llm_config['audio_pad'] = self.audio_pad_id
         self.llm_config['audio_start'] = 151669
         self.llm_config['audio_end'] = 151670
         self.llm_config['attn_scale'] = 0.08838834764831845  # 1/sqrt(128)
-        # Window/chunk config (for future chunking support; simplified forward path uses full-sequence)
-        self.n_window = getattr(self.encoder, 'n_window', 50)
-        self.n_window_infer = getattr(self.encoder, 'n_window_infer', 800)
-        self.conv_chunksize = getattr(self.encoder, 'conv_chunksize', 500)
 
     def forward(self, input_features):
-        return self.encoder(input_features)
+        # input_features: [B, 128, T]  freq-major (whisper_fbank output)
+        # → Permute to [B, T, 128] for conv_frontend
+        x = input_features.permute(0, 2, 1)               # [B, T, 128]
+        x = self.ae_frontend(x)                            # [B, T', 896]
+        mask = torch.ones(1, x.size(1), device=x.device)   # [1, T']
+        x = self.ae_encoder(x, mask)                       # [B, T', 1024]
+        return x
 
     def audio_process(self, audio_obj):
         import numpy as np
@@ -526,26 +530,55 @@ class Qwen3AsrAudio(Audio):
 
     @spinner_run(f'export audio to ')
     def export(self, onnx_path):
-        class AudioExport(torch.nn.Module):
-            def __init__(self, encoder):
-                super().__init__()
-                self.encoder = encoder
-
-            def forward(self, input_features):
-                return self.encoder(input_features)
-
-        model = AudioExport(self.encoder).float().eval()
-        input_features = torch.randn((1, self.feature_size, 200))
-        onnx_model = f'{onnx_path}/audio.onnx'
-        onnx_export(model, (input_features,),
-                    onnx_model,
+        import os
+        # ── Export conv_frontend.onnx ──
+        frontend = self.ae_frontend.float().eval()
+        # T=800 > chunk_size ensures fold-into-batch multi-chunk path is traced
+        dummy_frontend = torch.randn(1, 800, 128)
+        conv_onnx = os.path.join(onnx_path, "conv_frontend.onnx")
+        onnx_export(frontend, dummy_frontend,
+                    conv_onnx,
                     input_names=['input_features'],
-                    output_names=['audio_embeds'],
+                    output_names=['conv_output'],
                     dynamic_axes={
-                        "input_features": {0: "batch", 2: "time"},
-                        "audio_embeds": {0: "batch", 1: "enc_time"}
-                    })
-        return onnx_model
+                        "input_features": {0: "batch", 1: "n_frames"},
+                        "conv_output": {0: "batch", 1: "n_audio_tokens"},
+                    },
+                    opset_version=17)
+
+        # Verify frame count (Wasser1462 formula: ceil(T/chunk) * fff(chunk))
+        chunk = frontend.chunk_size
+        for T_test in [50, 100, 120, 200, 350, 500, 800, 1600]:
+            with torch.no_grad():
+                out = frontend(torch.randn(1, T_test, 128))
+                N = (T_test + chunk - 1) // chunk  # ceil division
+                T_out_chunk = frontend._get_feat_extract_output_lengths(chunk)
+                expected = N * T_out_chunk
+                actual = out.shape[1]
+                if actual != expected:
+                    raise ValueError(
+                        f"conv_frontend frame count mismatch: T={T_test}, "
+                        f"expected {expected}, got {actual}"
+                    )
+
+        # ── Export encoder.onnx ──
+        encoder = self.ae_encoder.float().eval()
+        # Use a representative sequence length for the encoder (T' ≈ 100 frames)
+        dummy_feat = torch.randn(1, 101, 896)
+        dummy_mask = torch.ones(1, 101)
+        enc_onnx = os.path.join(onnx_path, "encoder.onnx")
+        onnx_export(encoder, (dummy_feat, dummy_mask),
+                    enc_onnx,
+                    input_names=['input_features', 'feature_attention_mask'],
+                    output_names=['audio_features'],
+                    dynamic_axes={
+                        "input_features": {0: "batch", 1: "n_audio_tokens"},
+                        "feature_attention_mask": {0: "batch", 1: "n_audio_tokens"},
+                        "audio_features": {0: "batch", 1: "n_audio_tokens"},
+                    },
+                    opset_version=17)
+
+        return [conv_onnx, enc_onnx]
 
 
 class Gemma4AudioExportModel(torch.nn.Module):

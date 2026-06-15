@@ -1,15 +1,17 @@
 ---
 date: 2026-06-14
-status: implemented
+status: superseded
 tags: [qwen3-asr, plan, sherpa-onnx, mnnconvert, omni-engine, audio-encoder]
 category: plan
 aliases: [Sherpa AE 集成方案, MNNConvert 替换 AE]
-related: [[root-cause-analysis]], [[fbank-numerical-analysis]], [[progress]]
+related: [[root-cause-analysis]], [[fbank-numerical-analysis]], [[progress]], [[replicate-onnx-export-plan]]
 ---
 
 # Sherpa-ONNX AE → MNN 集成方案
 
 > 目标：用 MNNConvert 转换 sherpa-onnx 的 conv_frontend.onnx + encoder.int8.onnx 替换 llmexport.py 手写 forward() 导出的 audio.mnn，使 MNN AE 与 sherpa-onnx **完全架构等价**。
+>
+> **状态更新（2026-06-15）**：此方案曾成功部署（MNNConvert 转换 Wasser1462 ONNX → MNN 双模型），是早期快速验证和生产过渡的关键步骤。现已**被 llmexport.py 自控双模型导出替代**（[[replicate-onnx-export-plan]]），不再依赖第三方 ONNX 文件。Wasser1462 ONNX 文件仅保留用于调试对照。
 
 ## 背景
 

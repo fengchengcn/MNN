@@ -39,6 +39,7 @@ Architecture:
       └── proj2    — Linear(d_model, hidden_size)
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -154,7 +155,7 @@ class AudioEncoderLayer(nn.Module):
         self.fc1 = nn.Linear(d_model, ffn, bias=True)
         self.fc2 = nn.Linear(ffn, d_model, bias=True)
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         # Pre-LN self-attention with multi-head
         residual = x
         x = self.self_attn_layer_norm(x)
@@ -163,7 +164,13 @@ class AudioEncoderLayer(nn.Module):
         q = self.self_attn_q_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.self_attn_k_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.self_attn_v_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
-        attn_out = F.scaled_dot_product_attention(q, k, v)
+
+        if attention_mask is not None:
+            attn_bias = (1.0 - attention_mask) * -10000.0
+            attn_bias = attn_bias.unsqueeze(1).unsqueeze(2)
+            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+        else:
+            attn_out = F.scaled_dot_product_attention(q, k, v)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, D)
         attn_out = self.self_attn_out_proj(attn_out)
         x = residual + attn_out
@@ -240,18 +247,17 @@ class AudioEncoder(nn.Module):
 
     @staticmethod
     def _create_sinusoidal_positions(max_len, dim):
-        """Create sinusoidal position embeddings (Whisper-style concatenation).
+        """Whisper-style sinusoidal PE: [all_sins | all_cosines].
 
-        Official formula: cat([sin(scaled_time), cos(scaled_time)], dim=-1)
-        Groups all sines in the first half, all cosines in the second half.
-        NOT interleaved (sin,cos,sin,cos...).
+        Uses Whisper's frequency formula: log_inc = ln(10000) / (dim/2 - 1).
+        Verified against Wasser1462 encoder.int8.onnx PE table (cosim 1.0).
         """
         if dim % 2 != 0:
             raise ValueError(f"Sinusoidal position embedding requires even dim, got {dim}")
-        log_timescale_increment = torch.log(torch.tensor(10000.0)) / (dim // 2 - 1)
-        inv_timescales = torch.exp(-log_timescale_increment * torch.arange(dim // 2, dtype=torch.float))
-        scaled_time = torch.arange(max_len, dtype=torch.float).unsqueeze(1) * inv_timescales.unsqueeze(0)
-        pe = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
+        log_inc = math.log(10000.0) / (dim // 2 - 1)
+        inv = torch.exp(-log_inc * torch.arange(dim // 2, dtype=torch.float))
+        scaled = torch.arange(max_len, dtype=torch.float).unsqueeze(1) * inv.unsqueeze(0)
+        pe = torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1)
         return pe
 
     def forward(self, input_features):
@@ -302,6 +308,222 @@ class AudioEncoder(nn.Module):
         self.proj1.bias.data.copy_(state_dict[f"{prefix}.proj1.bias"])
         self.proj2.weight.data.copy_(state_dict[f"{prefix}.proj2.weight"])
         self.proj2.bias.data.copy_(state_dict[f"{prefix}.proj2.bias"])
+
+
+# ---------------------------------------------------------------------------
+# Dual-model components: Qwen3ASRConvFrontend + Qwen3ASREncoder
+#
+# Replicates the same I/O signatures as the verified Wasser1462 ONNX models:
+#   conv_frontend.onnx:  [B, T, 128] → fold-into-batch → [B, T_valid, 896]
+#   encoder.int8.onnx:   ([B, T_valid, 896], [B, T_valid]) → [B, T_valid, 1024]
+# ---------------------------------------------------------------------------
+
+class Qwen3ASRConvFrontend(nn.Module):
+    """Fold-into-batch conv frontend matching Wasser1462 conv_frontend.onnx.
+
+    Input:  [B, T, 128]     time-major mel features
+    Output: [B, T_valid, 896]  all valid frames (pad/slice handled internally)
+
+    Key design:
+    - Dynamic padding to multiple of chunk_size via torch.cat (no .item() calls)
+    - Fold-into-Batch for parallel conv across chunks
+    - Internal Slice to remove ghost frames from partial last chunk
+    - conv_out (bias=False) applied after unfold
+    """
+
+    def __init__(self, chunk_size=100, conv_hidden=480, d_model=896):
+        super().__init__()
+        self.chunk_size = chunk_size
+        self.d_model = d_model
+        self.conv_hidden = conv_hidden
+
+        # Conv2d×3: k=3, s=2, p=1 (same as official & Wasser1462)
+        self.conv1 = nn.Conv2d(1, conv_hidden, 3, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(conv_hidden, conv_hidden, 3, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(conv_hidden, conv_hidden, 3, stride=2, padding=1)
+
+        # Linear projection: 7680 → d_model (bias=False — critical!)
+        self.conv_out = nn.Linear(conv_hidden * 16, d_model, bias=False)
+
+    @staticmethod
+    def _get_feat_extract_output_lengths(input_lengths):
+        """Official formula per stride-2 conv layer: L_out = (L-1)//2 + 1."""
+        for _ in range(3):
+            input_lengths = (input_lengths - 1) // 2 + 1
+        return input_lengths
+
+    def load_weights_from_audio_encoder(self, audio_encoder):
+        self.conv1.weight.data.copy_(audio_encoder.conv2d1.weight.data)
+        self.conv1.bias.data.copy_(audio_encoder.conv2d1.bias.data)
+        self.conv2.weight.data.copy_(audio_encoder.conv2d2.weight.data)
+        self.conv2.bias.data.copy_(audio_encoder.conv2d2.bias.data)
+        self.conv3.weight.data.copy_(audio_encoder.conv2d3.weight.data)
+        self.conv3.bias.data.copy_(audio_encoder.conv2d3.bias.data)
+        self.conv_out.weight.data.copy_(audio_encoder.conv_out.weight.data)
+
+    def forward(self, x):
+        # x: [B, T, 128]  time-major
+        B, T, C = x.shape
+        chunk = self.chunk_size
+
+        # ── Step 1: Dynamic pad to multiple of chunk_size ──
+        # pad_len = (chunk - T % chunk) % chunk  (kept as int / symbolic)
+        pad_len = (chunk - T % chunk) % chunk
+
+        # Use concat with zeros for dynamic padding (F.pad breaks with Tensor args)
+        # For ONNX export with dynamic T: use expand fallback if torch.zeros fails
+        try:
+            zeros = torch.zeros(B, pad_len, C, dtype=x.dtype, device=x.device)
+        except (TypeError, RuntimeError):
+            zeros = torch.zeros(1, 1, C, dtype=x.dtype, device=x.device).expand(B, pad_len, C)
+        x = torch.cat([x, zeros], dim=1)  # [B, T_pad, 128]
+        T_pad = T + pad_len
+
+        # ── Step 2: Fold-into-Batch ──
+        N = T_pad // chunk  # number of chunks (int / symbolic)
+        # [B, N*chunk, 128] → [B, N, chunk, 128]
+        x = x.reshape(B, N, chunk, C)
+        # → [B, N, 128, chunk] → [B*N, 1, 128, chunk]  (Conv2d expects NCHW)
+        x = x.permute(0, 1, 3, 2)               # [B, N, 128, chunk]
+        x = x.reshape(B * N, 1, C, chunk)       # [B*N, 1, 128, chunk]
+
+        # ── Step 3: Conv2d×3 (parallel across all chunks) ──
+        x = F.gelu(self.conv1(x))   # [B*N, 480, 64, T_chunk_1]
+        x = F.gelu(self.conv2(x))   # [B*N, 480, 32, T_chunk_2]
+        x = F.gelu(self.conv3(x))   # [B*N, 480, 16, T_out_chunk]
+
+        _, H_conv, H_freq, T_out_chunk = x.shape
+        # H_conv=480, H_freq=16, T_out_chunk=f³(chunk)
+
+        # ── Step 4: Unfold ──
+        # [B*N, 480, 16, T_out] → [B, N, 480, 16, T_out]
+        x = x.reshape(B, N, H_conv, H_freq, T_out_chunk)
+        # → [B, 480, 16, N, T_out] → [B, 7680, N * T_out]
+        x = x.permute(0, 2, 3, 1, 4)             # [B, 480, 16, N, T_out_chunk]
+        x = x.reshape(B, H_conv * H_freq, N * T_out_chunk)  # [B, 7680, enc_T_padded]
+        x = x.permute(0, 2, 1)                    # [B, enc_T_padded, 7680]
+
+        # ── Step 5: Linear projection (Wasser1462: no partial-chunk ghost frame removal) ──
+        # The model was trained with chunk_size=100 fold-into-batch, which retains all
+        # N * T_out_chunk frames including those from zero-padded partial chunks.
+        # Removing ghost frames (Slice) would deviate from training distribution.
+        x = self.conv_out(x)  # [B, N * T_out_chunk, d_model=896]
+
+        return x
+
+
+class Qwen3ASREncoder(nn.Module):
+    """Transformer encoder matching Wasser1462 encoder.int8.onnx.
+
+    Input 1: input_features       [B, n_audio_tokens, 896]
+    Input 2: feature_attention_mask [B, n_audio_tokens]  (1=valid, 0=padding)
+    Output:  audio_features [B, n_audio_tokens, 1024]
+
+    Uses Whisper-style concat PE (pre-computed buffer, sliced at runtime).
+    attention_mask is passed through to all transformer layers.
+    """
+
+    def __init__(self, d_model=896, n_layers=18, n_heads=14,
+                 ffn_dim=3584, output_dim=1024, max_pe_len=5000,
+                 chunk_output_len=13):
+        """chunk_output_len: conv output frames per chunk (fff(chunk_size)=13 for chunk=100).
+        PE repeats positions 0..chunk_output_len-1 for each chunk, matching training."""
+        super().__init__()
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.n_heads = n_heads
+        self.max_pe_len = max_pe_len
+        self.chunk_output_len = chunk_output_len
+        pe = self._create_sinusoidal_positions(max_pe_len, d_model)
+        self.register_buffer("positional_embedding", pe, persistent=False)
+        self.encoder_layers = nn.ModuleList([
+            AudioEncoderLayer(d_model, n_heads, ffn_dim)
+            for _ in range(n_layers)
+        ])
+        self.ln_post = nn.LayerNorm(d_model)
+        self.proj1 = nn.Linear(d_model, d_model, bias=True)
+        self.proj2 = nn.Linear(d_model, output_dim, bias=True)
+
+    @staticmethod
+    def _create_sinusoidal_positions(max_len, dim):
+        """Whisper-style: [all_sins | all_cosines] with log_inc = ln(10000)/(dim/2-1).
+
+        Verified against Wasser1462 encoder.int8.onnx PE table (cosim 1.0).
+        """
+        if dim % 2 != 0:
+            raise ValueError(f"Sinusoidal PE requires even dim, got {dim}")
+        log_inc = math.log(10000.0) / (dim // 2 - 1)
+        inv = torch.exp(-log_inc * torch.arange(dim // 2, dtype=torch.float))
+        scaled = torch.arange(max_len, dtype=torch.float).unsqueeze(1) * inv.unsqueeze(0)
+        pe = torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=1)
+        return pe
+
+    def load_weights_from_audio_encoder(self, audio_encoder):
+        """Copy transformer/projection weights. PE is generated independently (do not copy)."""
+        if len(self.encoder_layers) != len(audio_encoder.layers):
+            raise ValueError(f"Layer count mismatch: {len(self.encoder_layers)} vs {len(audio_encoder.layers)}")
+        for i, (d, s) in enumerate(zip(self.encoder_layers, audio_encoder.layers)):
+            d.self_attn_layer_norm.weight.data.copy_(s.self_attn_layer_norm.weight.data)
+            d.self_attn_layer_norm.bias.data.copy_(s.self_attn_layer_norm.bias.data)
+            d.final_layer_norm.weight.data.copy_(s.final_layer_norm.weight.data)
+            d.final_layer_norm.bias.data.copy_(s.final_layer_norm.bias.data)
+            for p in ['q_proj', 'k_proj', 'v_proj', 'out_proj']:
+                getattr(d, f'self_attn_{p}').weight.data.copy_(getattr(s, f'self_attn_{p}').weight.data)
+                getattr(d, f'self_attn_{p}').bias.data.copy_(getattr(s, f'self_attn_{p}').bias.data)
+            d.fc1.weight.data.copy_(s.fc1.weight.data)
+            d.fc1.bias.data.copy_(s.fc1.bias.data)
+            d.fc2.weight.data.copy_(s.fc2.weight.data)
+            d.fc2.bias.data.copy_(s.fc2.bias.data)
+        self.ln_post.weight.data.copy_(audio_encoder.ln_post.weight.data)
+        self.ln_post.bias.data.copy_(audio_encoder.ln_post.bias.data)
+        self.proj1.weight.data.copy_(audio_encoder.proj1.weight.data)
+        self.proj1.bias.data.copy_(audio_encoder.proj1.bias.data)
+        self.proj2.weight.data.copy_(audio_encoder.proj2.weight.data)
+        self.proj2.bias.data.copy_(audio_encoder.proj2.bias.data)
+        # PE is NOT copied — Qwen3ASREncoder generates its own Whisper-concat PE
+
+    def forward(self, input_features, attention_mask=None):
+        seq_len = input_features.size(1)
+        # Per-chunk repeating PE (matching training: PE resets to 0..12 for each chunk)
+        # seq_len is always N * chunk_output_len (e.g. N * 13 for chunk_size=100)
+        pe_chunk = self.positional_embedding[:self.chunk_output_len]  # [chunk_out, d_model]
+        n_repeats = (seq_len + self.chunk_output_len - 1) // self.chunk_output_len
+        pe = pe_chunk.repeat(n_repeats, 1)[:seq_len]  # [seq_len, d_model]
+        x = input_features + pe.unsqueeze(0)
+        for layer in self.encoder_layers:
+            x = layer(x, attention_mask)
+        x = self.ln_post(x)
+        x = F.gelu(self.proj1(x))
+        x = self.proj2(x)
+        return x
+
+
+def split_audio_encoder(audio_encoder, chunk_size=100):
+    """Split AudioEncoder into (Qwen3ASRConvFrontend, Qwen3ASREncoder).
+
+    The frontend uses fold-into-batch (matching Wasser1462 conv_frontend.onnx).
+    The encoder generates its own Whisper-concat PE (matching Wasser1462 encoder.int8.onnx).
+
+    chunk_size=100 matches Wasser1462 ONNX behavior: ceil(T/100) * fff(100) output frames.
+    """
+    frontend = Qwen3ASRConvFrontend(
+        chunk_size=chunk_size,
+        conv_hidden=audio_encoder.conv_hidden,
+        d_model=audio_encoder.d_model,
+    )
+    frontend.load_weights_from_audio_encoder(audio_encoder)
+    chunk_output_len = Qwen3ASRConvFrontend._get_feat_extract_output_lengths(chunk_size)
+    encoder = Qwen3ASREncoder(
+        d_model=audio_encoder.d_model,
+        n_layers=audio_encoder.n_layers,
+        n_heads=audio_encoder.n_heads,
+        ffn_dim=audio_encoder.ffn,
+        output_dim=audio_encoder.proj2.out_features,
+        max_pe_len=audio_encoder.embed_positions.shape[0],
+        chunk_output_len=chunk_output_len,
+    )
+    encoder.load_weights_from_audio_encoder(audio_encoder)
+    return frontend, encoder
 
 
 # ---------------------------------------------------------------------------

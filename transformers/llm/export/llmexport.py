@@ -367,7 +367,8 @@ class LlmExporter(torch.nn.Module):
                 config.update({
                     'is_audio': True,
                     'audio_type': 'qwen3_asr',
-                    'audio_model': 'audio.mnn',
+                    'audio_model': 'conv_frontend.mnn',
+                    'audio_encoder': 'encoder.mnn',
                     'audio_pad': 151676,
                     'audio_start': 151669,
                     'audio_end': 151670,
@@ -662,8 +663,14 @@ class LlmExporter(torch.nn.Module):
         # encoder-only Transformer), which would create incompatible fused ops.
         # The old export path (export_qwen3_asr.py) also omits --transformerFuse.
         audio_quant = self.args.quant_bit if self.args.quant_bit >= 16 else max(8, self.args.quant_bit)
-        if self.mnn_converter: self.mnn_converter.export(audio_onnx, audio_quant,
-                                                          transformer_fuse=False)
+        if self.mnn_converter:
+            if isinstance(audio_onnx, (list, tuple)):
+                for onnx_file in audio_onnx:
+                    self.mnn_converter.export(onnx_file, audio_quant,
+                                              transformer_fuse=False)
+            else:
+                self.mnn_converter.export(audio_onnx, audio_quant,
+                                          transformer_fuse=False)
 
     def export_talker(self):
         if self.talker is None:

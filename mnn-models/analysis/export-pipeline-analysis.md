@@ -1,10 +1,10 @@
 ---
-date: 2026-06-14
+date: 2026-06-15
 status: active
 tags: [qwen3-asr, analysis, export, modeling, pipeline]
 category: analysis
 aliases: [导出链路分析, Export Pipeline Analysis]
-related: [[root-cause-analysis]], [[sherpa-ae-mnn-integration]], [[progress]]
+related: [[root-cause-analysis]], [[sherpa-ae-mnn-integration]], [[progress]], [[plans/replicate-onnx-export-plan]]
 ---
 
 # Qwen3-ASR 导出链路分析
@@ -112,9 +112,9 @@ Qwen 官方权重 + modeling 代码
 
 **实际修复**（2 个 bug + 配置适配），详见上方 § 实施结果。
 
-### 实施结果（2026-06-14）
+### 实施结果（2026-06-14，已被 06-15 双模型方案替代）
 
-**采用简化方案**：保持简化 forward（无 chunking），原因如下：
+**采用简化方案**（06-14 过渡方案，已被 06-15 双模型方案替代）：
 - Chunk/Pad/Slice/Window 是官方代码的**长音频内存优化**，非精度要求
 - 短音频（≤30s=3000 mel→~375 enc frames）不超单窗口（n_window_infer=800），**全序列连续 conv + full bidirectional attention 与分窗版数学等价**
 - 完整 Chunk/Pad/Slice/Window 逻辑包含 `torch.split`、`pad_sequence`、boolean mask 索引等不可 trace 操作，ONNX 导出会失败
@@ -152,18 +152,23 @@ Qwen 官方权重 + modeling 代码
 - T=100 时帧数相同 → cosim 0.993 确认权重和计算完全对齐
 - 大 T 时低 cosim 来自帧数不对齐（旧模型 chunk boundary 效应导致多出 ~4% 帧），非权重差异
 
+### 2026-06-15 更新：PE 模式根因定位与修复
+
+上述"简化方案"和"双模型照抄 ONNX"两种方案在手机实测中结果一致：短句准确，长句（≥16s）幻觉高。经过系统排查，定位到**真正的根因是 Positional Encoding 模式与训练不一致**，而非 conv chunking 差异。
+
+**根因**：官方训练时 PE 按 chunk 重置为 0..12（每 100 mel 帧 → 13 enc 帧），而我们两种方案的 encoder 都使用连续递增 PE（0..seq_len-1）。详见 [[plans/replicate-onnx-export-plan#实施结果（2026-06-15-完成）]]。
+
+**修复**：encoder PE 改为 `repeat(PE[0:13], N)[:seq_len]`，完美复刻训练时的按 chunk 重置 PE 模式。修复后手机实测长音频幻觉消失。
+
+修复后的最终方案是**双模型 llmexport.py 自控导出**（`conv_frontend.mnn` + `encoder.mnn`），替代了此前的简化单模型方案和第三方 Wasser1462 ONNX。详见 [[plans/replicate-onnx-export-plan]]。
+
 **已知限制**：
 
 | 限制 | 详情 | 影响 |
 |------|------|------|
-| **长音频识别退化** | 手机实测：≥16s 音频出现语音幻觉（FP16/INT8 均有）。7s 以内识别正常。 | 中等 |
-| 非分块 conv 与训练时不一致 | 模型训练时对每 100 mel 帧分块独立 conv，各 chunk 边界有 zero-padding artifact。简化版全序列连续 conv 无此 artifact → 多 chunk 时中间表示偏离训练分布 | — |
-| 旧 so fallback 误加载 | `llmconfig.hpp` 旧默认值 `"encoder.mnn"` 已修复为 `""`。需清理手机上残留旧文件 | 已修复 |
+| **Windowed attention 未实现** | 官方训练使用 104 帧分窗注意力（n_window_infer=800），当前使用全序列双向注意力。PE 修复已大幅改善长音频，windowed attention 作为后续可选优化 | 低 |
 | >30s 超长音频 | 超出 n_window_infer=800 单窗口上限，需分窗 | ASR 不现实 |
-
-**缓解措施**：VAD 模式天然将音频切分为短段（每段 <5s），绕过长音频退化问题。BATCH 模式建议限制在 10s 以内。
-
-**根本解决**：需移植完整 Chunk/Pad/Slice 逻辑（`torch.split` + `pad_sequence` + boolean mask），但这些 op 无法被 `torch.onnx.export()` 追踪。可能需要拆为双模型（conv_frontend 含 chunk 逻辑 + encoder），类似 Wasser1462 的方案。这将在后续迭代中评估。
+| 旧 so fallback 误加载 | `llmconfig.hpp` 旧默认值 `"encoder.mnn"` 已修复为 `""`。需清理手机上残留旧文件 | 已修复 |
 
 ### 注意事项
 

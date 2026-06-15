@@ -1,5 +1,5 @@
 ---
-date: 2026-06-13
+date: 2026-06-15
 status: active
 tags: [mnn, export, guide, model, naming]
 category: reference
@@ -109,10 +109,10 @@ python3 llmexport.py \
 
 导出完成后，输出目录应包含以下文件：
 
+### 通用文件（所有模型）
+
 ```
 ModelName-Omni-INT8/
-├── audio.mnn              # 音频 encoder 模型结构
-├── audio.mnn.weight       # 音频 encoder 权重
 ├── config.json            # 推理配置（供 App 读取）
 ├── export_args.json       # 导出参数记录（供调试用）
 ├── llm.mnn                # LLM 模型结构（含 FusedAttention，~494K）
@@ -122,11 +122,34 @@ ModelName-Omni-INT8/
 └── tokenizer.txt          # Tokenizer 文件
 ```
 
+### Qwen3-ASR 专用：双模型 Audio Encoder
+
+Qwen3-ASR 使用分离的 conv_frontend + encoder 双模型（而非单文件 audio.mnn）：
+
+```
+├── conv_frontend.mnn      # Conv 前端模型结构（14 KB，chunk=100 fold-into-batch）
+├── conv_frontend.mnn.weight  # Conv 前端权重（~11 MB @ INT8）
+├── encoder.mnn            # Encoder 模型结构（335 KB，PE 按 chunk 重复 0..12）
+├── encoder.mnn.weight     # Encoder 权重（~189 MB @ INT8）
+```
+
+**config.json 配置**：
+```json
+{
+    "audio_model": "conv_frontend.mnn",
+    "audio_encoder": "encoder.mnn"
+}
+```
+
+> **历史说明**：早期导出为单文件 `audio.mnn` + `audio.mnn.weight`，因 PE 模式与训练不一致导致长音频幻觉。2026-06-15 改为双模型方案，PE 按 chunk 重复 0..12 复刻训练行为，详见 [[analysis/root-cause-analysis]] 和 [[plans/replicate-onnx-export-plan]]。
+
 **关键检查项**:
 - ✅ `llm.mnn` 大小 ~494K（非 ~790K），说明使用了 FusedAttention
 - ✅ 存在 `llm_config.json`，且包含 `tie_embeddings` 字段
 - ✅ 不存在 `embeddings_bf16.bin`（Omni 格式 embedding 内嵌在 weight 中）
 - ✅ 不存在 `llm_kv.mnn`（Omni 格式不需要分离的 KV cache 模型）
+- ✅ **Qwen3-ASR 专用**：存在 `conv_frontend.mnn` + `encoder.mnn`（双模型），不存在 `audio.mnn`（单模型已废弃）
+- ✅ config.json 中 `audio_model: "conv_frontend.mnn"` 且 `audio_encoder: "encoder.mnn"`
 
 ---
 

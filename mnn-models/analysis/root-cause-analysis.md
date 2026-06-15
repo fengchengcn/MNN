@@ -1,10 +1,10 @@
 ---
-date: 2026-06-14
+date: 2026-06-15
 status: active
 tags: [qwen3-asr, accuracy, analysis, fbank]
 category: analysis
 aliases: [精度根因分析, Root Cause Analysis]
-related: [[fbank-numerical-analysis]], [[omni-parameters]], [[progress]]
+related: [[fbank-numerical-analysis]], [[omni-parameters]], [[progress]], [[export-pipeline-analysis]], [[accuracy-debugging-journey]]
 ---
 # Qwen3-ASR 识别精度差异分析
 
@@ -19,16 +19,17 @@ related: [[fbank-numerical-analysis]], [[omni-parameters]], [[progress]]
 > 修复后 PyTorch vs ONNX max diff = 2.36e-6，MNN vs Wasser1462 cosim = 0.993（同帧数）。
 > 之前归因于 Chunk/Pad/Slice 的分析是错误的——这些操作是官方代码的长音频内存优化，对短音频（≤30s）数学等价，不可 trace 也不是精度差异的原因。
 
-## 最终结论（2026-06-14 更新）
+## 最终结论（2026-06-15 更新）
 
 经过系统实验逐一排除后，**精度差异主因排名**：
 
 1. **🔴 AEC + NoiseSuppressor 硬件音效（影响最大，已修复）**：Android `AcousticEchoCanceler` + `NoiseSuppressor` 在 vendor DSP 上的实现在许多手机上会严重扭曲语音频谱。去掉后（与 sherpa-onnx 一致：raw MIC 直通）识别质量大幅提升。详见 [[progress]] Pitfall #12。
-2. **🔴→🟢 Audio Encoder 代码 bug（已更正，已修复）**：MNN `audio.mnn` 和 sherpa-onnx AE 输出 cosim ~0.30 的**真正原因**：`conv_out` 多余随机 bias（`bias=True` → 896 个随机值） + 位置编码公式错误（interleaved 应为 concat，max diff=2.0/位置）。修复后 cosim 提升至 0.993（同帧数）。这两个 bug 在之前的分析中被错误归因为"架构不等价 / Chunk/Pad/Slice 缺失"，参见下文 §更正说明。
-3. **🟢 推理精度 (FP16)**：手机端已使用 `precision: "high"` (FP32)，排除此因素。
-4. **🟢 FBank 数值差异**：kaldi-native-fbank 集成后已消除。
-5. **🟢 Sampling 参数**：ASR 已配置 greedy (temp=0, top_k=1)。
-6. **🟢 Audio Encoder**：桌面端对比实验已排除（见 §5）。
+2. **🔴→🟢 Audio Encoder 代码 bug（已更正，已修复）**：MNN `audio.mnn` 和 sherpa-onnx AE 输出 cosim ~0.30 的**直接原因**：`conv_out` 多余随机 bias（`bias=True` → 896 个随机值） + 位置编码公式错误（interleaved 应为 concat，max diff=2.0/位置）。修复后短序列 cosim 提升至 0.993（同帧数）。
+3. **🔴→🟢 Positional Encoding 模式错误（06-15 定位，已修复）**：训练时 PE 按 chunk 重复 0..12，我们使用连续递增 PE 0..seq_len-1。短序列外推倍数低（3×）影响小，长序列外推 15×+ → 注意力崩溃 → 幻觉。修复后长音频正常。详见 §第三根因。
+4. **🟢 推理精度 (FP16)**：手机端已使用 `precision: "high"` (FP32)，排除此因素。
+5. **🟢 FBank 数值差异**：kaldi-native-fbank 集成后已消除。
+6. **🟢 Sampling 参数**：ASR 已配置 greedy (temp=0, top_k=1)。
+7. **🟢 Audio Encoder**：桌面端对比实验已排除（见 §5）。
 
 ## 已排除的假设
 
@@ -193,6 +194,78 @@ cosim ~0.30 的唯一原因是 `qwen3_asr_model.py` 中的两个实现错误（�
 2. **ONNX trace 不了 Chunk/Pad/Slice**（`torch.split`、`pad_sequence`、boolean mask 索引都是动态 op），Wasser1462 拆成双模型正是为了规避此限制。
 3. **短音频（≤30s）简化版等价于完整版**：全序列在单窗口内（≤800 enc 帧），无需分窗。
 4. 原分析中将帧数差异（65 vs 53）归因于架构。实际帧数差异来自 chunk 边界的边界效应，且修复 bug 后帧数已接近（63 vs 65 at T=500）。
+
+## 🔴 第三根因：Positional Encoding 模式错误（2026-06-15 定位）
+
+> 修复前两个 bug（bias + PE formula）后 cosim 提升到 0.993，但手机实测长音频（≥16s）仍出现幻觉。进一步排查定位到第三个根因。
+
+### 现象
+
+两种方案（简化单模型 + 双模型照抄 ONNX）在手机实测中表现一致：
+- 短句（≤10s）：识别准确率高
+- 长句（≥16s）：语音幻觉严重
+
+### 根因
+
+官方 Qwen3-ASR 训练时的 PE 模式是**按 chunk 重复**，而非连续递增：
+
+```
+官方训练（modeling_qwen3_asr.py:712-717）：
+  mel → chunk of 100 frames → conv×3 → 13 enc frames → PE[0..12]
+  所有 chunk 独立加 PE[0..12]，PE 在每个 chunk 边界重置
+
+我们的实现（两种方案）：
+  mel → conv → T' enc frames → PE[0..T'-1]
+  PE 从 0 连续递增到 T'-1，从不重置
+```
+
+**量化影响**：
+
+| 音频时长 | enc 帧数 | 官方 PE 范围 | 我们的 PE 范围 | 外推倍数 |
+|---------|:------:|:----------:|:----------:|:------:|
+| 3s | ~38 | 0..12 × 3 | **0..37** | 3× |
+| 7s | ~88 | 0..12 × 7 | **0..87** | 7× |
+| 16s | ~200 | 0..12 × 16 | **0..199** | 15× |
+| 30s | ~375 | 0..12 × 30 | **0..374** | 29× |
+
+模型在训练期间**只见过 PE 位置 0..12**（每次 chunk 重置）。当 PE 外推到位置 199+ 时，sinusoidal PE 虽然数学上可外推，但 Transformer 的 Q·K^T 注意力权重从未在这些位置值上训练过 → 注意力图变成近乎随机噪声 → decoder 收到退化特征 → 生成幻觉文本。
+
+### 修复
+
+```python
+# 修复前（Qwen3ASREncoder.forward）：
+pe = self.positional_embedding[:seq_len, :]       # PE[0..seq_len-1] 连续递增
+x = input_features + pe
+
+# 修复后：
+N = seq_len // 13  # chunk 数量
+pe = self.positional_embedding[:13, :].repeat(N, 1)[:seq_len, :]  # PE[0..12] 重复 N 次
+x = input_features + pe
+```
+
+### 验证
+
+| 指标 | 修复前 | 修复后 |
+|------|:------:|:------:|
+| 帧数 vs Wasser1462 (T=50~1600) | 不匹配 | **100% 匹配** |
+| PyTorch vs Wasser1462 ONNX cosim | 低 | **1.000000** |
+| MNN E2E cosim @ T=1600 | — | **0.9996** |
+| 手机短句识别 | ✅ | ✅ |
+| 手机长句识别 (≥16s) | ❌ 幻觉 | ✅ **修复** |
+
+详见 [[plans/replicate-onnx-export-plan#实施结果（2026-06-15-完成）]]。
+
+### 与前面两个 bug 的关系
+
+三个根因的发现顺序和影响层级：
+
+| # | 根因 | 发现日期 | 影响 |
+|---|------|:------:|------|
+| 1 | `conv_out` random bias | 06-14 | cosim 0.30 → 修复后无改善（被 PE 掩盖） |
+| 2 | PE interleaved 公式 | 06-14 | cosim 0.30 → 0.993（同帧数时） |
+| 3 | **PE 连续递增 vs 按 chunk 重复** | 06-15 | 长音频幻觉 → 修复后消失 |
+
+Bug #1 和 #2 修复后，MNN 与 Wasser1462 的 cosim 在短序列（T=100）达到 0.993，但在实际长音频上精度仍然差。这说明 cosim 高 ≠ 端到端精度好 — **PE 模式错误在短序列上影响小（外推倍数低），在长序列上影响大（外推倍数高）**，这解释了为什么桌面端短序列 cosim 验证通过、手机长音频却出现幻觉。
 
 ### 原始分析（2026-06-14，已被更正 —— 保留作为记录）
 
