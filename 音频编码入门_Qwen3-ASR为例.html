@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Qwen3-ASR 音频编码 · 从零入门</title>
+<style>
+  /* ===== GLOBAL ===== */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    background: #0d1117; color: #e6edf3; line-height: 1.65;
+    padding: 0; overflow-x: hidden;
+  }
+  a { color: #58a6ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ::selection { background: #264f78; color: #fff; }
+
+  /* ===== HERO ===== */
+  .hero {
+    background: linear-gradient(135deg, #0d1b2a 0%, #1b2838 40%, #162033 100%);
+    padding: 60px 24px 48px; text-align: center;
+    border-bottom: 1px solid #30363d; position: relative; overflow: hidden;
+  }
+  .hero::before {
+    content: ''; position: absolute; inset: 0;
+    background: radial-gradient(ellipse 70% 60% at 50% 100%, rgba(88,166,255,.08) 0%, transparent 70%);
+    pointer-events: none;
+  }
+  .hero h1 {
+    font-size: 2.45rem; font-weight: 700;
+    background: linear-gradient(135deg, #58a6ff, #79c0ff, #58a6ff);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text; margin-bottom: 8px;
+  }
+  .hero .sub {
+    color: #8b949e; font-size: 1.05rem; max-width: 620px; margin: 0 auto 6px;
+  }
+  .hero .tag {
+    display: inline-flex; gap: 10px; flex-wrap: wrap; justify-content: center;
+    margin-top: 14px;
+  }
+  .hero .tag span {
+    background: #21262d; border: 1px solid #30363d; border-radius: 999px;
+    padding: 2px 12px; font-size: .78rem; color: #8b949e;
+  }
+
+  /* ===== CONTAINER ===== */
+  .container { max-width: 920px; margin: 0 auto; padding: 32px 20px 80px; }
+
+  /* ===== SECTION ===== */
+  .section { margin-bottom: 48px; }
+  .section h2 {
+    font-size: 1.55rem; font-weight: 700; margin-bottom: 4px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .section h2 .num {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 32px; height: 32px; border-radius: 8px;
+    background: #1f6feb; color: #fff; font-size: .9rem;
+  }
+  .section > p { color: #8b949e; margin-bottom: 20px; }
+
+  /* ===== INFO CARD ===== */
+  .card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+    padding: 20px 22px; margin-bottom: 16px;
+  }
+  .card h3 {
+    font-size: 1.1rem; font-weight: 600; margin-bottom: 8px; color: #f0f6fc;
+  }
+  .card h3 .emoji { margin-right: 6px; }
+  .card p, .card li { color: #c9d1d9; }
+  .card ul, .card ol { padding-left: 20px; margin: 8px 0; }
+  .card li { margin: 3px 0; }
+  .card .highlight {
+    background: #1f2937; border-left: 3px solid #58a6ff; padding: 10px 14px;
+    border-radius: 6px; margin: 10px 0; font-size: .93rem;
+  }
+  .card .highlight .label { color: #58a6ff; font-weight: 600; }
+  .card .highlight code { background: #0d1117; padding: 1px 6px; border-radius: 4px; }
+
+  /* ===== STAT ROW ===== */
+  .stats {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px; margin: 16px 0;
+  }
+  .stat {
+    background: #0d1117; border: 1px solid #21262d; border-radius: 8px;
+    padding: 12px; text-align: center;
+  }
+  .stat .num { font-size: 1.5rem; font-weight: 700; color: #79c0ff; }
+  .stat .lbl { font-size: .78rem; color: #8b949e; margin-top: 2px; }
+
+  /* ===== CODE ===== */
+  pre {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 8px;
+    padding: 16px 18px; overflow-x: auto; font-size: .84rem;
+    line-height: 1.55; font-family: "JetBrains Mono", "SF Mono", "Fira Code", monospace;
+    tab-size: 2; margin: 10px 0;
+  }
+  .comment { color: #8b949e; font-style: italic; }
+  .keyword { color: #ff7b72; }
+  .func { color: #d2a8ff; }
+  .type { color: #7ee787; }
+  .str { color: #a5d6ff; }
+  .num { color: #79c0ff; }
+  .op { color: #ffa657; }
+  .var { color: #ffa657; }
+  .classname { color: #f0883e; }
+
+  /* ===== DIAGRAM ===== */
+  .diagram { margin: 20px 0; overflow-x: auto; }
+  .arch {
+    display: flex; flex-direction: column; gap: 4px;
+    min-width: 700px; padding: 8px 0;
+  }
+  .layer-row { display: flex; align-items: center; gap: 6px; justify-content: center; }
+  .layer-row .arrow { color: #484f58; font-size: 1.1rem; }
+  .flow-down { text-align: center; color: #484f58; font-size: .85rem; margin: 2px 0 4px; }
+
+  /* arch block */
+  .ablock {
+    background: #1a2332; border: 1px solid #30363d; border-radius: 8px;
+    padding: 10px 14px; text-align: center; min-width: 100px;
+    flex-shrink: 0; transition: border-color .2s;
+    position: relative;
+  }
+  .ablock:hover { border-color: #58a6ff; }
+  .ablock .name { font-size: .82rem; font-weight: 600; color: #f0f6fc; }
+  .ablock .shape { font-size: .7rem; color: #8b949e; margin-top: 2px; }
+  .ablock .dim {
+    font-size: .7rem; color: #6e7681; margin-top: 1px;
+    font-family: monospace;
+  }
+  .ablock.input { background: #0a2a1a; border-color: #238636; }
+  .ablock.input .name { color: #3fb950; }
+  .ablock.output { background: #2a0a1a; border-color: #da3633; }
+  .ablock.output .name { color: #f85149; }
+  .ablock.proc { background: #111d2e; border-color: #1f6feb; }
+  .ablock.proc .name { color: #58a6ff; }
+  .ablock.lm { background: #1a1030; border-color: #8957e5; }
+  .ablock.lm .name { color: #bc8cff; }
+  .ablock .subname {
+    font-size: .68rem; color: #6e7681; margin-top: 1px;
+    display: flex; gap: 3px; justify-content: center; flex-wrap: wrap;
+  }
+  .ablock .subname .s { background: #21262d; padding: 0 5px; border-radius: 3px; }
+  .ablock .alabel {
+    position: absolute; top: -8px; right: 6px;
+    font-size: .6rem; background: #1f6feb; color: #fff;
+    padding: 0 6px; border-radius: 4px; line-height: 1.5;
+  }
+  .ablock .alabel.green { background: #238636; }
+  .ablock .alabel.purple { background: #8957e5; }
+
+  /* data-flow arrow */
+  .dfa { display: flex; flex-direction: column; align-items: center; gap: 0; color: #484f58; }
+  .dfa .line { width: 1.5px; height: 16px; background: #484f58; }
+  .dfa .tip { font-size: .6rem; transform: scaleX(.7); }
+
+  /* highlight box */
+  .hlbox {
+    background: #1a2332; border: 1px solid #30363d; border-radius: 8px;
+    padding: 14px 16px; margin: 16px 0;
+  }
+  .hlbox h4 { font-size: .9rem; color: #79c0ff; margin-bottom: 6px; }
+
+  /* table */
+  table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: .88rem; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #21262d; }
+  th { color: #8b949e; font-weight: 600; font-size: .8rem; text-transform: uppercase; }
+  td { color: #c9d1d9; }
+
+  /* ===== ANIMATED DOTS ===== */
+  @keyframes pulse {
+    0%, 100% { opacity: .4; }
+    50% { opacity: 1; }
+  }
+  .pulse { animation: pulse 1.8s ease-in-out infinite; }
+
+  /* ===== FOOTER ===== */
+  .footer {
+    border-top: 1px solid #21262d; padding: 24px 20px;
+    text-align: center; color: #484f58; font-size: .82rem;
+  }
+
+  /* ===== RESPONSIVE ===== */
+  @media (max-width: 600px) {
+    .hero h1 { font-size: 1.7rem; }
+    .container { padding: 20px 12px; }
+    .card { padding: 14px; }
+    pre { font-size: .76rem; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+
+<!-- ========== HERO ========== -->
+<div class="hero">
+  <h1>🎤 大模型如何"听懂"语音？</h1>
+  <p class="sub">以 Qwen3-ASR (0.6B) 为例，三步搞懂音频编码器的设计哲学与实现</p>
+  <div class="tag">
+    <span>🔊 Whisper-style encoder</span>
+    <span>🧱 3× Conv2D + 18× Transformer</span>
+    <span>📏 1024维 LLM 空间</span>
+    <span>⚡ ~250M 参数</span>
+  </div>
+</div>
+
+<div class="container">
+
+<!-- ==================================================================
+     PART 1: 概念篇
+     ================================================================== -->
+<div class="section">
+  <h2><span class="num">①</span> 先讲个故事：音频编码器到底在"编"什么？</h2>
+  <p>不用公式，用类比让你秒懂音频编码器的使命。</p>
+
+  <div class="card">
+    <h3><span class="emoji">🎯</span> 核心问题：声音和文字是两门语言</h3>
+    <p>
+      大模型（LLM）只懂<strong>文字 token 的世界</strong>——它看到的是一串整数 ID，每个 ID 对应一个词或子词。
+      但声音是<strong>连续的波形</strong>，每秒 16000 个采样点，没有天然的分词边界。
+    </p>
+    <div class="highlight">
+      <span class="label">🤔 翻译官的角色：</span>
+      <strong>音频编码器就是一位翻译官</strong>，把原始语音信号"翻译"成 LLM 能理解的<strong>连续向量序列</strong>，
+      每个向量（1024维）≈ 一个"音频词"。
+    </div>
+    <p>
+      更准确地说，这个过程类似于<strong>降维与抽象</strong>：声波（16000点/秒）→ 语谱图（128×每10ms一帧）→
+      编码向量（1024维每80ms一帧）。信息从<strong>微观→宏观</strong>，从<strong>原始→语义</strong>。
+    </p>
+  </div>
+
+  <div class="card">
+    <h3><span class="emoji">🏗️</span> 三阶段理解法</h3>
+    <div class="stats">
+      <div class="stat"><div class="num">①</div><div class="lbl">预处理</div></div>
+      <div class="stat"><div class="num">②</div><div class="lbl">特征编码</div></div>
+      <div class="stat"><div class="num">③</div><div class="lbl">空间对齐</div></div>
+    </div>
+    <p>
+      <strong>① 预处理</strong>：把原始波形变成一张"语音频谱图"（Mel 语谱图）。<br>
+      就像把一段音频录下来，转成一张 <strong>2D 图像</strong>：横轴是时间，纵轴是频率，每个像素是能量大小。<br><br>
+      <strong>② 特征编码</strong>：用卷积层做"下采样"，再用 Transformer 层做"全局理解"。<br>
+      卷积层先<strong>压缩局部信息</strong>（类似看小图），Transformer 层再做<strong>序列建模</strong>（类似理解整段话的逻辑）。<br><br>
+      <strong>③ 空间对齐</strong>：把编码器输出（896维）投影到 LLM 空间（1024维）。<br>
+      就像把中文翻译官的单词表<strong>对齐到英文翻译官的词典</strong>，让 LLM 能直接"读懂"。
+    </p>
+  </div>
+
+  <div class="card">
+    <h3><span class="emoji">🔄</span> 等一等，为什么不用 LLM 直接处理音频？</h3>
+    <p>
+      一个好问题！LLM 擅长处理<strong>离散序列</strong>（token），而音频是<strong>连续信号</strong>。
+      如果把原始 16kHz 音频直接喂给 LLM：
+    </p>
+    <ul>
+      <li><strong>序列太长</strong>：1 秒音频 = 16000 个点，Self-Attention 的 <strong>O(n²)</strong> 复杂度会爆炸</li>
+      <li><strong>缺少结构化</strong>：LLM 没有天生的"频率感知"能力</li>
+      <li><strong>维度过高</strong>：1维波形比 1024维 token embedding 包含的语义信息密度低得多</li>
+    </ul>
+    <p>
+      所以需要一个专门的编码器来做<strong>降采样 + 语义提取</strong>。
+    </p>
+  </div>
+</div>
+
+<!-- ==================================================================
+     PART 2: 架构图
+     ================================================================== -->
+<div class="section">
+  <h2><span class="num">②</span> 架构总览：从波形到 token</h2>
+  <p>一张图看清整个数据流的形状和维度变化。</p>
+
+  <div class="diagram">
+    <div class="arch">
+      <!-- Row 0: waveform -->
+      <div class="layer-row">
+        <div class="ablock input" style="min-width:80px;">
+          <div class="name">🎵 原始波形</div>
+          <div class="dim">[T_samples]</div>
+          <div class="shape">16kHz PCM</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="ablock proc" style="min-width:110px;">
+          <div class="name">⚡ 归一化</div>
+          <div class="subname"><span class="s">-6dBFS</span></div>
+          <div class="dim">→ RMS标准</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="ablock proc" style="min-width:120px;">
+          <div class="name">📊 Mel滤波组</div>
+          <div class="subname"><span class="s">FFT 400</span><span class="s">hop 160</span></div>
+          <div class="dim">[1, 128, T_mel]</div>
+        </div>
+      </div>
+      <div class="flow-down">↓ 第一阶段：波形 → 语谱图（预处理）</div>
+
+      <!-- divider -->
+      <div style="text-align:center;color:#30363d;font-size:1.2rem;margin:4px 0;">━━━━━━━━━━━━━━━━━━━━━━</div>
+      <div class="flow-down" style="color:#58a6ff;font-weight:600;">音频编码器（~250M 参数）</div>
+
+      <!-- Row 1: conv frontend -->
+      <div class="layer-row">
+        <div class="ablock proc" style="min-width:90px;">
+          <div class="name">🧱 Conv #1</div>
+          <div class="subname"><span class="s">k=3 s=2</span></div>
+          <div class="dim">[1,480,64,T/2]</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="ablock proc" style="min-width:90px;">
+          <div class="name">🧱 Conv #2</div>
+          <div class="subname"><span class="s">k=3 s=2</span></div>
+          <div class="dim">[1,480,32,T/4]</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="ablock proc" style="min-width:90px;">
+          <div class="name">🧱 Conv #3</div>
+          <div class="subname"><span class="s">k=3 s=2</span></div>
+          <div class="dim">[1,480,16,T/8]</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="ablock proc" style="min-width:100px;">
+          <div class="name">🔌 展平+投影</div>
+          <div class="subname"><span class="s">7680→896</span></div>
+          <div class="dim">[1, T/8, 896]</div>
+        </div>
+      </div>
+      <div class="flow-down">↓ Conv Frontend: 128→16 频率轴 (8×下采样)，时间轴也 8× 收缩</div>
+
+      <!-- Row 2: Pos enc -->
+      <div class="layer-row">
+        <div class="ablock" style="background:#162240;border-color:#264f78;min-width:110px;">
+          <div class="name">📌 位置编码 (sinusoidal)</div>
+          <div class="dim">[T_enc, 896] 可学习</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="ablock proc" style="min-width:150px;">
+          <div class="name">🔁 18× Encoder Layer</div>
+          <div class="subname">
+            <span class="s">Pre-LN Attn</span>
+            <span class="s">GELU FFN</span>
+          </div>
+          <div class="dim">[1, T_enc, 896]</div>
+        </div>
+      </div>
+      <div class="flow-down">↓ Transformer: 18 层双向自注意力——让每个音频帧"看到"所有其他帧</div>
+
+      <!-- Row 3: Output proj -->
+      <div class="layer-row">
+        <div class="ablock" style="background:#162240;border-color:#264f78;min-width:130px;">
+          <div class="name">🎯 输出投影</div>
+          <div class="subname">
+            <span class="s">LN → GELU → 896</span>
+            <span class="s">→ Linear 1024</span>
+          </div>
+          <div class="dim">[1, T_enc, 1024]</div>
+        </div>
+      </div>
+      <div class="flow-down">↓ 第③阶段：对齐到 LLM 空间（896→1024）</div>
+
+      <div style="text-align:center;color:#30363d;font-size:1.2rem;margin:4px 0;">━━━━━━━━━━━━━━━━━━━━━━</div>
+
+      <!-- Row 4: LLM -->
+      <div class="layer-row">
+        <div class="ablock lm" style="min-width:140px;">
+          <div class="name">🤖 Qwen3 LLM Decoder</div>
+          <div class="subname">
+            <span class="s">28× Layer</span>
+            <span class="s">GQA 16/8</span>
+            <span class="s">RoPE</span>
+          </div>
+          <div class="dim">[S_total, 1, 1024]</div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="ablock output" style="min-width:100px;">
+          <div class="name">📝 文本 Token</div>
+          <div class="dim">"你好"</div>
+        </div>
+      </div>
+      <div class="flow-down">↓ 音频向量与文本 token 嵌入合并，LLM 做因果自回归解码</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3><span class="emoji">🔍</span> 维度演化速查</h3>
+    <p>以 3 秒音频（48000 个采样点）为例：</p>
+    <table>
+      <tr><th>阶段</th><th>形状</th><th>含义</th></tr>
+      <tr><td>原始波形</td><td><code>[48000]</code></td><td>16kHz × 3s = 48000 个 float</td></tr>
+      <tr><td>Mel 语谱图</td><td><code>[1, 128, 299]</code></td><td>每秒 100 帧（hop=160），3s ≈ 299 帧</td></tr>
+      <tr><td>Conv 输出</td><td><code>[1, 37, 7680]</code></td><td>时间轴 8× 压缩：299/8 ≈ 37 帧；频率轴展平</td></tr>
+      <tr><td>投影后</td><td><code>[1, 37, 896]</code></td><td>7680 → 896 线性投影，进入 Transformer</td></tr>
+      <tr><td>Encoder 输出</td><td><code>[1, 37, 896]</code></td><td>18 层 Transformer 后形状不变，语义更丰富</td></tr>
+      <tr><td>对齐后</td><td><code>[1, 37, 1024]</code></td><td>投影到 LLM hidden_size，每个 ≈ 一个"音频词"</td></tr>
+    </table>
+    <p style="margin-top:6px;font-size:.88rem;color:#8b949e;">
+      ⏱️ 每个编码向量大约代表 80ms 音频（原始 299 帧 ÷ 8 ÷ 37 ≈ 80ms/帧）。
+      即 <strong>1 秒语音 ≈ 12 个"音频 token"</strong>，压得相当狠！
+    </p>
+  </div>
+</div>
+
+<!-- ==================================================================
+     PART 2.5: 详解每个模块
+     ================================================================== -->
+<div class="section">
+  <h2><span class="num">③</span> 逐个拆解：每个模块的"为什么"与"怎么做"</h2>
+  <p>从卷积到 Transformer，逐个理解设计意图。</p>
+
+  <div class="card">
+    <h3><span class="emoji">🎚️</span> A. 预处理：为什么 Mel 语谱图？</h3>
+    <p>
+      人耳对频率的感知是<strong>对数尺度</strong>的——我们更容易区分低频的微小变化，而对高频的区分力较弱。
+      Mel 刻度正是模拟这个特性：将线性频率 <code>f</code> 映射到 Mel 频率：
+    </p>
+    <pre><span class="comment"># Mel 频率公式</span>
+<span class="var">mel</span>(<span class="var">f</span>) = <span class="num">2595</span> × log₁₀(<span class="num">1</span> + <span class="var">f</span> / <span class="num">700</span>)</pre>
+    <div class="highlight">
+      <span class="label">🤔 为什么不用 FFT 直接输出？</span>
+      FFT 输出有 400/2+1=201 个频率 bin，但 <strong>相邻 bin 高度相关</strong>。
+      Mel 滤波组将 201 个 bin 合并成 <strong>128 个 Mel bin</strong>，
+      既降维又符合听觉感知。加上 log 操作使<strong>能量分布更均匀</strong>（人耳感知与能量对数正相关）。
+    </div>
+  </div>
+
+  <div class="card">
+    <h3><span class="emoji">🧱</span> B. 三个 Conv2D：为什么是"卷积+大 stride"？</h3>
+    <p>
+      三个相同的 Conv2D（kernel=3, stride=2, padding=1），每个都把<strong>时间轴和频率轴各缩小一半</strong>。
+      最终频率从 128→16（缩小 8×），时间从 T→T/8。这是<strong>整个编码器最关键的压缩步骤</strong>。
+    </p>
+    <div class="highlight">
+      <span class="label">💡 设计意图：</span>
+      <ol>
+        <li><strong>减少序列长度</strong>：T_audio 在 30 秒语音下 ≈ 300 帧，经过 3× stride-2 后 ≈ 37 帧。
+          Transformer 的 O(n²) 注意力复杂度下，T_enc=37 的代价比 T_mel=300 低了 <strong>≈65 倍</strong>。</li>
+        <li><strong>局部特征提取</strong>：卷积天然擅长提取局部模式（音素、音调变化的局部模式），
+          相当于先做<strong>"语音的局部理解"</strong>，再交给 Transformer 做全局建模。</li>
+        <li><strong>频率整合</strong>：128 个 Mel bin 逐步压缩到 16，强迫模型学习<strong>频率间的组合模式</strong>（一个音素通常跨越多个频段）。</li>
+      </ol>
+    </div>
+    <p style="margin-top:8px;">
+      展平后得到 <code>[T/8, 480×16=7680]</code>，再用一个 Linear 投影到 <code>[T/8, 896]</code>。
+      896 是 Whisper 风格的编码器维数（与 Whisper Large 相同）。
+    </p>
+  </div>
+
+  <div class="card">
+    <h3><span class="emoji">📌</span> C. 位置编码：为什么是 Sinusoidal + 分块重复？</h3>
+    <p>
+      卷积和 Transformer 都是<strong>置换不变的</strong>（permutation-invariant）——打乱帧的顺序，输出也会跟着打乱。
+      所以需要注入<strong>位置信息</strong>。Qwen3-ASR 用了 Whisper 风格的<strong>正弦位置编码</strong>
+      （非可学习的固定编码）：
+    </p>
+    <pre><span class="comment"># 正弦位置编码（每个位置 pos 生成一个 d_model 维向量）</span>
+<span class="keyword">for</span> i <span class="keyword">in</span> <span class="func">range</span>(d_model <span class="op">//</span> <span class="num">2</span>):
+    θ = pos / <span class="num">10000</span>^(<span class="num">2</span>i / d_model)
+    PE[pos, 2i]   = sin(θ)   <span class="comment"># 每个维度的"相位"不同</span>
+    PE[pos, 2i+1] = cos(θ)</pre>
+    <p>
+      但这里有一个<strong>关键细节</strong>：为了处理任意长度的音频，位置编码会<strong>按 chunk 重复</strong>。
+      如果训练时每段音频被切分成 100 Mel 帧的 chunk（对应 13 个编码帧），
+      那么位置编码也每 13 帧<strong>重置一次</strong>：<code>[0,1,...12, 0,1,...12, ...]</code>。
+    </p>
+    <div class="highlight">
+      <span class="label">🎯 为什么重复而不是连续？</span>
+      训练时每个 chunk 是独立送入编码器的。如果推理时用连续位置编码
+      （0,1,2,...,20,21,...），编码器看到的 POS 分布和训练不一致，准确率会<strong>显著下降</strong>。
+      重复编码的每帧都能"看到"它在这个 chunk 里的相对位置，匹配了训练分布。
+    </div>
+  </div>
+
+  <div class="card">
+    <h3><span class="emoji">🧠</span> D. Transformer Encoder Layer：双向注意力的意义</h3>
+    <p>
+      18 层 <strong>Pre-LayerNorm</strong> 多头自注意力层，每层结构：<br>
+      <code>LayerNorm → QKV投影 → Self-Attention → 残差 → LayerNorm → GELU FFN → 残差</code>
+    </p>
+    <div class="highlight">
+      <span class="label">🔑 关键词：双向注意力（非因果）</span>
+      <p>LLM 解码器用<strong>因果注意力</strong>（每个 token 只能看前面的），
+      但音频编码器用<strong>双向注意力</strong>（每个帧可以看所有帧）。
+      因为音频理解不是自回归的——要听懂"w-a-t-e-r"这个单词，不能只看前几个音素，
+      需要<strong>整段字符的全局语境</strong>。</p>
+    </div>
+    <table>
+      <tr><th>参数</th><th>值</th></tr>
+      <tr><td>d_model</td><td>896</td></tr>
+      <tr><td>n_heads</td><td>14 (896/14=64)</td></tr>
+      <tr><td>ffn_dim</td><td>3584 (4× d_model)</td></tr>
+      <tr><td>Attention bias</td><td>True</td></tr>
+      <tr><td>FFN activation</td><td>GELU</td></tr>
+      <tr><td>Pre/Post LN</td><td>Pre-LN（训练更稳定）</td></tr>
+    </table>
+    <p style="margin-top:8px;">
+      为什么是 Pre-LN？<br>
+      Post-LN（早期的 LayerNorm 放在残差后）在深层网络中容易梯度爆炸/消失；<br>
+      Pre-LN（LayerNorm 放在子层<strong>之前</strong>）让<strong>残差直通路经保持恒等映射</strong>，
+      梯度可以直接从输出传到输入，训练更稳定，<strong>18 层也能收敛</strong>。
+    </p>
+  </div>
+
+  <div class="card">
+    <h3><span class="emoji">🔌</span> E. 输出投影：对齐到 LLM 空间</h3>
+    <p>
+      编码器的最后一步：<code>LayerNorm(896) → GELU → Linear(896→896) → Linear(896→1024)</code>。
+      为什么是 <strong>1024</strong>？因为 Qwen3 LLM 的 <code>hidden_size = 1024</code>。
+    </p>
+    <div class="highlight">
+      <span class="label">🤝 插入到 LLM 输入：</span>
+      <p>
+        在推理时，音频编码器的输出 <code>[1, T_enc, 1024]</code> 被<strong>逐帧替换掉</strong> prompt 中的
+        <code>&lt;|audio_pad|&gt;</code> token 对应的文本嵌入：
+      </p>
+      <pre><span class="comment"># 伪代码：音频嵌入如何"混入"文本序列</span>
+text_embeds = embed_table([<t1>, <t2>, <audio_pad>, ..., <audio_pad>, <t3>])
+<span class="comment"># ↓ 替换所有 &lt;|audio_pad|&gt; 位置</span>
+<span class="keyword">for</span> i, token <span class="keyword">in</span> <span class="func">enumerate</span>(input_ids):
+    <span class="keyword">if</span> token == AUDIO_PAD:
+        text_embeds[i] = audio_embedding[audio_idx++]  <span class="comment"># 替换！</span>
+<span class="comment"># 最终：LLM 看到的是一个无缝的 [文本 + 音频向量 + 文本] 序列</span></pre>
+    </div>
+    <p>
+      注意这些音频嵌入<strong>不需要额外的投影层</strong>——编码器的最后一步 Linear(896→1024)
+      已经把维度对齐好了。音频向量<strong>以和文本嵌入完全相同的接口</strong>进入 LLM 的 Transformer 层。
+    </p>
+  </div>
+</div>
+
+<!-- ==================================================================
+     PART 3: 伪代码
+     ================================================================== -->
+<div class="section">
+  <h2><span class="num">④</span> 伪代码实战：一步一步搭出来</h2>
+  <p>用接近真实 PyTorch 的伪代码，把整个流程串起来。</p>
+
+  <div class="card">
+    <h3><span class="emoji">📦</span> 数据类定义</h3>
+    <pre><span class="keyword">class</span> <span class="classname">AudioEncoder</span>:
+    <span class="str">"""
+    整体音频编码器：Mel语谱图 → LLM可用的embedding
+
+    输入:  [B, 128, T]  Mel语谱图
+    输出:  [B, T_enc, 1024]  对齐后的音频embedding
+    """</span>
+
+    <span class="keyword">def</span> <span class="func">__init__</span>(<span class="keyword">self</span>):
+        <span class="comment"># ==== 阶段1: Conv Frontend ====</span>
+        <span class="keyword">self</span>.conv1 = Conv2D(in_ch=<span class="num">1</span>, out_ch=<span class="num">480</span>, kernel=<span class="num">3</span>, stride=<span class="num">2</span>)  <span class="comment"># 128→64, T→T/2</span>
+        <span class="keyword">self</span>.conv2 = Conv2D(in_ch=<span class="num">480</span>, out_ch=<span class="num">480</span>, kernel=<span class="num">3</span>, stride=<span class="num">2</span>) <span class="comment"># 64→32,  T→T/4</span>
+        <span class="keyword">self</span>.conv3 = Conv2D(in_ch=<span class="num">480</span>, out_ch=<span class="num">480</span>, kernel=<span class="num">3</span>, stride=<span class="num">2</span>) <span class="comment"># 32→16,  T→T/8</span>
+        <span class="keyword">self</span>.conv_out = Linear(in_features=<span class="num">480</span>*<span class="num">16</span>, out_features=<span class="num">896</span>, bias=<span class="keyword">False</span>)
+
+        <span class="comment"># ==== 阶段2: 位置编码 + Transformer ====</span>
+        <span class="keyword">self</span>.pos_embed = self.<span class="func">_build_sinusoidal_table</span>(max_len=<span class="num">5000</span>, dim=<span class="num">896</span>)
+        <span class="keyword">self</span>.layers = [EncoderLayer(dim=<span class="num">896</span>) <span class="keyword">for</span> _ <span class="keyword">in</span> <span class="func">range</span>(<span class="num">18</span>)]
+
+        <span class="comment"># ==== 阶段3: 输出投影 ====</span>
+        <span class="keyword">self</span>.ln_post = LayerNorm(<span class="num">896</span>)
+        <span class="keyword">self</span>.proj1 = Linear(<span class="num">896</span>, <span class="num">896</span>)     <span class="comment"># 先映射到自身维度</span>
+        <span class="keyword">self</span>.proj2 = Linear(<span class="num">896</span>, <span class="num">1024</span>)    <span class="comment"># 再映射到 LLM hidden_size</span></pre>
+  </div>
+
+  <div class="card">
+    <h3><span class="emoji">🔄</span> 前向传播（完整流程）</h3>
+    <pre><span class="keyword">def</span> <span class="func">forward</span>(<span class="keyword">self</span>, mel_spec, audio_len=None):
+    <span class="str">"""
+    Args:
+        mel_spec: [1, 128, T]  Mel语谱图 (B=1 推理时)
+        audio_len: [1] 实际音频帧数（用于mask）
+    Returns:
+        audio_embeds: [1, T_enc, 1024]
+    """</span>
+    <span class="comment"># ======== 阶段1a: Conv Frontend ========</span>
+    x = <span class="func">unsqueeze</span>(mel_spec, dim=<span class="num">1</span>)  <span class="comment"># [1, 1, 128, T]  Conv2D需要4D输入</span>
+
+    x = GELU(<span class="keyword">self</span>.conv1(x))     <span class="comment"># [1, 480, 64, T/2]</span>
+    x = GELU(<span class="keyword">self</span>.conv2(x))     <span class="comment"># [1, 480, 32, T/4]</span>
+    x = GELU(<span class="keyword">self</span>.conv3(x))     <span class="comment"># [1, 480, 16, T/8]</span>
+
+    B, C, H, W = <span class="func">shape</span>(x)          <span class="comment"># H=16, W=T_enc = T/8</span>
+    x = <span class="func">permute</span>(x, [<span class="num">0</span>, <span class="num">3</span>, <span class="num">1</span>, <span class="num">2</span>])     <span class="comment"># [B, T_enc, 480, 16]</span>
+    x = <span class="func">reshape</span>(x, [B, W, C * H]) <span class="comment"># [B, T_enc, 7680]  展平频率轴</span>
+    x = <span class="keyword">self</span>.conv_out(x)           <span class="comment"># [B, T_enc, 896]  线性投影</span>
+
+    <span class="comment"># ======== 阶段1b: 位置编码 ========</span>
+    T_enc = <span class="func">shape</span>(x)[<span class="num">1</span>]
+    pe = <span class="keyword">self</span>.pos_embed[:T_enc]     <span class="comment"># 截取到当前序列长度 [T_enc, 896]</span>
+    x = x + pe                        <span class="comment"># 加到编码器输出上</span>
+
+    <span class="comment"># ======== 阶段2: 18× Transformer Encoder Layers ========</span>
+    <span class="keyword">for</span> layer <span class="keyword">in</span> <span class="keyword">self</span>.layers:     <span class="comment"># 每层保持 [B, T_enc, 896] 不变</span>
+        x = layer(x)
+
+    <span class="comment"># ======== 阶段3: 输出投影 ========</span>
+    x = <span class="keyword">self</span>.ln_post(x)              <span class="comment"># LayerNorm [B, T_enc, 896]</span>
+    x = GELU(<span class="keyword">self</span>.proj1(x))          <span class="comment"># [B, T_enc, 896]  GELU激活</span>
+    x = <span class="keyword">self</span>.proj2(x)                <span class="comment"># [B, T_enc, 1024] 对齐到LLM空间</span>
+
+    <span class="keyword">return</span> x  <span class="comment"># → LLM decoder的embedding输入</span></pre>
+  </div>
+
+  <div class="card">
+    <h3><span class="emoji">🧬</span> EncoderLayer 内部（最核心的模块）</h3>
+    <pre><span class="keyword">class</span> <span class="classname">EncoderLayer</span>:
+    <span class="str">"""
+    一个 Pre-LN 的 Transformer encoder layer:
+      Attention:   x = x + SelfAttn(LayerNorm(x))
+      FFN:         x = x + FFN(LayerNorm(x))
+    """</span>
+    <span class="keyword">def</span> <span class="func">__init__</span>(<span class="keyword">self</span>):
+        <span class="comment"># Self-Attention 子层</span>
+        <span class="keyword">self</span>.attn_ln = LayerNorm(<span class="num">896</span>)
+        <span class="keyword">self</span>.q_proj   = Linear(<span class="num">896</span>, <span class="num">896</span>, bias=<span class="keyword">True</span>)
+        <span class="keyword">self</span>.k_proj   = Linear(<span class="num">896</span>, <span class="num">896</span>, bias=<span class="keyword">True</span>)
+        <span class="keyword">self</span>.v_proj   = Linear(<span class="num">896</span>, <span class="num">896</span>, bias=<span class="keyword">True</span>)
+        <span class="keyword">self</span>.out_proj  = Linear(<span class="num">896</span>, <span class="num">896</span>, bias=<span class="keyword">True</span>)
+        <span class="comment"># FFN 子层 (GELU激活)</span>
+        <span class="keyword">self</span>.ffn_ln  = LayerNorm(<span class="num">896</span>)
+        <span class="keyword">self</span>.fc1     = Linear(<span class="num">896</span>, <span class="num">3584</span>)    <span class="comment"># 4× 扩展</span>
+        <span class="keyword">self</span>.fc2     = Linear(<span class="num">3584</span>, <span class="num">896</span>)    <span class="comment"># 压缩回去</span>
+
+    <span class="keyword">def</span> <span class="func">forward</span>(<span class="keyword">self</span>, x):
+        <span class="comment"># ─── Self-Attention (Pre-LN) ───</span>
+        residual = x
+        x_norm = <span class="keyword">self</span>.attn_ln(x)           <span class="comment"># Pre-LN: 先norm再attention</span>
+
+        <span class="comment"># 多头注意力计算</span>
+        Q = <span class="keyword">self</span>.q_proj(x_norm)              <span class="comment"># [B, L, 896]</span>
+        K = <span class="keyword">self</span>.k_proj(x_norm)
+        V = <span class="keyword">self</span>.v_proj(x_norm)
+
+        <span class="comment"># 拆成14个头，每个头 dim=64</span>
+        Q = <span class="func">reshape</span>(Q, [B, L, <span class="num">14</span>, <span class="num">64</span>]).<span class="func">permute</span>(<span class="num">0</span>,<span class="num">2</span>,<span class="num">1</span>,<span class="num">3</span>)  <span class="comment"># [B, 14, L, 64]</span>
+        K = <span class="func">reshape</span>(K, [B, L, <span class="num">14</span>, <span class="num">64</span>]).<span class="func">permute</span>(<span class="num">0</span>,<span class="num">2</span>,<span class="num">1</span>,<span class="num">3</span>)
+        V = <span class="func">reshape</span>(V, [B, L, <span class="num">14</span>, <span class="num">64</span>]).<span class="func">permute</span>(<span class="num">0</span>,<span class="num">2</span>,<span class="num">1</span>,<span class="num">3</span>)
+
+        <span class="comment"># 注意力分数: Q @ K^T / sqrt(64)</span>
+        attn_scores = Q @ <span class="func">transpose</span>(K, -<span class="num">2</span>, -<span class="num">1</span>)  <span class="comment"># [B, 14, L, L]</span>
+        attn_scores = attn_scores / <span class="func">sqrt</span>(<span class="num">64.0</span>)
+
+        <span class="comment"># 双向注意力（无mask）：每个位置看所有位置</span>
+        attn_weights = <span class="func">softmax</span>(attn_scores, dim=-<span class="num">1</span>)
+        attn_out = attn_weights @ V               <span class="comment"># [B, 14, L, 64]</span>
+
+        <span class="comment"># 合并多头 + 输出投影</span>
+        attn_out = <span class="func">permute</span>(attn_out, [<span class="num">0</span>, <span class="num">2</span>, <span class="num">1</span>, <span class="num">3</span>])    <span class="comment"># [B, L, 14, 64]</span>
+        attn_out = <span class="func">reshape</span>(attn_out, [B, L, <span class="num">896</span>])
+        attn_out = <span class="keyword">self</span>.out_proj(attn_out)
+        x = residual + attn_out                  <span class="comment"># 残差连接</span>
+
+        <span class="comment"># ─── FFN (Pre-LN) ───</span>
+        residual = x
+        x_norm = <span class="keyword">self</span>.ffn_ln(x)               <span class="comment"># 再norm</span>
+        x_ffn = GELU(<span class="keyword">self</span>.fc1(x_norm))          <span class="comment"># [B, L, 3584]  GELU激活</span>
+        x_ffn = <span class="keyword">self</span>.fc2(x_ffn)                 <span class="comment"># [B, L, 896]  压缩回来</span>
+        x = residual + x_ffn                     <span class="comment"># 残差连接</span>
+
+        <span class="keyword">return</span> x</pre>
+  </div>
+
+  <div class="card">
+    <h3><span class="emoji">🌊</span> 完整推理流程（从音频到文字）</h3>
+    <pre><span class="keyword">def</span> <span class="func">qwen3_asr_inference</span>(raw_waveform):
+    <span class="str">"""输入原始PCM音频，输出转录文本"""</span>
+    <span class="comment"># 1️⃣ 预处理: 波形 → 语谱图</span>
+    waveform = <span class="func">volume_normalize</span>(raw_waveform, target_rms=<span class="num">0.5</span>)  <span class="comment"># -6dBFS</span>
+    mel = whisper_fbank(waveform, n_fft=<span class="num">400</span>, hop_len=<span class="num">160</span>, n_mels=<span class="num">128</span>)
+    <span class="comment"># mel shape: [1, 128, T_mel]</span>
+
+    <span class="comment"># 2️⃣ 音频编码</span>
+    audio_embeds = audio_encoder(mel)          <span class="comment"># [1, T_enc, 1024]</span>
+    audio_embeds = <span class="func">permute</span>(audio_embeds, [<span class="num">1</span>, <span class="num">0</span>, <span class="num">2</span>]) <span class="comment"># [T_enc, 1, 1024] (MNN格式)</span>
+
+    <span class="comment"># 3️⃣ 构建LLM输入序列</span>
+    <span class="comment"># prompt: "<|im_start|>system\nTranscribe speech to text.<|im_end|>\n</span>
+    <span class="comment">#          <|im_start|>user\n&lt;|audio_start|>&lt;audio_pad&gt;×T_enc&lt;|audio_end|>&lt;im_end|>\n</span>
+    <span class="comment">#          <|im_start|>assistant\n"</span>
+    input_ids = tokenize(prompt_template)
+    input_ids = <span class="func">replace_audio_pad</span>(input_ids, T_enc)
+
+    <span class="comment"># 4️⃣ 嵌入替换: audio_pad → 编码器输出</span>
+    embeddings = []
+    audio_idx = <span class="num">0</span>
+    <span class="keyword">for</span> i, token <span class="keyword">in</span> <span class="func">enumerate</span>(input_ids):
+        <span class="keyword">if</span> token == AUDIO_PAD:
+            embeddings.append(audio_embeds[audio_idx])  <span class="comment"># 替换为音频嵌入</span>
+            audio_idx += <span class="num">1</span>
+        <span class="keyword">else</span>:
+            embeddings.append(embed_table[token])        <span class="comment"># 常规文本嵌入</span>
+
+    inputs_embeds = <span class="func">stack</span>(embeddings)            <span class="comment"># [S_total, 1, 1024]</span>
+
+    <span class="comment"># 5️⃣ LLM自回归解码</span>
+    output_ids = []
+    <span class="keyword">for</span> step <span class="keyword">in</span> <span class="func">range</span>(max_new_tokens):
+        logits = qwen3_llm(inputs_embeds, position_ids, ...)
+        next_token = <span class="func">argmax</span>(logits[-<span class="num">1</span>])         <span class="comment"># greedy采样</span>
+
+        <span class="keyword">if</span> next_token == EOS: <span class="keyword">break</span>
+        output_ids.append(next_token)
+
+        <span class="comment"># 准备下一帧输入（KV cache加速）</span>
+        next_embed = embed_table[next_token]       <span class="comment"># [1, 1, 1024]</span>
+        inputs_embeds = <span class="func">concat</span>(inputs_embeds, next_embed)
+
+    <span class="keyword">return</span> detokenize(output_ids)  <span class="comment"># "你好，今天是2025年1月1日。"</span></pre>
+  </div>
+</div>
+
+<!-- ==================================================================
+     PART 4: 总结
+     ================================================================== -->
+<div class="section">
+  <h2><span class="num">⑤</span> 总结：一张卡片记住全部</h2>
+  <div class="card">
+    <div class="highlight">
+      <span class="label">📋 Qwen3-ASR 音频编码器 一句话总结：</span><br>
+      <strong>三段式"翻译官"：</strong><br>
+      <strong>① 下采样</strong>（3× Conv2D stride-2）—— 把 300 帧语谱图压到 37 帧，频率整合；<br>
+      <strong>② 理解</strong>（18× Transformer 双向自注意力）—— 让每帧看到全局，提取语音语义特征；<br>
+      <strong>③ 对齐</strong>（Linear 896→1024）—— 投影到 LLM 空间，<code>&lt;audio_pad&gt;</code> 替换即完成融合。
+    </div>
+    <table>
+      <tr><th>维度</th><th>值</th></tr>
+      <tr><td>输入</td><td>16kHz PCM 波形 / Mel 语谱图 [128, T_mel]</td></tr>
+      <tr><td>输出</td><td>LLM hidden_size=1024 的连续向量序列</td></tr>
+      <tr><td>编码器参数</td><td>~250M（0.6B 模型中占比约 42%）</td></tr>
+      <tr><td>核心设计借鉴</td><td>Whisper（卷积 + Sinusoidal PE + Pre-LN Transformer）</td></tr>
+      <tr><td>时间压缩比</td><td>~80×（16kHz 波形 → ~200Hz 编码帧）</td></tr>
+      <tr><td>输出投影维度</td><td>896 → 1024（对齐 Qwen3 LLM）</td></tr>
+      <tr><td>注意力类型</td><td>全双向（非因果，音频不是自回归任务）</td></tr>
+      <tr><td>推理时音频嵌入</td><td>替换 prompt 中的 &lt;audio_pad&gt; token 位置</td></tr>
+    </table>
+  </div>
+
+  <div class="hlbox">
+    <h4>🎯 现在你知道了什么</h4>
+    <ul>
+      <li>音频编码器不是"把声音转成文字"，而是把<strong>声音转成 LLM 能理解的连续向量</strong></li>
+      <li>它使用 <strong>Conv2D + Transformer</strong> 的组合，先做<strong>局部压缩</strong>再做<strong>全局理解</strong></li>
+      <li>三个 stride-2 的卷积是整个系统<strong>最重要的压缩杠杆</strong></li>
+      <li>输出的 1024 维向量直接替换 <code>&lt;audio_pad&gt;</code> token 的 embedding，<strong>无缝融入 LLM</strong></li>
+      <li>这种方法称为 <strong>Encoder-Decoder 架构</strong>的变体：专用编码器 + LLM 解码器</li>
+    </ul>
+  </div>
+
+  <div class="hlbox">
+    <h4>📚 延伸思考</h4>
+    <p style="color:#c9d1d9;font-size:.92rem;">
+      <strong>为什么 Qwen3-ASR 不用 <a href="#" onclick="return false;">Whisper</a> 那样的纯 Encoder-Decoder？</strong><br>
+      因为它让 LLM <strong>直接做解码器</strong>，而不是用一个小 Transformer 做解码。
+      这样 LLM 的语言能力（逻辑、知识、上下文）可以<strong>直接帮助语音理解</strong>。
+      比如"<em>I went to Paris in [音模糊]</em>"——LLM 的<strong>语言先验</strong>会倾向于预测"June"而不是"Moon"。<br><br>
+
+      <strong>这和传统的 ASR（如 Kaldi、Wenet）有什么区别？</strong><br>
+      传统 ASR 用 CTC / RNN-T / AED 等专门的序列到序列模型；而 <strong>Qwen3-ASR 把语音编码嵌入到 LLM 空间</strong>，
+      让 LLM 充当解码器 + 语言模型二合一，<strong>共享 LLM 的强语言能力</strong>。<br><br>
+
+      <strong>更前沿的方向？</strong><br>
+      Qwen3-ASR 的 encoder 还是 Whisper 风格的<strong>独立编码器</strong>。更先进的模型（如 Qwen2-Audio、SALMONN）
+      使用 <strong>Q-Former 或 Perceiver Resampler</strong> 来进一步压缩编码器输出，
+      甚至让 LLM 通过 <strong>cross-attention</strong> 直接"读"编码器的中间特征。思考一下——
+      如果你要把 37 帧再压到 10 帧，该怎么做？🤔
+    </p>
+  </div>
+</div>
+</div>
+
+<div class="footer">
+  🎓 基于 MNN 项目 Qwen3-ASR 真实实现 · 仅供学习参考 · <a href="https://github.com/alibaba/MNN" target="_blank">github.com/alibaba/MNN</a>
+</div>
+
+</body>
+</html>
