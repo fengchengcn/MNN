@@ -41,3 +41,7 @@ __pycache__/
 **/*.egg-info/
 pymnn/pip_package/.export.log
 pymnn_build/
+
+# ── Python virtualenvs ──
+**/venv/
+**/.venv/
